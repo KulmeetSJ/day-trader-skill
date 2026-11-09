@@ -196,6 +196,180 @@ public filings the minute they post.
 **Taxes.** Day-trading gains are short-term gains, and frequent trading makes
 wash sales likely. Nothing here is tax advice.
 
+## BharatTrader AI (Indian Market Support)
+
+BharatTrader AI adapts the trading tools for the Indian equity and derivatives market (NSE and BSE).
+
+### Market Data Configuration
+
+Set the environment variable `BHARAT_DATA_PROVIDER` to choose the data source:
+
+- `yahoo` (default): Free market data with automated NSE (`.NS`) and BSE (`.BO`) exchange suffix translation.
+- `offline`: Local JSON or JSON.GZ bar and quote files for offline analysis and deterministic backtesting.
+
+### Environment Variables
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `BHARAT_MARKET` | Market mode (`IN` for India, default `US`) | `US` |
+| `BHARAT_DATA_PROVIDER` | Market data provider (`yahoo`, `offline`) | `yahoo` |
+| `BHARAT_INSTRUMENTS_CACHE` | Path to local instrument metadata cache | `trader/state/instruments.json` |
+
+### Data Quality Tiers
+
+All market data is classified into explicit quality tiers:
+- `DELAYED`: Delayed by 15 minutes (Yahoo Finance). Never treated or presented as real-time.
+- `HISTORICAL`: Completed historical bars from closed trading sessions.
+- `SIMULATED`: Generated or replayed backtest data.
+- `REAL_TIME`: Real-time un-delayed feeds (reserved for authenticated broker connections).
+
+### Usage Examples
+
+1. Check Indian market session status and Closing Auction Session (CAS) phase:
+
+```bash
+python3 trader-alerts/alerts.py clock --market IN
+```
+
+2. Fetch delayed quotes for NSE securities:
+
+```bash
+python3 trader-alerts/alerts.py quote RELIANCE TCS INFY --market IN
+```
+
+3. Fetch historical 5-minute intraday bars aligned to IST trading hours (09:15-15:30 IST):
+
+```bash
+python3 trader-alerts/alerts.py history RELIANCE --market IN --interval 5m --range 5d
+```
+
+4. Build Indian stock universe (`trader/universe.txt`):
+
+```bash
+python3 trader-scanner/scan.py universe --market IN --index NIFTY50   # 50 Nifty constituents
+python3 trader-scanner/scan.py universe --market IN --index NIFTY100  # 100 Nifty constituents
+python3 trader-scanner/scan.py universe --market IN --index FNO       # F&O eligible stocks
+```
+
+5. Run pre-market daily setup scan (breakouts, flags, oversold) on Indian stocks:
+
+```bash
+python3 trader-scanner/scan.py daily --market IN
+```
+
+6. Run opening-range breakout scan (15-min range 09:15-09:30 IST, first breakout at 09:35 IST):
+
+```bash
+python3 trader-scanner/scan.py orb --market IN
+python3 trader-scanner/scan.py orb --market IN --at 10:15
+```
+
+7. Real-time entry timing check on Indian stocks (IST market hours, 15m ORB):
+
+```bash
+python3 trader-entry/entry.py check RELIANCE --setup orb --market IN
+```
+
+8. Exit plan generation with Indian tick sizes (Rs 0.05 default) and IST closing rules (flat_by 15:20 IST):
+
+```bash
+python3 trader-exit/exit.py plan --symbol RELIANCE --entry 2850.00 --stop or-mid --target 2R --market IN --write trader/plan.json
+python3 trader-exit/exit.py show --plan trader/plan.json
+```
+
+9. Historical Monte Carlo replay on Indian session grid (75 bars regular / 72 bars CAS V1):
+
+```bash
+python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market IN
+python3 trader-timemachine/timemachine.py chart --plan trader/plan.json --market IN
+```
+
+10. Position sizing and capital allocation in INR with lot sizing and Trade-to-Trade checks:
+
+```bash
+python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --market IN --write trader/orders.json
+```
+
+11. Pre-trade risk validation with Indian session window, SEBI Trade-to-Trade enforcement, and PDT exemption:
+
+```bash
+python3 trader-risk/check.py trader/orders.json --config trader/config.json --market IN
+```
+
+12. Use the Python market data API:
+
+```python
+from data_in import fetch_quote, fetch_intraday_bars, detect_setups
+
+# Fetch current delayed quote
+quote = fetch_quote("RELIANCE", exchange="NSE")
+print(quote["price"], quote["currency"], quote["tier"])
+
+# Fetch 5-minute session bars
+intraday = fetch_intraday_bars("TCS", interval="5m", range_str="5d", exchange="NSE")
+print("Fetched %d continuous bars" % len(intraday["bars"]))
+```
+
+### Complete End-to-End Indian Paper-Trading Walkthrough
+
+Run the full pipeline offline or with live data, from opening-range breakout scan through risk validation, order tickets, alerts tracking, and session flattening:
+
+```bash
+# Setup Indian trading configuration
+cp trader-budget/config.in.example.json trader/config.json
+
+# 1. Chart Scanner: Scan for opening-range breakouts (15-min range 09:15-09:30 IST)
+python3 trader-scanner/scan.py orb --market IN --offline tests/fixtures/bharat --now "2026-10-19 10:35" --out trader/watchlist.json
+
+# 2. Entry Timer: Verify breakout trigger on RELIANCE at 10:30 AM IST (bar 14 close > range high)
+python3 trader-entry/entry.py check RELIANCE --setup orb --offline tests/fixtures/bharat/RELIANCE-5m.json --now "2026-10-19 10:35" --market IN --write trader/entry.json
+
+# 3. Exit Planner: Set stop-loss, 2R target and 15:20 IST closing rule with Rs 0.05 tick size
+python3 trader-exit/exit.py plan --from trader/entry.json --market IN --write trader/plan.json
+
+# 4. Time Machine: 10,000-session Monte Carlo simulation over historical IST session bars
+python3 trader-timemachine/timemachine.py run --plan trader/plan.json --offline tests/fixtures/trader-timemachine/RELIANCE-60d5m.json.gz --market IN
+
+# 5. Budget Manager: Size bracket order to INR account budget and max loss limits
+python3 trader-budget/size.py --plan trader/plan.json --config trader/config.json --now "2026-10-19 10:35" --market IN --write trader/orders.json
+
+# 6. Risk Manager: Pre-trade safety gate (max loss, trade counts, market hours, T2T)
+python3 trader-risk/check.py --orders trader/orders.json --config trader/config.json --now "2026-10-19 10:35" --market IN --out trader/state/risk.json
+
+# 7. Order Executor: Render plain-English ticket and confirm order is READY
+python3 trader-broker/ticket.py show --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --now "2026-10-19 10:35" --market IN
+
+# 8. User Approval: Record explicit yes for the entry order
+python3 trader-broker/ticket.py approve --index 1 --reply "yes buy 26 RELIANCE" --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --now "2026-10-19 10:35" --market IN
+
+# 9. Broker Fill: Record paper execution in trader/portfolio.json
+python3 trader-broker/ticket.py result --index 1 --status placed --filled-qty 26 --filled-price 2849.00 --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --portfolio trader/portfolio.json --state trader/state/broker.json --now "2026-10-19 10:35" --market IN
+
+# 10. Price Alerts: Arm stop, target, and flat-by-close rules
+python3 trader-alerts/alerts.py add --from-plan --plan trader/plan.json --config trader/config.json
+
+# 11. Alert Monitor: Check prices mid-session
+python3 trader-alerts/alerts.py check --now "2026-10-19 10:40" --market IN --offline tests/fixtures/bharat
+
+# 12. Flat-by Alert: Time alert fires at 15:20 IST before closing auction
+python3 trader-alerts/alerts.py check --now "2026-10-19 15:20" --market IN --offline tests/fixtures/bharat
+
+# 13. Session Flatten: Build sell ticket to close open positions before market close
+python3 trader-broker/ticket.py flatten --symbol RELIANCE --config trader/config.json --portfolio trader/portfolio.json --plan trader/plan.json --orders trader/orders.json --now "2026-10-19 15:20"
+
+# 14. Exit Risk Check: Risk manager approves flatten exit order
+python3 trader-risk/check.py --orders trader/orders.json --config trader/config.json --portfolio trader/portfolio.json --state trader/state/broker.json --now "2026-10-19 15:20" --market IN --out trader/state/risk.json
+
+# 15. Approve Exit: Record user yes for the sell ticket
+python3 trader-broker/ticket.py approve --index 1 --reply "yes sell 26 RELIANCE" --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --now "2026-10-19 15:20"
+
+# 16. Record Exit Fill: Position flattened, cash and P&L updated
+python3 trader-broker/ticket.py result --index 1 --status placed --filled-qty 26 --filled-price 2863.00 --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --portfolio trader/portfolio.json --state trader/state/broker.json --now "2026-10-19 15:20"
+
+# 17. Decision Log: Inspect complete audit trail of today's trades
+python3 trader-broker/ticket.py log --state trader/state/broker.json --config trader/config.json --now "2026-10-19 15:20"
+```
+
 ## Files
 
 ```

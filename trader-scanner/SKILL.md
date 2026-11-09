@@ -178,6 +178,27 @@ and GE a reclaim of the 20-day average, and BAC, MS, RIVN and PLUG oversold,
 as the reel did. On closes it also tags KO (breakout), RCL (flag) and PNC (an
 oversold bounce).
 
+## Indian market support (BharatTrader AI)
+
+The scanner supports Indian equities on NSE and BSE:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scan.py" universe --market IN --index NIFTY50   # NIFTY 50 -> trader/universe.txt
+python3 "${CLAUDE_SKILL_DIR}/scan.py" universe --market IN --index NIFTY100  # NIFTY 100 -> trader/universe.txt
+python3 "${CLAUDE_SKILL_DIR}/scan.py" universe --market IN --index FNO       # F&O eligible stocks
+python3 "${CLAUDE_SKILL_DIR}/scan.py" daily --market IN                      # pre-market setups -> trader/watchlist.json
+python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --market IN                        # opening-range breakouts (09:15-09:30 range)
+python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --market IN --at 10:15             # cut clock at 10:15 AM IST
+```
+
+Key differences for the Indian market:
+- Trading hours: regular session runs 09:15 to 15:30 IST.
+- Opening range: 15-minute range spans 09:15 to 09:30 IST; first potential breakout bar closes at 09:35 IST.
+- Symbols: internal scrips are canonical (RELIANCE, TCS, INFY, M&M), automatically translated to provider tickers (RELIANCE.NS) on the wire.
+- Currency: formatted in Indian Rupees (INR).
+- Calendar: verified against official NSE/BSE holiday circulars and special sessions (e.g. Muhurat trading).
+- Workflow: output is written to `trader/watchlist.json` to feed downstream skills (trader-news and trader-entry).
+
 ## Rules
 
 - Say what was scanned: how many symbols, how many charts came back, how many

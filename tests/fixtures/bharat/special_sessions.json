@@ -1,0 +1,36 @@
+[
+  {
+    "session_date": "2024-11-01",
+    "exchange": "NSE",
+    "open_time": "18:00",
+    "close_time": "19:00",
+    "pre_open_start": "17:45",
+    "pre_open_end": "18:00",
+    "session_type": "MUHURAT",
+    "source": "NSE Circular Ref No: 110/2024",
+    "publication_date": "2024-10-21"
+  },
+  {
+    "session_date": "2025-10-21",
+    "exchange": "NSE",
+    "open_time": "18:15",
+    "close_time": "19:15",
+    "pre_open_start": "18:00",
+    "pre_open_end": "18:08",
+    "session_type": "MUHURAT",
+    "source": "NSE Circular Ref No: 98/2025",
+    "publication_date": "2025-10-06"
+  },
+  {
+    "session_date": "2026-11-08",
+    "exchange": "NSE",
+    "open_time": "18:15",
+    "close_time": "19:15",
+    "pre_open_start": "18:00",
+    "pre_open_end": "18:08",
+    "session_type": "MUHURAT",
+    "source": "NSE Circular Ref No: 104/2026",
+    "publication_date": "2026-10-20"
+  }
+]
+

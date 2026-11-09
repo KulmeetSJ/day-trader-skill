@@ -57,6 +57,17 @@ import time
 import urllib.error
 import urllib.request
 
+_alerts_dir = os.path.dirname(os.path.abspath(__file__))
+if _alerts_dir not in sys.path:
+    sys.path.insert(0, _alerts_dir)
+
+try:
+    import calendar_in
+    import symbols_in
+except ImportError:
+    calendar_in = None
+    symbols_in = None
+
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/Jakeschincariol/day-trader-skill)"
 PAUSE = 0.5    # seconds between requests: be polite to free endpoints
 BACKOFF = 2.0  # seconds to wait before the one retry after a 429
@@ -425,6 +436,79 @@ def ring_time(rule, status):
     return at
 
 
+def _rang_today_in(stamp, today):
+    """Did a rule that rang at this stamp ring on this Indian market date?"""
+    if not stamp:
+        return False
+    return str(stamp)[:10] == today
+
+
+def evaluate_in(rules, quotes, status, state, now_ist):
+    """Pure function for Indian market rules. Returns (rings, new_state)."""
+    state = json.loads(json.dumps(state or {}))
+    rung = state.setdefault("rung", {})
+    today = status["date"]
+    stamp = now_ist.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    rings = []
+    for r in rules:
+        validate(r)
+        rid = r.get("id") or "%s-%s" % (r.get("symbol", "market"), r["type"])
+        if not active(r, today):
+            continue
+        typ = {"stop": "below", "target": "above"}.get(r["type"], r["type"])
+        if typ == "opening_bell":
+            if status["open"] and not _rang_today_in(rung.get(rid), today):
+                rings.append({"id": rid, "symbol": "", "message": "Opening bell: NSE is open (%s IST)."
+                              % now_ist.strftime("%H:%M")})
+                rung[rid] = stamp
+            continue
+        if typ == "time":
+            at = _hhmm(r.get("at"))
+            if status.get("opens") and now_ist.time() >= at and not _rang_today_in(rung.get(rid), today):
+                label = r.get("label") or "time alert"
+                msg = "%s%s: it is %s IST (set for %s)" % (label[:1].upper(), label[1:],
+                                                           now_ist.strftime("%H:%M"), at.strftime("%H:%M"))
+                msg += (", the market closes at %s." % status["closes"]) if status["open"] else \
+                    ", the market has closed."
+                sym = str(r.get("symbol") or "").upper()
+                if sym:
+                    msg += (" If %s is still open, close it: ticket.py flatten --symbol %s builds the sell "
+                            "ticket, then trader-risk and your yes." % (sym, sym))
+                rings.append({"id": rid, "symbol": sym, "message": msg})
+                rung[rid] = stamp
+            continue
+        sym = str(r.get("symbol", "")).upper()
+        c_sym = symbols_in.normalize_symbol(sym) if symbols_in else sym
+        q = quotes.get(c_sym) or quotes.get(sym)
+        if not q:
+            continue
+        p = q["price"]
+        if typ in ("above", "below"):
+            hit = p >= r["price"] if typ == "above" else p <= r["price"]
+            if hit and rid not in rung:
+                word = "at or above" if typ == "above" else "at or below"
+                label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
+                rings.append({"id": rid, "symbol": c_sym, "message": "%s %s \u20b9%.2f: %s your %s \u20b9%s%s."
+                              % (c_sym, "is" if status["open"] else "last", p, word, label, _n(r["price"]),
+                                 (" (" + r["note"] + ")") if r.get("note") else "")})
+                rung[rid] = stamp
+            elif not hit and rid in rung and r.get("rearm"):
+                del rung[rid]
+        elif typ == "pct_move":
+            ref = r.get("ref") or q.get("prev_close") or q.get("open")
+            if not ref:
+                continue
+            move = 100.0 * (p / float(ref) - 1)
+            want = r.get("direction")
+            hit = abs(move) >= r["pct"] and (not want or (want == "up") == (move > 0))
+            if hit and not _rang_today_in(rung.get(rid), today):
+                rings.append({"id": rid, "symbol": c_sym, "message": "%s moved %+.2f%% to \u20b9%.2f (from \u20b9%.2f)."
+                              % (c_sym, move, p, float(ref))})
+                rung[rid] = stamp
+    state["last_check"] = stamp
+    return rings, state
+
+
 def evaluate(rules, quotes, status, state, now_utc):
     """Pure function. Returns (rings, new_state). Each ring: {id, symbol, message}."""
     state = json.loads(json.dumps(state or {}))
@@ -502,6 +586,8 @@ def rules_from_plan(plan, cfg_flat_by=None):
     if not isinstance(plan, dict) or not plan.get("symbol"):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
+    if symbols_in:
+        sym = symbols_in.normalize_symbol(sym)
     out = []
     for key, typ, word in (("stop", "stop", "plan stop"), ("target", "target", "plan target")):
         v = plan.get(key)
@@ -510,7 +596,9 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:55"
+    is_in = str(plan.get("market", "")).upper() in ("IN", "INDIA") or plan.get("currency") == "INR"
+    default_flat = "15:20" if is_in else "15:55"
+    flat = plan.get("flat_by") or cfg_flat_by or default_flat
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
     out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
@@ -542,7 +630,233 @@ def _dedupe(items):
     return out
 
 
+def get_market_profile(a, doc=None):
+    m = getattr(a, "market", None)
+    if m:
+        return m.upper()
+    env = os.environ.get("BHARAT_MARKET")
+    if env and env.upper() in ("IN", "INDIA"):
+        return "IN"
+    if doc and isinstance(doc, dict):
+        if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
+            return "IN"
+        for r in doc.get("rules", []):
+            sym = str(r.get("symbol", "")).upper()
+            if sym.endswith((".NS", ".BO", "-EQ")) or "-" in sym or "&" in sym:
+                return "IN"
+    cfg_path = getattr(a, "config", "trader/config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+                if "market" in cfg:
+                    return str(cfg["market"]).upper()
+        except Exception:
+            pass
+    return "US"
+
+
+def cmd_clock_in(a):
+    if calendar_in is None:
+        raise AlertError("Indian market calendar engine unavailable")
+    now = calendar_in.parse_ist(a.now) if a.now else calendar_in.now_ist()
+    date_str = now.strftime("%Y-%m-%d")
+
+    is_cas = getattr(a, "cas", False)
+    sym = getattr(a, "symbol", None)
+    if sym and not is_cas:
+        try:
+            import instruments
+            cache_path = getattr(a, "instruments", instruments.DEFAULT_CACHE_PATH)
+            if os.path.isfile(cache_path):
+                payload = instruments.load_instrument_cache(cache_path, max_age_days=365, as_of_date=date_str)
+                is_cas = instruments.is_cas_eligible(sym, payload)
+        except Exception:
+            pass
+
+    phase, reason = calendar_in.get_session_phase(now, exchange="NSE", is_cas_eligible=is_cas)
+    is_open = calendar_in.is_market_hours_in(now, exchange="NSE", is_cas_eligible=is_cas)
+    bars = calendar_in.get_session_bars(now, exchange="NSE", is_cas_eligible=is_cas)
+    is_trading, status, trade_reason = calendar_in.is_trading_day_in(now)
+    special = calendar_in.get_special_session(date_str)
+
+    st = {
+        "market": "NSE",
+        "profile": "IN",
+        "open": is_open,
+        "phase": phase,
+        "reason": reason,
+        "is_trading_day": is_trading,
+        "calendar_status": status,
+        "now_ist": now.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "date": date_str,
+        "weekday": now.strftime("%A"),
+        "session_bars": bars,
+        "is_cas_eligible": is_cas,
+        "cas_rule_version": calendar_in.get_cas_rule_version(date_str, exchange="NSE", is_cas_eligible=is_cas),
+        "unexecuted_order_transition_active": calendar_in.is_unexecuted_order_transition_active(date_str),
+        "special_session": special is not None,
+    }
+    if sym:
+        st["symbol"] = sym
+    if special:
+        st["special_session_details"] = special
+
+    if a.json:
+        print(json.dumps(st, indent=2))
+    else:
+        cas_label = " (CAS-eligible)" if is_cas else " (Non-CAS)"
+        print("India (IST) %s (%s): NSE %s%s, phase: %s (%s)." % (
+            st["now_ist"], st["weekday"], "OPEN" if is_open else "closed", cas_label, phase, reason))
+        print("Continuous session bars (5-min): %d bars." % bars)
+        if special:
+            print("Special session (%s): %s to %s." % (
+                special.get("session_type"), special["open_time"], special["close_time"]))
+    return 0 if is_open else 1
+
+
+def cmd_quote_in(a):
+    raw_syms = _dedupe([s.upper() for s in a.symbols] + (holdings(a) if a.holdings else []))
+    if not raw_syms:
+        raise AlertError("which tickers? alerts.py quote RELIANCE TCS, or --holdings")
+
+    try:
+        import data_in
+    except ImportError:
+        data_in = None
+
+    now = calendar_in.parse_ist(a.now) if (calendar_in and a.now) else parse_now(a.now)
+
+    quotes = {}
+    errors = []
+
+    if data_in:
+        provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+        for s in raw_syms:
+            try:
+                c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
+                q = provider.get_quote(c_sym, exchange="NSE")
+                quotes[c_sym] = q
+            except Exception as e:
+                errors.append(str(e))
+    else:
+        canonical_syms = []
+        for s in raw_syms:
+            if symbols_in:
+                canonical_syms.append(symbols_in.normalize_symbol(s))
+            else:
+                canonical_syms.append(s)
+
+        yahoo_map = {}
+        query_syms = []
+        for c_sym in canonical_syms:
+            if symbols_in and a.source == "yahoo":
+                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange="NSE")
+            else:
+                y_sym = c_sym
+            yahoo_map[y_sym] = c_sym
+            query_syms.append(y_sym)
+
+        quotes_raw, errs = get_quotes(query_syms, a.source, a.offline)
+        errors.extend(errs)
+
+        for y_sym, q in quotes_raw.items():
+            c_sym = yahoo_map.get(y_sym, y_sym)
+            q_copy = dict(q)
+            q_copy["symbol"] = c_sym
+            q_copy["market"] = "NSE"
+            q_copy["tier"] = "DELAYED"
+            q_copy["currency"] = "INR"
+            quotes[c_sym] = q_copy
+
+    if a.write and quotes:
+        write_prices(a.write, quotes, now, a.source)
+
+    if a.json:
+        print(json.dumps({"quotes": quotes, "errors": errors}, indent=2))
+    else:
+        for s in sorted(quotes.keys()):
+            q = quotes.get(s)
+            if q and "price" in q:
+                chg = ""
+                if q.get("prev_close"):
+                    pct = q.get("change_pct")
+                    if pct is None:
+                        pct = 100.0 * (q["price"] / q["prev_close"] - 1)
+                    chg = " (%+.2f%% vs prev close \u20b9%.2f)" % (pct, q["prev_close"])
+                tier_label = q.get("tier", "DELAYED")
+                src_label = q.get("source", a.source)
+                print("%-10s \u20b9%.2f%s  %s  [%s:%s]" % (
+                    s, q["price"], chg, q.get("time", ""), src_label, tier_label))
+        for e in errors:
+            print("error: " + e)
+        if a.write and quotes:
+            print("Wrote %d price(s) to %s." % (len(quotes), a.write))
+        print("Quotes are free, delayed and unofficial: for alerts only. Never treat delayed quotes as real-time.")
+    return 0 if quotes else 1
+
+
+def cmd_history_in(a):
+    if not a.symbol:
+        raise AlertError("which ticker? alerts.py history RELIANCE --market IN")
+    try:
+        import data_in
+    except ImportError:
+        raise AlertError("data_in module unavailable")
+
+    c_sym = symbols_in.normalize_symbol(a.symbol) if symbols_in else a.symbol.upper()
+    provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+
+    interval = getattr(a, "interval", "5m")
+    range_str = getattr(a, "range_str", "5d")
+
+    try:
+        if interval == "1d":
+            data = provider.get_daily_bars(c_sym, range_str=range_str, exchange="NSE", now=a.now)
+        else:
+            data = provider.get_intraday_bars(c_sym, interval=interval, range_str=range_str,
+                                              exchange="NSE", now=a.now)
+    except Exception as e:
+        raise AlertError("Failed to fetch historical bars for %s: %s" % (c_sym, e))
+
+    if a.write and data:
+        _write(a.write, data)
+
+    if a.json:
+        print(json.dumps(data, indent=2))
+    else:
+        bars = data.get("bars", [])
+        tier = data.get("tier", "HISTORICAL")
+        source = data.get("source", "yahoo")
+        print("%s (%s) - %d bars (%s) [%s:%s]" % (
+            c_sym, data.get("exchange", "NSE"), len(bars), interval, source, tier))
+        print("%-12s %-6s %9s %9s %9s %9s %10s" % ("Date", "Start", "Open", "High", "Low", "Close", "Volume"))
+        print("-" * 72)
+        display_bars = bars[-10:] if len(bars) > 10 else bars
+        for b in display_bars:
+            start_str = b.get("start", "")
+            print("%-12s %-6s %9.2f %9.2f %9.2f %9.2f %10d" % (
+                b["date"], start_str, b["o"], b["h"], b["l"], b["c"], b["v"]))
+        if len(bars) > 10:
+            print("... and %d earlier bars." % (len(bars) - 10))
+        dropped = data.get("dropped")
+        if dropped:
+            drop_str = ", ".join("%s: %d" % (k, v) for k, v in dropped.items() if v > 0)
+            if drop_str:
+                print("Dropped bars: %s" % drop_str)
+    return 0 if data.get("bars") else 1
+
+
+def cmd_history(a):
+    if get_market_profile(a) == "IN":
+        return cmd_history_in(a)
+    raise AlertError("history command currently supported for --market IN")
+    return 0 if quotes else 1
+
+
 def cmd_clock(a):
+    if get_market_profile(a) == "IN":
+        return cmd_clock_in(a)
     st = market_status(parse_now(a.now))
     if a.json:
         print(json.dumps(st, indent=2))
@@ -560,6 +874,8 @@ def cmd_clock(a):
 
 
 def cmd_quote(a):
+    if get_market_profile(a) == "IN":
+        return cmd_quote_in(a)
     syms = _dedupe([s.upper() for s in a.symbols] + (holdings(a) if a.holdings else []))
     if not syms:
         raise AlertError("which tickers? alerts.py quote TSLA KO, or --holdings")
@@ -585,11 +901,100 @@ def cmd_quote(a):
     return 0 if quotes else 1
 
 
+def cmd_check_in(a, rules):
+    if calendar_in is None:
+        raise AlertError("Indian market calendar engine unavailable")
+    try:
+        import data_in
+    except ImportError:
+        data_in = None
+
+    now = calendar_in.parse_ist(a.now) if a.now else calendar_in.now_ist()
+    date_str = now.strftime("%Y-%m-%d")
+
+    phase, reason = calendar_in.get_session_phase(now, exchange="NSE")
+    is_open = calendar_in.is_market_hours_in(now, exchange="NSE")
+    status = {
+        "market": "NSE",
+        "open": is_open,
+        "phase": phase,
+        "reason": reason,
+        "date": date_str,
+        "now_ist": now.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "weekday": now.strftime("%A"),
+        "opens": "09:15",
+        "closes": "15:30",
+    }
+
+    watched = [r for r in rules if active(r, date_str)]
+    raw_syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
+    quotes = {}
+    errors = []
+
+    if raw_syms:
+        if data_in:
+            provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+            for s in raw_syms:
+                try:
+                    c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
+                    q = provider.get_quote(c_sym, exchange="NSE")
+                    quotes[c_sym] = q
+                    if s != c_sym:
+                        quotes[s] = q
+                except Exception as e:
+                    errors.append(str(e))
+        else:
+            canonical_syms = [symbols_in.normalize_symbol(s) if symbols_in else s for s in raw_syms]
+            yahoo_map = {}
+            query_syms = []
+            for c_sym in canonical_syms:
+                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange="NSE") if symbols_in else c_sym
+                yahoo_map[y_sym] = c_sym
+                query_syms.append(y_sym)
+            raw_q, errs = get_quotes(query_syms, a.source, a.offline)
+            errors.extend(errs)
+            for y_s, q in raw_q.items():
+                c_s = yahoo_map.get(y_s, y_s)
+                q_copy = dict(q)
+                q_copy["symbol"] = c_s
+                q_copy["currency"] = "INR"
+                quotes[c_s] = q_copy
+
+    state = _read(a.state, {})
+    rings, state = evaluate_in(rules, quotes, status, state, now)
+
+    if not a.no_write:
+        _write(a.state, state)
+        if quotes:
+            write_prices(a.prices_out, quotes, now, a.source)
+
+    if a.json:
+        print(json.dumps({"market": status, "rings": rings, "errors": errors,
+                          "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2))
+    else:
+        print("NSE %s (%s IST, %s)." % ("OPEN" if status["open"] else "closed", now.strftime("%H:%M"), status["phase"]))
+        for r in rings:
+            print("ALERT " + r["message"])
+        if not rings:
+            print("Nothing hit. %d rule(s) watched today%s." % (
+                len(watched), (", " + ", ".join("%s \u20b9%.2f" % (s, quotes[s]["price"]) for s in raw_syms if s in quotes))
+                if quotes else ""))
+        for e in errors:
+            print("error: " + e)
+        if rings:
+            print("An alert is information, not an order. A bracket's stop-loss and take-profit already sit at "
+                  "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
+                  "position yourself: ticket.py flatten, then trader-risk and your yes.")
+    return 0 if rings else 1
+
+
 def cmd_check(a):
     doc = _read(a.rules, None)
     if not doc or not doc.get("rules"):
         raise AlertError("no rules in %s: add some with alerts.py add --from-plan" % a.rules)
     rules = doc["rules"]
+    if get_market_profile(a, doc=doc) == "IN":
+        return cmd_check_in(a, rules)
     now = parse_now(a.now)
     status = market_status(now)
     watched = [r for r in rules if active(r, status["date"])]
@@ -633,6 +1038,8 @@ def cmd_add(a):
         new = rules_from_plan(plan, (cfg or {}).get("flat_by"))
         ids = {r["id"] for r in new}
         doc["rules"] = [r for r in doc["rules"] if r.get("id") not in ids] + new
+        if plan.get("market") == "IN" or (cfg or {}).get("market") == "IN":
+            doc["market"] = "IN"
         state = _read(a.state, {})
         if state.get("rung"):
             for i in ids:
@@ -716,18 +1123,24 @@ def cmd_reset(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Price alerts and the NYSE clock (trader-alerts).")
+    ap = argparse.ArgumentParser(description="Price alerts and the NYSE/NSE clock (trader-alerts).")
+    ap.add_argument("--market", default="US", choices=["US", "IN"], help="market profile (US or IN)")
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
         p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq"])
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
-        p.add_argument("--now", help="pretend it is this time (no offset = New York time)")
+        p.add_argument("--now", help="pretend it is this time (no offset = New York time for US, IST for IN)")
         p.add_argument("--json", action="store_true")
+        p.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
 
-    p = sub.add_parser("clock", help="is the NYSE open?")
+    p = sub.add_parser("clock", help="is the exchange open?")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
+    p.add_argument("--cas", action="store_true", help="evaluate as Closing Auction Session (CAS) eligible security")
+    p.add_argument("--symbol", help="security symbol to resolve CAS eligibility from instruments")
+    p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
     p = sub.add_parser("quote", help="latest delayed quotes")
     net(p)
     p.add_argument("symbols", nargs="*")
@@ -736,6 +1149,13 @@ def main(argv=None):
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--write", nargs="?", const="trader/prices.json", metavar="PATH",
                    help="save to prices.json (default trader/prices.json)")
+    p = sub.add_parser("history", help="historical intraday or daily bars")
+    net(p)
+    p.add_argument("symbol")
+    p.add_argument("--interval", default="5m", help="bar interval (1m, 5m, 1d; default 5m)")
+    p.add_argument("--range", dest="range_str", default="5d", help="range to fetch (e.g. 1d, 5d, 1mo, 1y; default 5d)")
+    p.add_argument("--write", nargs="?", const="trader/history.json", metavar="PATH",
+                   help="save to history.json (default trader/history.json)")
     p = sub.add_parser("check", help="check every rule, ring what hit")
     net(p)
     p.add_argument("--rules", default="trader/alerts.json")
@@ -776,7 +1196,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        return {"clock": cmd_clock, "quote": cmd_quote, "check": cmd_check, "add": cmd_add,
+        return {"clock": cmd_clock, "quote": cmd_quote, "history": cmd_history, "check": cmd_check, "add": cmd_add,
                 "list": cmd_list, "reset": cmd_reset}[a.cmd](a)
     except AlertError as e:
         print("alerts.py: %s" % e, file=sys.stderr)

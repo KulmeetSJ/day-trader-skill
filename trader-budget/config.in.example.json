@@ -1,0 +1,28 @@
+{
+  "market": "IN",
+  "currency": "INR",
+  "budget": 100000,
+  "cash_buffer_pct": 10,
+  "max_position_pct": 75,
+  "max_order_inr": 75000,
+  "min_order_inr": 100,
+  "max_loss_per_trade_inr": 2000,
+  "max_daily_loss_inr": 5000,
+  "max_trades_per_day": 3,
+  "max_orders_per_day": 10,
+  "min_reward_risk": 1.0,
+  "require_stop": true,
+  "no_entries_before": "09:30",
+  "no_entries_after": "15:00",
+  "flat_by": "15:20",
+  "fractional": false,
+  "broker": "paper",
+  "paper": true,
+  "blocked": [],
+  "allow_options": false,
+  "allow_margin": false,
+  "allow_short": false,
+  "pdt_guard": false,
+  "primary_exchange": "NSE"
+}
+

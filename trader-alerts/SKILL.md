@@ -101,6 +101,24 @@ Daylight saving time is worked out in the tool, so it needs no time zone
 files and ignores the computer's own zone. For any other year it says the
 holiday list is unknown.
 
+## Indian market (NSE/BSE) clock and profile
+
+Pass `--market IN` (or set `"market": "IN"` in `trader/config.json`) to use the
+Indian market engine (IST = UTC+05:30):
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock --market IN               # NSE open or closed, session bars
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote RELIANCE TCS --market IN  # quotes for canonical Indian scrips
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" history RELIANCE --market IN    # 5-minute bars aligned to IST
+```
+
+- Normal equity continuous session 09:15 to 15:30 IST (75 five-minute bars).
+- Closing Auction Session (CAS) modeling with 3 date-effective regimes (Pre-CAS, CAS V1 20-min auction, CAS V2 10-min auction).
+- Verified holiday calendars for 2025 and 2026 from official NSE/BSE circulars.
+- Dynamic session bar calculations for special sessions (e.g. 1-hour Diwali Muhurat Trading = 12 bars).
+- Data quality tier classification: all quotes and bars are explicitly labeled `DELAYED`, `HISTORICAL`, or `SIMULATED`, and never presented as real-time.
+- Granular session phases: pre-open order entry (09:00 to 09:08), order matching (09:08 to 09:12), buffer (09:12 to 09:15), continuous trading, closing auction order entry, equilibrium matching, and post-closing (15:50 to 16:00).
+
 ## Steps
 
 1. Right after trader-exit writes the plan, run `add --from-plan`. Confirm
