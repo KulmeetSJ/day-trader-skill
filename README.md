@@ -2,12 +2,15 @@
 
 11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.
 
-Free, MIT, no signup, no API key. The tools are plain Python that read free
-public data: Yahoo Finance charts, Nasdaq Trader's symbol lists, SEC EDGAR
-and the House Clerk.
+Now with **BharatTrader AI**: full native support for **Indian stock markets (NSE / BSE in INR)** alongside **US stock markets (NYSE / NASDAQ in USD)**.
 
-One scans thousands of charts for setups. Another tracks breaking news on
-every stock you watch. One watches a setup bar by bar and tells you the moment
+Free, MIT, no signup, no API key. The tools are plain Python that read free
+public data: Yahoo Finance charts, Nasdaq Trader's symbol lists, NSE/BSE
+security masters, SEC EDGAR, and regulatory disclosures.
+
+One scans thousands of charts for setups across US and Indian indices (NIFTY 50,
+NIFTY 100, F&O). Another tracks breaking news on every stock you watch. One
+watches a setup bar by bar in market hours (EST or IST) and tells you the moment
 to get in, and another sets your stop and your target before you do. And the
 craziest one is the Time Machine: before you risk a dollar, it replays the
 rest of the session 10,000 times from the stock's own recent bars, plus every
@@ -19,14 +22,15 @@ an order on its own. Paper trading is the default.
 > **Looking for the original Trader skill?** Copy an investor's 13F, the
 > stock screener, tax lots and rebalancing live in
 > [github.com/Jakeschincariol/trader-skill](https://github.com/Jakeschincariol/trader-skill).
-> This repo is its day-trading sequel: the Trader skill v2.
+> This repo is its day-trading sequel: the Trader skill v2, now with full Indian
+> stock market (NSE/BSE) integration.
 
 ## Install
 
 Paste this into Claude:
 
 ```
-https://github.com/Jakeschincariol/day-trader-skill
+https://github.com/KulmeetSJ/day-trader-skill
 
 install skill
 ```
@@ -34,7 +38,7 @@ install skill
 Or as a plugin, in Claude Code:
 
 ```
-/plugin marketplace add Jakeschincariol/day-trader-skill
+/plugin marketplace add KulmeetSJ/day-trader-skill
 /plugin install day-trader-skill@day-trader-skill
 ```
 
@@ -43,7 +47,7 @@ Claude Code namespaces plugin skills, so installed as a plugin they show up as
 plain `/trader-scanner`:
 
 ```bash
-git clone https://github.com/Jakeschincariol/day-trader-skill.git
+git clone https://github.com/KulmeetSJ/day-trader-skill.git
 cp -r day-trader-skill/trader-* ~/.claude/skills/
 ```
 
@@ -52,26 +56,23 @@ Project-local instead of global: copy the same folders into your repo's
 top of a chat and it runs as a mode. You lose the Python tools, but the method
 works.
 
-The tools need Python 3.8 or newer. Nothing to pip install. The SEC tools
-(news filings, the analyst) ask you to identify yourself: put your name and
-email in `trader/config.json` (`"sec_user_agent": "Your Name you@example.com"`)
-or in the `SEC_USER_AGENT` environment variable.
+The tools need Python 3.8 or newer. Nothing to pip install. Standard library only.
 
 ## The eleven
 
 | command | job | what it does |
 | --- | --- | --- |
-| `/trader-scanner` | Chart Scanner | Scans thousands of charts for setups: opening-range breakouts, flags, oversold bounces. |
-| `/trader-news` | News Monitor | Tracks breaking news on every stock you watch and flags what moves it. |
-| `/trader-entry` | Entry Timer | Watches a setup bar by bar and tells you the moment to get in. |
-| `/trader-exit` | Exit Planner | Sets your stop and your target before you enter, so you know when to get out. |
-| `/trader-timemachine` | Time Machine | Replays every possible outcome of a trade before you risk a dollar: 10,000 simulated sessions plus every past time the setup fired. |
-| `/trader-risk` | Risk Manager | Checks every trade against your limits and stops anything over them. |
-| `/trader-budget` | Budget Manager | Sizes every position to your budget and your max loss per trade. |
-| `/trader-broker` | Order Executor | Sends approved orders to your broker, paper trading by default, never without your yes. |
-| `/trader-alerts` | Price Alerts | Rings when a price, a stop or the opening bell hits. |
-| `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
-| `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
+| `/trader-scanner` | Chart Scanner | Scans thousands of charts (US equities or Indian NIFTY 50 / NIFTY 100 / F&O) for setups: opening-range breakouts, flags, oversold bounces. |
+| `/trader-news` | News Monitor | Tracks breaking news and corporate disclosures on every stock you watch and flags what moves it. |
+| `/trader-entry` | Entry Timer | Watches a setup bar by bar in market hours (EST or IST) and tells you the moment to get in. |
+| `/trader-exit` | Exit Planner | Sets your stop and your target before you enter, rounded to exchange tick sizes (e.g. ₹0.05), with session flat_by rules (15:55 ET / 15:20 IST). |
+| `/trader-timemachine` | Time Machine | Replays every possible outcome of a trade before you risk capital: 10,000 simulated sessions over historical 5-minute bars (including Indian 75-bar regular / 72-bar CAS grids). |
+| `/trader-risk` | Risk Manager | Pre-trade safety gate checking loss limits, market hours, holiday calendars, and SEBI Trade-to-Trade restrictions. |
+| `/trader-budget` | Budget Manager | Sizes every position to your budget ($ USD or ₹ INR) and max loss per trade, respecting lot sizes and capital caps. |
+| `/trader-broker` | Order Executor | Renders plain-English tickets, paper trading by default, requiring your explicit yes before anything is placed. |
+| `/trader-alerts` | Price Alerts | Rings when a price, stop, target, or closing time (15:20 IST / 15:55 ET) hits. |
+| `/trader-analyst` | Earnings Analyst | Reads corporate filings and financial reports and sums up what changed. |
+| `/trader-pelosi` | Smart Money / Disclosures | Reads institutional, insider and regulatory trading disclosures. |
 
 ## How to use it
 
@@ -84,7 +85,7 @@ alerts: stop, target, flat by the close                                       (w
 news / analyst / pelosi                                                        (on a schedule)
 ```
 
-An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
+### Example 1: US Market Trade (Tesla on NASDAQ)
 
 1. **`/trader-scanner`** at 10:15 AM ET: of the 231 charts in the reel's
    scan, 42 had closed above their 15-minute opening range. TSLA is one: range 354.47 to 362.18,
@@ -120,12 +121,36 @@ An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 9. **`/trader-alerts`** rings on the stop, the target and at 3:55 PM to
    flatten whatever is still open.
 
+### Example 2: Indian Market Trade (Reliance Industries on NSE)
+
+1. **`/trader-scanner`** at 10:35 AM IST (`--market IN`): scans NIFTY constituents.
+   RELIANCE triggers an opening-range breakout above its 15-minute opening range
+   (09:15-09:30 range ₹2,836.00 to ₹2,848.00; the 10:25 bar closed at ₹2,849.00, +0.04% over).
+2. **`/trader-entry`** verifies breakout trigger at 10:30 AM IST at ₹2,849.00.
+3. **`/trader-exit`** plans the trade with official tick size ₹0.05: stop at
+   opening-range midpoint ₹2,842.00 (risk ₹7.00/share), target 2R at ₹2,863.00,
+   flat by 15:20 IST ahead of the closing auction session.
+4. **`/trader-timemachine`** replays 10,000 simulations over historical IST
+   5-minute bars: draws from RELIANCE's own sessions on the Indian 60-bar intraday grid.
+5. **`/trader-budget`** with a ₹1,00,000 account and ₹2,000 max loss sizes the trade:
+   position cap (75% = ₹75,000) binds at 26 shares (₹74,074). Max loss at stop is ₹182.
+   Generates bracket order with INR pricing.
+6. **`/trader-risk`** verifies pre-trade rules: IST entry window (09:30-15:00 IST),
+   NSE holiday calendar, non-T2T equity series verification, and loss limits. PASS.
+7. **`/trader-broker`** renders the ticket in plain English (`ORDER 1 of 1, PAPER account, Paper Broker (NSE/BSE)`).
+   User types "yes buy 26 RELIANCE". Order executed in paper portfolio (`trader/portfolio.json`).
+8. **`/trader-alerts`** monitors the position: stop (₹2,842.00), target (₹2,863.00),
+   and rings at 15:20 IST: `ALERT Flat by close: it is 15:20 IST`.
+9. **`/trader-broker flatten`** generates sell ticket for 26 shares, passes risk,
+   and closes the position before 15:30 IST market close.
+
 ## The tools
 
 All standard-library Python. The data tools read public endpoints and are
 polite about it.
 
 ```bash
+# US Stock Market (default)
 python3 trader-scanner/scan.py universe                                # ~5,900 US stocks, Nasdaq Trader
 python3 trader-scanner/scan.py daily                                   # pre-market setups, whole universe
 python3 trader-scanner/scan.py orb --at 10:15                          # opening-range breakouts so far
@@ -141,6 +166,19 @@ python3 trader-alerts/alerts.py add --from-plan                        # stop, t
 python3 trader-alerts/alerts.py check                                  # rings what hit, once
 python3 trader-analyst/facts.py TSLA                                   # quarters, growth, EPS
 python3 trader-pelosi/ptr.py index --member pelosi                     # her PTRs this year
+
+# Indian Stock Market (NSE / BSE)
+python3 trader-scanner/scan.py universe --market IN --index NIFTY50   # NIFTY 50 universe
+python3 trader-scanner/scan.py orb --market IN --at 10:35             # Indian ORB scan
+python3 trader-entry/entry.py check RELIANCE --setup orb --market IN   # IST bar-by-bar entry timer
+python3 trader-exit/exit.py plan --from trader/entry.json --market IN  # Tick size ₹0.05, flat_by 15:20 IST
+python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market IN  # 10k IST replays
+python3 trader-budget/size.py --plan trader/plan.json --config trader/config.json --market IN  # INR sizing
+python3 trader-risk/check.py --orders trader/orders.json --config trader/config.json --market IN  # Pre-trade gate
+python3 trader-broker/ticket.py show --orders trader/orders.json --market IN  # Plain ticket (₹)
+python3 trader-alerts/alerts.py clock --market IN                      # NSE market & CAS phase status
+python3 trader-alerts/alerts.py quote RELIANCE TCS --market IN         # Delayed quotes (₹)
+python3 trader-alerts/alerts.py check --market IN                      # Evaluate stop/target/flat-by
 ```
 
 ```bash
@@ -148,9 +186,10 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests run offline, on fixtures cut from real data: TSLA's 5-minute bars
-for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
-TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
-real XBRL facts. They reproduce every number in the example above.
+for the 60 days to October 19 2026, RELIANCE's 5-minute bars on NSE, the
+10:15 AM opening-range scan, Yahoo's TSLA headlines that morning, the House
+Clerk's 2026 index, real PTR text, and real XBRL facts. They reproduce every
+number in the examples above.
 
 ## Fine print
 
@@ -166,13 +205,12 @@ yes for it in the chat. Set your brokerage tool to "Needs approval" in Claude
 own "Allow once / Deny" card is a second check. No options, margin, short
 selling or leverage unless you turn them on.
 
-**Paper first.** `"paper": true` is the default in `config.example.json`, and
-Alpaca's MCP server defaults to its paper account. Keys live in environment
-variables, never in the chat.
+**Paper first.** `"paper": true` is the default in `config.example.json` and
+`config.in.example.json`. Keys live in environment variables, never in the chat.
 
 **The Time Machine is a simulation, not a prediction.** It is built from the
-stock's own last 60 days of 5-minute bars. The future can do things those 60
-days never did: an earnings report, a halt, a headline. Treat its odds as a
+stock's own recent 5-minute bars. The future can do things past sessions
+never did: an earnings report, a halt, a headline. Treat its odds as a
 reality check, never as a promise.
 
 **A stop is a plan, not a guarantee.** In a fast market or across a gap, a
@@ -184,17 +222,13 @@ official API: it can lag, change or rate-limit you. The scanner and the entry
 timer read 1-minute or 5-minute bars, not every tick. Check anything that
 matters against your broker before you act on it.
 
-**Day-trading rules.** FINRA removed the $25,000 pattern-day-trader minimum
-on June 4, 2026 (Regulatory Notice 26-10), and brokers may phase the change
-in until October 20, 2027, so yours may still apply the old rule. If it does,
-set `"pdt_guard": true` and `/trader-risk` counts your day trades.
-
-**Congress's trades are public, not inside information.** Members must disclose
-trades over $1,000 within 45 days (the STOCK Act). The Pelosi skill reads those
-public filings the minute they post.
+**Day-trading rules & regulatory frameworks:**
+- **US Markets**: FINRA removed the $25,000 pattern-day-trader minimum on June 4, 2026 (Regulatory Notice 26-10), and brokers may phase the change in until October 20, 2027. If yours still applies the rule, set `"pdt_guard": true` and `/trader-risk` counts your day trades.
+- **Indian Markets (SEBI)**: The US PDT rule does not apply in India. However, SEBI Trade-to-Trade (T2T / BE / BZ series) regulations strictly prohibit intraday squaring-off for securities transferred to the trade-for-trade segment. `/trader-risk` inspects instrument metadata and automatically blocks any intraday buy/sell proposal for T2T stocks.
+- **NSE Closing Auction Session (CAS)**: Eligible F&O stocks participate in the Closing Auction Session starting at 15:15 IST. Day trades should be flattened before 15:20 IST (`"flat_by": "15:20"`).
 
 **Taxes.** Day-trading gains are short-term gains, and frequent trading makes
-wash sales likely. Nothing here is tax advice.
+wash sales likely. In India, speculative intraday equity trading is taxed as business income under Section 43(5) of the Income Tax Act. Nothing here is tax advice.
 
 ## BharatTrader AI (Indian Market Support)
 

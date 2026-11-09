@@ -27,7 +27,7 @@ import symbols_in
 import calendar_in
 
 # User agent and provider constants
-DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; BharatTrader/1.0; +https://github.com/Jakeschincariol/day-trader-skill)"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; BharatTrader/1.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 DEFAULT_TIMEOUT = 10
 DEFAULT_PAUSE = 0.3
