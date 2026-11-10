@@ -1,7 +1,12 @@
 import json
 import os
 import re
+import sys
 import unittest
+
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
 
 from _load import ROOT
 
@@ -39,7 +44,12 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in (".agents", "agents"))
+        # trader/ is the designated local runtime state directory defined in .gitignore.
+        # If present, ensure it is a valid runtime directory, then exclude from source folder comparison.
+        trader_path = os.path.join(ROOT, "trader")
+        if os.path.exists(trader_path):
+            self.assertTrue(os.path.isdir(trader_path), "trader at root must be a directory")
+        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in (".agents", "agents", "trader"))
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):

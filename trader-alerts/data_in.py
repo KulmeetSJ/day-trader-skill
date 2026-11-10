@@ -25,6 +25,7 @@ if _alerts_dir not in sys.path:
 
 import symbols_in
 import calendar_in
+import instruments
 
 # User agent and provider constants
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; BharatTrader/1.0; +https://github.com/KulmeetSJ/day-trader-skill)"
@@ -89,6 +90,14 @@ class MarketDataProvider:
 
     def get_daily_bars(self, symbol, range_str="1y", exchange="NSE", now=None):
         """Fetch daily historical OHLCV bars for screening and technical indicators."""
+        raise NotImplementedError
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+        """Fetch or construct option chain for underlying symbol and expiry."""
+        raise NotImplementedError
+
+    def get_derivatives_master(self, exchange="NSE"):
+        """Fetch or construct derivatives master containing active contracts and lot sizes."""
         raise NotImplementedError
 
 
@@ -407,6 +416,24 @@ class YahooMarketDataProvider(MarketDataProvider):
             "meta": meta,
         }
 
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+        """Fetch option chain for Indian derivatives.
+
+        Identifies provider capability limitation: Yahoo Finance does not provide
+        reliable real-time option chains with open interest and Greeks for Indian equities/indices.
+        """
+        raise MissingDataError(
+            "Yahoo Finance does not provide reliable Indian options chains with live OI and Greeks. "
+            "Use SimulatedMarketDataProvider (simulated tier) or official broker adapters for options trading."
+        )
+
+    def get_derivatives_master(self, exchange="NSE"):
+        """Fetch derivatives instrument master."""
+        raise MissingDataError(
+            "Yahoo Finance does not provide Indian derivatives instrument master. "
+            "Use authoritative NSE/BSE metadata files or local instrument cache."
+        )
+
 
 class OfflineMarketDataProvider(MarketDataProvider):
     """Offline market data provider for tests, air-gapped environments, and replay.
@@ -484,12 +511,372 @@ class OfflineMarketDataProvider(MarketDataProvider):
         res["tier"] = self.tier
         return res
 
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+        canonical = symbols_in.normalize_symbol(symbol)
+        try:
+            path = self._locate_file(canonical, "chain")
+        except SymbolNotFoundError:
+            try:
+                path = self._locate_file(canonical, "options")
+            except SymbolNotFoundError:
+                path = self._locate_file(canonical, "option-chain")
+        text = self._read_file(path)
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data["source"] = "offline"
+            data["tier"] = self.tier
+        return data
+
+    def get_derivatives_master(self, exchange="NSE"):
+        try:
+            path = self._locate_file("derivatives", "master")
+        except SymbolNotFoundError:
+            path = self._locate_file("fo_mktlots", "csv")
+        return self._read_file(path)
+
+
+# -----------------------------------------------------------------------------
+# Options Pricing and Greeks Engine (Black-Scholes-Merton)
+# -----------------------------------------------------------------------------
+
+def norm_cdf(x):
+    """Cumulative standard normal distribution function using math.erf."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def norm_pdf(x):
+    """Standard normal probability density function."""
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+
+def black_scholes(spot, strike, t_years, rate=0.07, vol=0.18, option_type="CE"):
+    """Compute European option price and analytical Greeks.
+
+    - spot: Current price of underlying asset (S)
+    - strike: Option strike price (K)
+    - t_years: Time to expiry in years (e.g. 15/365.0)
+    - rate: Annualized risk-free interest rate (e.g. 0.07 for 7%)
+    - vol: Annualized implied volatility (e.g. 0.18 for 18%)
+    - option_type: 'CE' for Call or 'PE' for Put
+
+    Returns dict with keys:
+    - price: Option theoretical premium
+    - delta: Sensitivity to underlying price (+ for CE, - for PE)
+    - gamma: Rate of change of delta per point move in underlying
+    - theta: Daily time decay in premium (Rs / day)
+    - vega: Sensitivity to 1% change in implied volatility
+    - rho: Sensitivity to 1% change in interest rate
+    """
+    ot = str(option_type).upper().strip()
+    s = float(spot)
+    k = float(strike)
+    t = max(float(t_years), 0.0)
+    r = float(rate)
+    v = max(float(vol), 0.001)
+
+    if t <= 0.0001:
+        # At or past expiry
+        if ot == "CE":
+            intrinsic = max(0.0, s - k)
+            delta = 1.0 if s > k else 0.0
+        else:
+            intrinsic = max(0.0, k - s)
+            delta = -1.0 if k > s else 0.0
+        return {
+            "price": max(0.05, round(intrinsic, 2)),
+            "delta": round(delta, 4),
+            "gamma": 0.0,
+            "theta": 0.0,
+            "vega": 0.0,
+            "rho": 0.0,
+        }
+
+    v_sqrt_t = v * math.sqrt(t)
+    d1 = (math.log(s / k) + (r + 0.5 * v * v) * t) / v_sqrt_t
+    d2 = d1 - v_sqrt_t
+    exp_rt = math.exp(-r * t)
+    pdf_d1 = norm_pdf(d1)
+
+    gamma = pdf_d1 / (s * v_sqrt_t)
+    vega = (s * pdf_d1 * math.sqrt(t)) / 100.0  # per 1% vol
+
+    if ot == "CE":
+        price = s * norm_cdf(d1) - k * exp_rt * norm_cdf(d2)
+        delta = norm_cdf(d1)
+        theta = (- (s * pdf_d1 * v) / (2.0 * math.sqrt(t)) - r * k * exp_rt * norm_cdf(d2)) / 365.0
+        rho = (k * t * exp_rt * norm_cdf(d2)) / 100.0
+    else:
+        price = k * exp_rt * norm_cdf(-d2) - s * norm_cdf(-d1)
+        delta = norm_cdf(d1) - 1.0
+        theta = (- (s * pdf_d1 * v) / (2.0 * math.sqrt(t)) + r * k * exp_rt * norm_cdf(-d2)) / 365.0
+        rho = (-k * t * exp_rt * norm_cdf(-d2)) / 100.0
+
+    return {
+        "price": max(0.05, round(price, 2)),
+        "delta": round(delta, 4),
+        "gamma": round(gamma, 6),
+        "theta": round(theta, 2),
+        "vega": round(vega, 2),
+        "rho": round(rho, 2),
+    }
+
+
+def calculate_iv(market_price, spot, strike, t_years, rate=0.07, option_type="CE", is_call=None):
+    """Compute implied volatility using bisection solver."""
+    target = float(market_price)
+    if is_call is not None:
+        ot = "CE" if is_call else "PE"
+    else:
+        ot = str(option_type).upper().strip()
+    low_v = 0.01
+    high_v = 4.0
+
+    intrinsic = max(0.0, spot - strike) if ot == "CE" else max(0.0, strike - spot)
+    if target <= intrinsic:
+        return 0.05
+
+    for _ in range(50):
+        mid_v = (low_v + high_v) / 2.0
+        calc = black_scholes(spot, strike, t_years, rate=rate, vol=mid_v, option_type=ot)["price"]
+        diff = calc - target
+        if abs(diff) < 0.01 or (high_v - low_v) < 0.001:
+            return round(mid_v, 4)
+        if diff > 0:
+            high_v = mid_v
+        else:
+            low_v = mid_v
+    return round(mid_v, 4)
+
+
+class OptionChain:
+    """Structured representation of an Indian equity or index option chain."""
+
+    def __init__(self, underlying, underlying_price, expiry, strikes_data,
+                 data_tier=DataTier.DELAYED, timestamp=None, exchange="NSE"):
+        self.underlying = underlying
+        self.underlying_price = float(underlying_price)
+        self.expiry = str(expiry)
+        self.data_tier = data_tier
+        self.timestamp = timestamp or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.exchange = exchange
+        self.strikes_data = strikes_data  # dict of strike -> {'ce': ..., 'pe': ...}
+        self.sorted_strikes = sorted(self.strikes_data.keys())
+
+    @property
+    def atm_strike(self):
+        """Return the strike closest to the current underlying price."""
+        if not self.sorted_strikes:
+            return None
+        return min(self.sorted_strikes, key=lambda k: abs(k - self.underlying_price))
+
+    def get_strikes(self):
+        return list(self.sorted_strikes)
+
+    def get_contract(self, strike, option_type="CE"):
+        k = float(strike)
+        entry = self.strikes_data.get(k)
+        if not entry:
+            return None
+        ot = option_type.lower()
+        return entry.get(ot)
+
+    def select_strike(self, strategy="ATM", option_type="CE", offset=0):
+        """Select strike based on strategy: ATM, ITM1, ITM2, OTM1, OTM2, or offset."""
+        atm = self.atm_strike
+        if atm is None:
+            return None
+        idx = self.sorted_strikes.index(atm)
+        strat = str(strategy).upper().strip()
+        ot = str(option_type).upper().strip()
+
+        if strat == "ATM":
+            eff_offset = 0
+        elif strat == "ITM1":
+            eff_offset = -1 if ot == "CE" else 1
+        elif strat == "ITM2":
+            eff_offset = -2 if ot == "CE" else 2
+        elif strat == "OTM1":
+            eff_offset = 1 if ot == "CE" else -1
+        elif strat == "OTM2":
+            eff_offset = 2 if ot == "CE" else -2
+        else:
+            eff_offset = offset
+
+        target_idx = max(0, min(len(self.sorted_strikes) - 1, idx + eff_offset))
+        return self.sorted_strikes[target_idx]
+
+    @property
+    def pcr(self):
+        """Calculate Put-Call Ratio (Total PE OI / Total CE OI)."""
+        ce_oi = sum(s.get("ce", {}).get("open_interest", 0) for s in self.strikes_data.values())
+        pe_oi = sum(s.get("pe", {}).get("open_interest", 0) for s in self.strikes_data.values())
+        if ce_oi <= 0:
+            return 1.0
+        return round(float(pe_oi) / float(ce_oi), 3)
+
+    def to_dict(self):
+        return {
+            "underlying": self.underlying,
+            "underlying_price": self.underlying_price,
+            "expiry": self.expiry,
+            "exchange": self.exchange,
+            "tier": self.data_tier,
+            "timestamp": self.timestamp,
+            "atm_strike": self.atm_strike,
+            "pcr": self.pcr,
+            "strikes": [
+                {
+                    "strike": k,
+                    "ce": self.strikes_data[k].get("ce"),
+                    "pe": self.strikes_data[k].get("pe"),
+                }
+                for k in self.sorted_strikes
+            ]
+        }
+
+
+class SimulatedMarketDataProvider(MarketDataProvider):
+    """Generates synthetic, fully consistent Indian market data and options chains.
+
+    Useful for paper trading, scenario replay, and testing derivatives strategies.
+    Explicitly labeled with DataTier.SIMULATED.
+    """
+
+    def __init__(self, base_provider=None, default_iv=0.18, rate=0.07):
+        self.base_provider = base_provider or YahooMarketDataProvider()
+        self.default_iv = default_iv
+        self.rate = rate
+
+    def get_quote(self, symbol, exchange="NSE"):
+        # If symbol is a derivative contract, resolve price using Black-Scholes
+        if symbols_in.is_derivative_symbol(symbol):
+            parsed = symbols_in.parse_derivative_symbol(symbol)
+            underlying = parsed["underlying"]
+            try:
+                und_q = self.base_provider.get_quote(underlying, exchange=exchange)
+                spot = und_q["price"]
+            except Exception:
+                spot = 24000.0 if underlying in ("NIFTY", "^NSEI") else 2800.0
+
+            if parsed["asset_type"] == "FUTURES":
+                price = round(spot * (1.0 + self.rate * (15.0 / 365.0)), 2)
+                return {
+                    "symbol": parsed["canonical_symbol"],
+                    "exchange": exchange,
+                    "price": price,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "tier": DataTier.SIMULATED,
+                    "source": "simulated",
+                    "is_real_time": False,
+                }
+            else:
+                strike = parsed["strike"]
+                opt_type = parsed["option_type"]
+                exp_dt = calendar_in.get_next_expiry(underlying=underlying, exchange=exchange)
+                days = max(1, calendar_in.days_to_expiry(exp_dt))
+                t_years = days / 365.0
+                bs = black_scholes(spot, strike, t_years, rate=self.rate, vol=self.default_iv, option_type=opt_type)
+                return {
+                    "symbol": parsed["canonical_symbol"],
+                    "exchange": exchange,
+                    "price": bs["price"],
+                    "strike": strike,
+                    "option_type": opt_type,
+                    "expiry": exp_dt.strftime("%Y-%m-%d"),
+                    "greeks": bs,
+                    "tier": DataTier.SIMULATED,
+                    "source": "simulated",
+                    "is_real_time": False,
+                }
+
+        return self.base_provider.get_quote(symbol, exchange=exchange)
+
+    def get_quotes(self, symbols, exchange="NSE"):
+        return {s: self.get_quote(s, exchange=exchange) for s in symbols}
+
+    def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
+        return self.base_provider.get_intraday_bars(symbol, interval=interval, range_str=range_str,
+                                                    exchange=exchange, now=now, is_cas_eligible=is_cas_eligible)
+
+    def get_daily_bars(self, symbol, range_str="1y", exchange="NSE", now=None):
+        return self.base_provider.get_daily_bars(symbol, range_str=range_str, exchange=exchange, now=now)
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
+        canonical = symbols_in.normalize_symbol(symbol)
+        if spot_price is not None:
+            spot = float(spot_price)
+        else:
+            try:
+                q = self.base_provider.get_quote(canonical, exchange=exchange)
+                spot = float(q["price"])
+            except Exception:
+                spot = 24000.0 if canonical in ("NIFTY", "^NSEI") else 2800.0
+
+        exp_dt = calendar_in.get_next_expiry(expiry or datetime.date.today(), underlying=canonical, exchange=exchange)
+        days = max(1, calendar_in.days_to_expiry(exp_dt))
+        t_years = days / 365.0
+
+        step = instruments.get_strike_interval(canonical, spot_price=spot)
+        base_atm = round(spot / step) * step
+
+        strikes_data = {}
+        for i in range(-10, 11):
+            k = round(base_atm + i * step, 2)
+            ce_bs = black_scholes(spot, k, t_years, rate=self.rate, vol=self.default_iv, option_type="CE")
+            pe_bs = black_scholes(spot, k, t_years, rate=self.rate, vol=self.default_iv, option_type="PE")
+
+            dist = abs(i)
+            base_oi = max(5000, int(100000 / (1.0 + 0.3 * dist * dist)))
+
+            strikes_data[k] = {
+                "ce": {
+                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "CE"),
+                    "last_price": ce_bs["price"],
+                    "bid": max(0.05, round(ce_bs["price"] - 0.10, 2)),
+                    "ask": round(ce_bs["price"] + 0.10, 2),
+                    "volume": int(base_oi * 0.4),
+                    "open_interest": base_oi,
+                    "change_in_oi": int(base_oi * 0.05),
+                    "iv": self.default_iv,
+                    "greeks": ce_bs,
+                    "tier": DataTier.SIMULATED,
+                },
+                "pe": {
+                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "PE"),
+                    "last_price": pe_bs["price"],
+                    "bid": max(0.05, round(pe_bs["price"] - 0.10, 2)),
+                    "ask": round(pe_bs["price"] + 0.10, 2),
+                    "volume": int(base_oi * 0.35),
+                    "open_interest": int(base_oi * 0.9),
+                    "change_in_oi": int(base_oi * 0.04),
+                    "iv": self.default_iv,
+                    "greeks": pe_bs,
+                    "tier": DataTier.SIMULATED,
+                }
+            }
+
+        return OptionChain(
+            underlying=canonical,
+            underlying_price=spot,
+            expiry=exp_dt.strftime("%Y-%m-%d"),
+            strikes_data=strikes_data,
+            data_tier=DataTier.SIMULATED,
+            exchange=exchange,
+        )
+
+    def get_derivatives_master(self, exchange="NSE"):
+        return self.base_provider.get_derivatives_master(exchange=exchange)
+
 
 # ---------------------------------------------------------------- Provider Registry
 
 _REGISTRY = {
     "yahoo": YahooMarketDataProvider,
     "offline": OfflineMarketDataProvider,
+    "simulated": SimulatedMarketDataProvider,
 }
 
 
@@ -498,14 +885,14 @@ def register_provider(name, provider_cls):
     _REGISTRY[name.lower()] = provider_cls
 
 
-def get_provider(name=None, **kwargs):
+def get_provider(name=None, source=None, **kwargs):
     """Factory to retrieve a configured market data provider instance.
 
     Checks environment variable BHARAT_DATA_PROVIDER (defaults to 'yahoo').
     """
     if name is None:
-        name = os.environ.get("BHARAT_DATA_PROVIDER", "yahoo")
-    name = name.lower()
+        name = source or os.environ.get("BHARAT_DATA_PROVIDER", "yahoo")
+    name = str(name).lower()
     if name not in _REGISTRY:
         raise DataError("Unknown market data provider: '%s'. Available: %s" % (name, list(_REGISTRY.keys())))
     return _REGISTRY[name](**kwargs)
@@ -629,4 +1016,9 @@ def fetch_intraday_bars(symbol, interval="5m", range_str="60d", exchange="NSE", 
 def fetch_daily_bars(symbol, range_str="1y", exchange="NSE", now=None, provider=None):
     prov = provider or get_provider()
     return prov.get_daily_bars(symbol, range_str=range_str, exchange=exchange, now=now)
+
+
+def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_price=None):
+    prov = provider or get_provider("simulated")
+    return prov.get_option_chain(symbol, expiry=expiry, exchange=exchange, spot_price=spot_price)
 

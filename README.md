@@ -170,6 +170,7 @@ python3 trader-pelosi/ptr.py index --member pelosi                     # her PTR
 # Indian Stock Market (NSE / BSE)
 python3 trader-scanner/scan.py universe --market IN --index NIFTY50   # NIFTY 50 universe
 python3 trader-scanner/scan.py orb --market IN --at 10:35             # Indian ORB scan
+python3 trader-news/news.py --tickers RELIANCE TCS INFY --hours 48    # Indian corporate news in IST
 python3 trader-entry/entry.py check RELIANCE --setup orb --market IN   # IST bar-by-bar entry timer
 python3 trader-exit/exit.py plan --from trader/entry.json --market IN  # Tick size ₹0.05, flat_by 15:20 IST
 python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market IN  # 10k IST replays
@@ -179,6 +180,9 @@ python3 trader-broker/ticket.py show --orders trader/orders.json --market IN  # 
 python3 trader-alerts/alerts.py clock --market IN                      # NSE market & CAS phase status
 python3 trader-alerts/alerts.py quote RELIANCE TCS --market IN         # Delayed quotes (₹)
 python3 trader-alerts/alerts.py check --market IN                      # Evaluate stop/target/flat-by
+python3 trader-analyst/facts.py RELIANCE TCS INFY                      # Indian quarterly & TTM fundamentals
+python3 trader-analyst/facts.py RELIANCE --annual                      # 4-year annual financials
+python3 trader-analyst/facts.py RELIANCE --json                        # Full structured fundamentals JSON
 ```
 
 ```bash
@@ -234,6 +238,69 @@ wash sales likely. In India, speculative intraday equity trading is taxed as bus
 
 BharatTrader AI adapts the trading tools for the Indian equity and derivatives market (NSE and BSE).
 
+### Pre-Market Readiness Checklist
+
+Before trading any Indian market session, run the automated readiness check to verify market status, instrument masters, expiry calendars, data tiers, and safety gates:
+
+```bash
+# Pre-market health and readiness check for Indian markets (NSE/BSE)
+python3 trader-alerts/alerts.py readiness --market IN
+
+# JSON output mode for programmatic monitoring or automated sidecars
+python3 trader-alerts/alerts.py readiness --market IN --json
+```
+
+The readiness command reports four independent statuses:
+- **Market Session** (`OPEN` / `CLOSED`): Indicates whether the continuous exchange trading session (09:15-15:30 IST) is currently active.
+- **Data Availability** (`FRESH` / `DELAYED` / `STALE` / `UNAVAILABLE`): Status of incoming quotes and cache freshness.
+- **Analysis Engine** (`AVAILABLE` / `UNAVAILABLE`): Confirms that stock screening, technical indicators, fundamentals, and options analytics are operable.
+- **Paper Trading** (`AVAILABLE` / `UNAVAILABLE`): Confirms that simulated bracket execution and risk gates are operable.
+- **Last Trading Session**: The date of the most recent completed or active exchange trading session.
+
+### 24/7 Research, Analytics & Paper Trading
+
+All stock research, screening, and paper trading capabilities operate 24/7, including weekends, exchange holidays, and off-market hours:
+
+1. **Available 24/7 Regardless of Market Hours**:
+   - Fundamental analysis and filings (`trader-analyst/facts.py`)
+   - Pre-market and daily technical screening (`trader-scanner/scan.py daily`)
+   - News monitoring (`trader-news/news.py`)
+   - Historical replay and Monte Carlo backtesting (`trader-timemachine/timemachine.py`)
+   - Options chain generation and Black-Scholes Greeks (`trader-alerts/data_in.py`, marked `SIMULATED`)
+   - Exit planning (`trader-exit/exit.py plan`)
+   - Position sizing and bracket order generation (`trader-budget/size.py trade`)
+   - Pre-trade risk validation in paper mode (`trader-risk/check.py`)
+
+2. **Historical Candle Analysis vs. Live Signals**:
+   - During live continuous trading (09:15-15:30 IST), strategies emit live entry signals (`TRIGGERED: This is the moment to get in`).
+   - Outside continuous market hours (weekends, holidays, evenings), strategies analyze the latest completed session's historical bars. Signals are explicitly tagged `[HISTORICAL ANALYSIS]` with the last session date, data status, and notice that the market is closed. Stale data is never presented as a live signal.
+
+3. **Exchange-Session Restrictions for Live Operations**:
+   - Continuous polling loops (`entry.py watch`) halt immediately when the exchange is closed (`market closed today`).
+   - Live order execution (`paper: false`) remains strictly blocked outside market hours. Paper trading and hypothetical trade analysis remain available off-hours with safety limits (stops, max loss, position cap) fully enforced.
+
+**Pre-Market Runbook (Step-by-Step Pre-Flight):**
+1. **Sync Exchange Instrument Masters**:
+   Fetch current NSE and BSE equity listings and F&O contract lot sizes:
+   ```bash
+   python3 trader-alerts/instruments.py sync
+   ```
+2. **Verify Session Readiness**:
+   Run `python3 trader-alerts/alerts.py readiness --market IN` and verify that all 6 core subsystem checks pass:
+   - **Market Calendar & Session**: Confirms trading day vs holiday (e.g. Diwali Balipratipada) or special Muhurat trading sessions.
+   - **Instrument Master Cache**: Confirms local cache freshness (< 1 day old) across 2,600+ equities and 220+ F&O underlyings.
+   - **Data Provider & Tiers**: Confirms data quality classification: Quotes are `DELAYED` (15m), options are `SIMULATED`.
+   - **Universe Population**: Verifies constituents for selected index (NIFTY50, NIFTY100, NIFTY500, FNO, SENSEX, ALL, or CUSTOM).
+   - **Derivatives & Expiry Metadata**: Verifies upcoming expiry dates (Tuesday for NSE NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY and stock derivatives, Friday for BSE SENSEX, Monday for BSE BANKEX), strike steps, and lot sizes.
+   - **Configuration & Safety Limits**: Confirms `paper: true` is active, positive capital budget, max loss per trade, and mandatory stop requirement.
+
+3. **Inspect Derivative Contracts**:
+   Verify authoritative contract resolution before market open:
+   ```bash
+   python3 trader-alerts/instruments.py inspect RELIANCE
+   python3 trader-alerts/instruments.py inspect NIFTY26NOV24000CE
+   ```
+
 ### Market Data Configuration
 
 Set the environment variable `BHARAT_DATA_PROVIDER` to choose the data source:
@@ -277,18 +344,28 @@ python3 trader-alerts/alerts.py quote RELIANCE TCS INFY --market IN
 python3 trader-alerts/alerts.py history RELIANCE --market IN --interval 5m --range 5d
 ```
 
-4. Build Indian stock universe (`trader/universe.txt`):
+4. Build Indian stock universe (`trader/universe.txt`) across NSE and BSE:
 
 ```bash
-python3 trader-scanner/scan.py universe --market IN --index NIFTY50   # 50 Nifty constituents
-python3 trader-scanner/scan.py universe --market IN --index NIFTY100  # 100 Nifty constituents
-python3 trader-scanner/scan.py universe --market IN --index FNO       # F&O eligible stocks
+python3 trader-scanner/scan.py universe --market IN --index NIFTY50       # 50 Nifty constituents
+python3 trader-scanner/scan.py universe --market IN --index NIFTY100      # 100 Nifty constituents
+python3 trader-scanner/scan.py universe --market IN --index NIFTY200      # 200 Top Market-Cap constituents
+python3 trader-scanner/scan.py universe --market IN --index NIFTY500      # 500 Broad-Market constituents
+python3 trader-scanner/scan.py universe --market IN --index BANKNIFTY     # 12 Major Banking stocks
+python3 trader-scanner/scan.py universe --market IN --index FINNIFTY     # 20 Financial Services stocks
+python3 trader-scanner/scan.py universe --market IN --index SENSEX        # 30 BSE Sensex Bluechips
+python3 trader-scanner/scan.py universe --market IN --index BSE100        # 100 BSE Large-Caps
+python3 trader-scanner/scan.py universe --market IN --index FNO           # All F&O eligible underlying stocks
+python3 trader-scanner/scan.py universe --market IN --index CASH          # All active listed cash equities
+python3 trader-scanner/scan.py universe --market IN --index CUSTOM        # Custom watchlist from trader/config.json
 ```
 
-5. Run pre-market daily setup scan (breakouts, flags, oversold) on Indian stocks:
+5. Run daily setup scan (breakouts, flags, oversold, MA crossovers, RSI momentum):
 
 ```bash
 python3 trader-scanner/scan.py daily --market IN
+python3 trader-scanner/scan.py daily --market IN --strategy ma_crossover
+python3 trader-scanner/scan.py daily --market IN --strategy rsi_momentum
 ```
 
 6. Run opening-range breakout scan (15-min range 09:15-09:30 IST, first breakout at 09:35 IST):
@@ -298,16 +375,30 @@ python3 trader-scanner/scan.py orb --market IN
 python3 trader-scanner/scan.py orb --market IN --at 10:15
 ```
 
-7. Real-time entry timing check on Indian stocks (IST market hours, 15m ORB):
+7. Real-time entry timing check on Indian stocks and options:
 
 ```bash
+# Equity ORB check
 python3 trader-entry/entry.py check RELIANCE --setup orb --market IN
+
+# Options ORB check: Triggers breakout on NIFTY index and selects ATM Call option
+python3 trader-entry/entry.py check NIFTY --setup options_orb --strike-selection ATM --market IN
+
+# Positional MA Crossover check
+python3 trader-entry/entry.py check TCS --setup ma_crossover --trading-style positional --market IN
 ```
 
-8. Exit plan generation with Indian tick sizes (Rs 0.05 default) and IST closing rules (flat_by 15:20 IST):
+8. Exit plan generation with Indian tick sizes (Rs 0.05 default), options, and closing rules:
 
 ```bash
+# Equity exit plan: stop at opening-range midpoint, 2R target, flat_by 15:20 IST
 python3 trader-exit/exit.py plan --symbol RELIANCE --entry 2850.00 --stop or-mid --target 2R --market IN --write trader/plan.json
+
+# Option contract exit plan: stop 20% under entry premium, 2R target
+python3 trader-exit/exit.py plan --symbol NIFTY26OCT24000CE --entry 125.00 --stop pct:20 --target 2R --market IN --write trader/plan.json
+
+# Positional trade plan: multi-day hold permitted (no 15:20 intraday cutoff)
+python3 trader-exit/exit.py plan --symbol INFY --entry 1920.00 --stop pct:2 --target 2R --trading-style positional --market IN --write trader/plan.json
 python3 trader-exit/exit.py show --plan trader/plan.json
 ```
 
@@ -318,13 +409,17 @@ python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market I
 python3 trader-timemachine/timemachine.py chart --plan trader/plan.json --market IN
 ```
 
-10. Position sizing and capital allocation in INR with lot sizing and Trade-to-Trade checks:
+10. Position sizing and capital allocation in INR with lot sizing, statutory charges, and Trade-to-Trade checks:
 
 ```bash
+# Equity position sizing (single shares, T2T protection, statutory STT/GST calculation)
+python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --market IN --write trader/orders.json
+
+# Option position sizing (sizes in whole lots e.g. 25 shares/contract, caps max loss to premium outlay)
 python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --market IN --write trader/orders.json
 ```
 
-11. Pre-trade risk validation with Indian session window, SEBI Trade-to-Trade enforcement, and PDT exemption:
+11. Pre-trade risk validation with Indian session window, SEBI Trade-to-Trade enforcement, lot multiples, and naked option rejection:
 
 ```bash
 python3 trader-risk/check.py trader/orders.json --config trader/config.json --market IN
@@ -333,7 +428,7 @@ python3 trader-risk/check.py trader/orders.json --config trader/config.json --ma
 12. Use the Python market data API:
 
 ```python
-from data_in import fetch_quote, fetch_intraday_bars, detect_setups
+from data_in import fetch_quote, fetch_intraday_bars, fetch_option_chain, calculate_bs_greeks
 
 # Fetch current delayed quote
 quote = fetch_quote("RELIANCE", exchange="NSE")
@@ -342,7 +437,54 @@ print(quote["price"], quote["currency"], quote["tier"])
 # Fetch 5-minute session bars
 intraday = fetch_intraday_bars("TCS", interval="5m", range_str="5d", exchange="NSE")
 print("Fetched %d continuous bars" % len(intraday["bars"]))
+
+# Fetch Black-Scholes analytical option chain with Greeks and Open Interest
+chain = fetch_option_chain("NIFTY", spot_price=24250.0, days_to_expiry=4)
+atm = chain.atm_strike
+print("ATM Strike:", atm, "Call Premium:", chain.calls[atm]["ltp"], "Delta:", chain.calls[atm]["delta"])
 ```
+
+13. Fundamental analysis for Indian-listed companies (NSE & BSE):
+
+```bash
+# Analyze single Indian company (quarterly statements, margins, publication dates, TTM)
+python3 trader-analyst/facts.py RELIANCE
+
+# Compare multiple Indian companies
+python3 trader-analyst/facts.py RELIANCE TCS INFY
+
+# Include full 4-year annual financials table
+python3 trader-analyst/facts.py RELIANCE --annual
+
+# JSON output mode for programmatic consumption
+python3 trader-analyst/facts.py RELIANCE --json
+
+# Merge fundamental metrics into screener metrics file
+python3 trader-analyst/facts.py RELIANCE TCS INFY --metrics trader/metrics.json
+
+# Offline evaluation with saved fixtures (zero internet access required)
+python3 trader-analyst/facts.py RELIANCE --offline tests/fixtures/trader-analyst/
+```
+
+### Indian Company Fundamental Analysis (`trader-analyst/facts.py`)
+
+Provides comprehensive fundamental analysis for Indian-listed equities (NSE & BSE) using public exchange corporate disclosures:
+
+- **Supported Metrics**:
+  - **Quarterly Financials**: Revenue, Operating Profit (Operating Income / EBITDA), Net Profit, Diluted EPS, Gross Margin %, Operating Margin %, Net Margin %, YoY Growth % vs. same quarter a year earlier, and Official Publication Date.
+  - **Annual Statements**: 4-year financial progression with annual Revenue, Operating Profit, Net Profit, Diluted EPS, Margins, and YoY Growth %.
+  - **Trailing Twelve Months (TTM)**: Sum of latest 4 quarters for revenue, operating profit, net profit, and diluted EPS.
+  - **Balance Sheet Metrics**: Reported Total Assets, Total Debt, Cash & Cash Equivalents, Stockholders' Equity, Debt-to-Equity Ratio, Current Ratio, Book Value per share, and Price-to-Book.
+  - **Cash Flow Metrics**: Annual Operating Cash Flow and Free Cash Flow.
+  - **Next Earnings Date**: Estimated date of the upcoming corporate quarterly results announcement.
+- **Data Quality & Hygiene**:
+  - **Clear Source Label**: Every report displays `[SOURCE: NSE/BSE Corporate Filings via Yahoo Finance | DATA: REPORTED | STATUS: FRESH]` along with the exact reporting period, filing publication date, and freshness timestamp.
+  - **Fail-Closed Missing Values**: Missing data points remain `-` (`null` in JSON) and are never silently substituted with zero.
+  - **No Fabrication**: Consensus estimates are clearly labeled as estimates; reported numbers strictly reflect exchange filings.
+  - **Currency & Units**: Financial figures are displayed in Indian exchange standards (INR Crores, where 1 Cr = Rs 10,000,000, except per-share EPS in Rs) or US$ Millions for ADR filers (e.g. INFY).
+- **Data Limitations**:
+  - Service companies (IT consultancies) and banks that do not report traditional Cost of Goods Sold show gross margin as `-`.
+  - Historical depth covers available public quarterly reporting history (typically 4-5 quarters and 4 fiscal years).
 
 ### Complete End-to-End Indian Paper-Trading Walkthrough
 
@@ -364,10 +506,10 @@ python3 trader-exit/exit.py plan --from trader/entry.json --market IN --write tr
 # 4. Time Machine: 10,000-session Monte Carlo simulation over historical IST session bars
 python3 trader-timemachine/timemachine.py run --plan trader/plan.json --offline tests/fixtures/trader-timemachine/RELIANCE-60d5m.json.gz --market IN
 
-# 5. Budget Manager: Size bracket order to INR account budget and max loss limits
+# 5. Budget Manager: Size bracket order to INR account budget, lot size, and max loss limits
 python3 trader-budget/size.py --plan trader/plan.json --config trader/config.json --now "2026-10-19 10:35" --market IN --write trader/orders.json
 
-# 6. Risk Manager: Pre-trade safety gate (max loss, trade counts, market hours, T2T)
+# 6. Risk Manager: Pre-trade safety gate (max loss, trade counts, market hours, T2T, lot sizes)
 python3 trader-risk/check.py --orders trader/orders.json --config trader/config.json --now "2026-10-19 10:35" --market IN --out trader/state/risk.json
 
 # 7. Order Executor: Render plain-English ticket and confirm order is READY
@@ -403,6 +545,60 @@ python3 trader-broker/ticket.py result --index 1 --status placed --filled-qty 26
 # 17. Decision Log: Inspect complete audit trail of today's trades
 python3 trader-broker/ticket.py log --state trader/state/broker.json --config trader/config.json --now "2026-10-19 15:20"
 ```
+
+### Indian Market Capability Matrix
+
+| Asset Class / Instrument | Support Level | Execution Mode | Data Provider Tier | Capabilities & Limitations |
+| :--- | :--- | :--- | :--- | :--- |
+| **Cash Equities (NSE / BSE)** | Fully Supported | Paper Trading | `DELAYED` (Yahoo 15m) / `HISTORICAL` / `OFFLINE` | Complete support for all listed cash equities. Sectoral and broad indices (NIFTY 50 to 500, SENSEX, BSE 100). SEBI Trade-to-Trade (T2T) series BE/BZ/T intraday blocks enforced. Tick size Rs 0.05. |
+| **Corporate News & Disclosures** | Fully Supported | Monitoring | `DELAYED` / `UNOFFICIAL` / `OFFLINE` | Public RSS syndication via Google News India corporate queries and Yahoo Finance RSS. Symbol normalization (RELIANCE, TCS.NS, BSE:INFY). Publisher attribution, source URLs, IST timestamps (+5:30), cross-feed deduplication, and automated price tracker filtering. |
+| **Indices (NIFTY, BANKNIFTY, SENSEX)** | Fully Supported | Paper Trading | `DELAYED` (Yahoo 15m) / `HISTORICAL` | Spot price tracking, ORB calculation, setup scanning, and underlying spot reference for derivative contracts. |
+| **Index Options (Long CE / PE)** | Fully Supported | Paper Trading | `SIMULATED` (Analytical BS) / `OFFLINE` | Contract naming (e.g. `NIFTY26OCT24000CE`), expiry calendar shifting for holidays, ATM/ITM/OTM strike selection, lot sizing (25 shares), analytical Black-Scholes Greeks (Delta, Gamma, Theta, Vega, Rho), IV solving, 14:30 IST expiry day cutoff. |
+| **Stock Options (Long CE / PE)** | Fully Supported | Paper Trading | `SIMULATED` (Analytical BS) / `OFFLINE` | F&O underlying lookup, official lot sizes from instrument cache, strike ladder generation, defined-risk position sizing. |
+| **Equity & Index Futures** | Fully Supported | Paper Trading | `SIMULATED` / `OFFLINE` | Margin requirements (~20% margin check), lot sizing, monthly Tuesday expiry calendar (NSE) / Friday (BSE), stop and target risk validation. |
+| **Statutory Transaction Costs** | Fully Supported | Calculations | Analytical | Automated breakdown of STT (intraday vs delivery vs derivatives vs exercised), NSE exchange turnover fees (March 2026 revision), SEBI charges, Stamp Duty, and 18% GST. |
+| **Naked Short Options** | Blocked by Design | N/A | N/A | Strictly blocked by risk manager. Undefined risk strategies are prohibited by default safety gates. |
+| **Live Broker Execution** | Blocked by Design | N/A | N/A | Paper trading is the default and only execution mode. No live broker connector is connected to prevent accidental capital loss. |
+
+### Indian Market Statutory Transaction Costs and Charges
+
+Every trade sized by `/trader-budget` calculates statutory regulatory charges alongside broker commission models using effective-date-based schedules (`REGULATORY_SCHEDULES`):
+
+| Component | Status | Intraday Equity | Delivery Equity | Equity / Index Futures | Options (Long CE/PE) | Exercised Options |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **STT (Securities Transaction Tax)** | Statutory Verified (Eff. 2026-04-01) | 0.025% on sell turnover | 0.1% on buy & sell turnover | 0.05% on sell turnover | 0.15% on sell premium turnover | 0.15% on intrinsic value |
+| **Stamp Duty** | Statutory Verified | 0.003% on buy turnover | 0.015% on buy turnover | 0.002% on buy turnover | 0.003% on buy premium turnover | 0.003% on buy premium turnover |
+| **NSE Exchange Charges** | Statutory Verified (Eff. 2026-03-01) | Rs 307 / cr (0.00307%) per side | Rs 307 / cr (0.00307%) per side | Rs 183 / cr (0.00183%) per side | Rs 3,553 / cr (0.03553%) per side of premium | Rs 3,553 / cr per side of premium |
+| **SEBI Turnover Fees** | Statutory Verified | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) |
+| **GST** | Statutory Verified | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) |
+| **Brokerage (Estimate)** | Estimated Tariff | min(Rs 20, 0.03%) per order | Rs 0 (standard delivery model) | min(Rs 20, 0.03%) per order | Rs 20 flat per order (Rs 40 round-trip) | Rs 20 flat per order |
+
+> [!NOTE]
+> **Brokerage Separation & Trade Profitability Impact**:
+> Estimated discount broker commissions are kept strictly segregated in `brokerage_estimate` and labeled as non-official estimates, distinct from official government and exchange levies in `statutory`.
+> The output includes `profitability_impact` containing gross P&L, total transaction drag, net P&L, and breakeven exit price.
+>
+> **Derivative Expiries (November 2026 Contract Specifications)**:
+> - **NSE**: All index (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) and stock derivatives expire on **Tuesday**. When Tuesday is an exchange holiday, contracts expire on the preceding trading day.
+> - **BSE**: Contracts follow independent rules (SENSEX expires on **Friday**; BANKEX expires on **Monday**).
+
+### Indian Corporate News Coverage (trader-news)
+
+`/trader-news` monitors company-specific news, corporate announcements, and regulatory filings across Indian equities (NSE & BSE) and US stocks:
+
+- **Symbol Normalization**: Accepts canonical symbols (`RELIANCE`, `TCS`, `INFY`, `HDFCBANK`), exchange suffixes (`.NS`, `.BO`), and prefixes (`NSE:`, `BSE:`), normalizing them automatically.
+- **Sources & Attribution**: Fetches public Google News Indian corporate query RSS feeds alongside Yahoo Finance RSS feeds. Every headline clearly identifies the original reporting publisher (e.g. Livemint, The Economic Times, Moneycontrol, Reuters, TradingView) and publisher source URL.
+- **IST Timestamps**: Formats all publication dates and intraday price moves in Indian Standard Time (`IST`, UTC+5:30), while preserving UTC datetimes internally for precise time-window filtering.
+- **Noise Filtering (Price Trackers vs. Real News)**: Automated stock quote tracker pages (e.g. "Share Price Today - Live NSE/BSE") are distinguished from genuine corporate disclosures, earnings releases, and material developments.
+- **Cross-Feed Deduplication**: Consolidates stories syndicated across multiple news outlets by matching normalized headlines and dates, merging ticker touchlists.
+- **Multi-Ticker Support**: Supports multiple Indian and mixed US/India tickers in a single invocation (`python3 news.py --tickers RELIANCE TCS INFY`).
+- **Data Limitations & Disclosures**: Public RSS feeds are unofficial and may experience syndication latency compared to real-time exchange circulars. Empty feed responses do not confirm the absence of material developments; material actions should be cross-verified directly on official exchange portals (NSE at `nseindia.com` or BSE at `bseindia.com`).
+
+### Data Provider Reality and Transparency
+
+- **Yahoo Finance (`DELAYED`)**: Provides 15-minute delayed quotes and historical OHLCV candles for Indian cash equities (`.NS` and `.BO`) and major indices (`^NSEI`, `^NSEBANK`, `^BSESN`). Yahoo Finance **does not reliably provide** Indian option chains with real-time Open Interest (OI) or Greeks.
+- **Simulated Provider (`SIMULATED`)**: When evaluating options strategies without a live paid provider, the system uses `SimulatedMarketDataProvider`, which generates mathematically sound Black-Scholes option chains with analytic Greeks, IV bisection, and realistic strike spacing. All such data is explicitly tagged `tier: SIMULATED`.
+- **Live / Broker Data (`REAL_TIME`)**: Real-time tick-by-tick market data and live NSE option chains with real-time Open Interest require an authenticated broker API adapter (such as Zerodha Kite Connect, Upstox, or Dhan). The modular `MarketDataProvider` interface is designed for drop-in connectivity when a broker API key is configured.
 
 ## Files
 

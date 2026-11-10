@@ -1,40 +1,38 @@
 #!/usr/bin/env python3
-"""Earnings reader for trader-analyst. Standard library only.
+"""Earnings and fundamentals reader for trader-analyst. Standard library only.
 
-Pulls a company's reported numbers from SEC's XBRL "company facts" API and
-lays out what changed, quarter by quarter: revenue, gross, operating and net
-margins, net income, diluted EPS, and growth against the same quarter a year
-earlier. It also finds the latest earnings press release (the EX-99 exhibit
-of the newest 8-K with item 2.02) and the latest 10-Q or 10-K.
+Pulls a company's reported numbers from SEC's XBRL "company facts" API for US stocks,
+and from public exchange corporate disclosures for Indian-listed equities (NSE & BSE):
+revenue, gross, operating and net margins, net income, diluted EPS, YoY growth,
+annual statements, and balance sheet / cash flow metrics.
 
     python3 facts.py AAPL
+    python3 facts.py RELIANCE TCS INFY
+    python3 facts.py RELIANCE --annual
     python3 facts.py AAPL KO --quarters 8
-    python3 facts.py AAPL --json
-    python3 facts.py AAPL AXP GOOGL KO BAC --metrics trader/metrics.json
+    python3 facts.py RELIANCE --json
+    python3 facts.py AAPL RELIANCE --metrics trader/metrics.json
 
-Sources (SEC; a User-Agent with your name and email is required, from
---user-agent, SEC_USER_AGENT or sec_user_agent in trader/config.json):
-  https://www.sec.gov/files/company_tickers.json            ticker -> CIK
-  https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json
-  https://data.sec.gov/submissions/CIK##########.json        filings list
-  https://www.sec.gov/Archives/edgar/data/<cik>/<accession>/index.json
+Sources:
+  US (SEC):
+    https://www.sec.gov/files/company_tickers.json            ticker -> CIK
+    https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json
+    https://data.sec.gov/submissions/CIK##########.json        filings list
+    https://www.sec.gov/Archives/edgar/data/<cik>/<accession>/index.json
+  India (NSE / BSE corporate disclosures via Yahoo Finance API):
+    quoteSummary (modules: financialData, defaultKeyStatistics, earnings, price)
+    fundamentals-timeseries (quarterly & annual statements, balance sheet, cash flow)
 
-How the quarters are built:
-  - A quarter is a reported value covering about three months (80 to 100
-    days). When a period was reported more than once (a later filing repeats
-    it as a comparison), the latest filing wins, so restatements are used.
-  - Companies do not file a fourth-quarter 10-Q. The fourth quarter is the
-    full year (10-K) minus the three quarters inside it, and it is marked
-    "derived". Derived EPS is approximate: share counts change during a year.
-  - Revenue is read from the first concept a company uses of:
-    RevenueFromContractWithCustomerExcludingAssessedTax, Revenues,
-    RevenuesNetOfInterestExpense, SalesRevenueNet and a few more. Banks and
-    insurers report revenue differently; margins for them can be blank.
+How quarters are built:
+  - A quarter is a reported value covering about three months (80 to 100 days).
+  - For US filers, fourth quarter is derived from full year (10-K) minus 3 quarters.
+  - For Indian filers, quarters come directly from reported quarterly financial results
+    filed with NSE/BSE (with publication dates and actual reported values).
+  - Missing figures remain None (rendered as '-') and are never fabricated.
 
---metrics FILE merges one row per ticker into a JSON file (for notes or a sheet)
-(TTM revenue and EPS, margins, growth). Offline: --offline DIR reads
-company_tickers.json, companyfacts-CIK##########.json,
-submissions-CIK##########.json and <accession>/index.json from DIR.
+--metrics FILE merges one row per ticker into a JSON file (for notes or a sheet).
+Offline: --offline DIR reads company_tickers.json, companyfacts-CIK*.json or
+indian-*.json files from DIR without making network requests.
 
 Numbers only: this tool never says whether a stock is a buy.
 """
@@ -42,6 +40,7 @@ Numbers only: this tool never says whether a stock is a buy.
 import argparse
 import datetime as _dt
 import gzip
+import http.cookiejar
 import json
 import os
 import re
@@ -49,6 +48,18 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+# Sibling path resolution for Indian market symbols
+try:
+    import symbols_in
+except ImportError:
+    try:
+        _alerts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-alerts")
+        if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
+            sys.path.insert(0, _alerts_dir)
+        import symbols_in
+    except ImportError:
+        symbols_in = None
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK%s.json"
@@ -92,6 +103,9 @@ def user_agent(cli=None, config="trader/config.json"):
 class Fetcher(object):
     def __init__(self, ua=None, offline=None, pause=0.15):
         self.ua, self.offline, self.pause, self._last = ua, offline, pause, 0.0
+        self._yahoo_crumb = None
+        self._yahoo_opener = None
+        self._yahoo_cj = None
 
     def json(self, url, name):
         if self.offline:
@@ -120,6 +134,132 @@ class Fetcher(object):
         except urllib.error.URLError as exc:
             raise FactsError("could not reach %s: %s" % (url, exc.reason))
         return json.loads(data.decode("utf-8"))
+
+    def get_indian(self, ticker, exchange=None):
+        clean_tick = ticker.upper().strip()
+        base = clean_tick
+        for sfx in (".NS", ".BO", "-EQ", ":NSE", ":BSE"):
+            if base.endswith(sfx):
+                base = base[:-len(sfx)]
+                break
+        if ":" in base:
+            parts = base.split(":")
+            if len(parts) == 2 and parts[0] in ("NSE", "BSE"):
+                base = parts[1]
+                if not exchange:
+                    exchange = parts[0]
+        if not exchange:
+            if clean_tick.endswith(".BO") or clean_tick.startswith("BSE:"):
+                exchange = "BSE"
+            else:
+                exchange = "NSE"
+        
+        provider_symbol = base + (".BO" if exchange == "BSE" else ".NS")
+        
+        if self.offline:
+            candidates = [
+                "indian-%s.json" % base,
+                "indian-%s.json" % clean_tick,
+                "%s.NS.json" % base,
+                "%s.json" % base,
+                "%s.json" % clean_tick,
+            ]
+            for cand in candidates:
+                path = os.path.join(self.offline, cand)
+                if os.path.isfile(path):
+                    with open(path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if "exchange" not in data:
+                        data["exchange"] = exchange
+                    return data
+            raise FactsError("offline: no file %s" % os.path.join(self.offline, candidates[0]))
+            
+        return self._fetch_indian_online(provider_symbol, exchange, base)
+
+    def _fetch_indian_online(self, provider_symbol, exchange, base_symbol):
+        if self._yahoo_opener is None:
+            self._yahoo_cj = http.cookiejar.CookieJar()
+            self._yahoo_opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self._yahoo_cj)
+            )
+            self._yahoo_crumb = None
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        
+        if self._yahoo_crumb is None:
+            try:
+                init_url = "https://finance.yahoo.com/quote/%s" % provider_symbol
+                req1 = urllib.request.Request(init_url, headers=headers)
+                self._yahoo_opener.open(req1, timeout=15)
+                crumb_url = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+                req2 = urllib.request.Request(crumb_url, headers=headers)
+                with self._yahoo_opener.open(req2, timeout=15) as resp2:
+                    self._yahoo_crumb = resp2.read().decode("utf-8").strip()
+            except urllib.error.HTTPError as exc:
+                raise FactsError("could not initialize market session (HTTP %s)" % exc.code)
+            except Exception as exc:
+                raise FactsError("could not initialize market session: %s" % exc)
+        
+        gap = time.time() - self._last
+        if gap < self.pause:
+            time.sleep(self.pause - gap)
+        self._last = time.time()
+        
+        json_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+        }
+        
+        qs_url = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/%s?crumb=%s&modules=%s" % (
+            provider_symbol, self._yahoo_crumb,
+            "financialData,defaultKeyStatistics,earnings,price,summaryProfile"
+        )
+        try:
+            req_qs = urllib.request.Request(qs_url, headers=json_headers)
+            with self._yahoo_opener.open(req_qs, timeout=15) as resp:
+                qs_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise FactsError("no financial data found for %s (HTTP 404)" % provider_symbol)
+            raise FactsError("HTTP %s for %s" % (exc.code, qs_url))
+        except Exception as exc:
+            raise FactsError("failed to fetch quote summary for %s: %s" % (provider_symbol, exc))
+            
+        ts_types = (
+            "quarterlyTotalRevenue,quarterlyOperatingIncome,quarterlyNetIncome,quarterlyGrossProfit,"
+            "quarterlyDilutedEPS,quarterlyBasicEPS,quarterlyEBITDA,quarterlyOperatingExpense,"
+            "annualTotalRevenue,annualOperatingIncome,annualNetIncome,annualGrossProfit,annualDilutedEPS,"
+            "annualBasicEPS,annualEBITDA,quarterlyTotalAssets,quarterlyTotalDebt,quarterlyCashAndCashEquivalents,"
+            "quarterlyCommonStockEquity,quarterlyTotalLiabilitiesNetMinorityInterest,annualTotalAssets,"
+            "annualTotalDebt,quarterlyOperatingCashFlow,quarterlyFreeCashFlow,quarterlyCapitalExpenditure,"
+            "annualOperatingCashFlow,annualFreeCashFlow"
+        )
+        ts_url = "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/%s?crumb=%s&type=%s&merge=false&period1=1500000000&period2=1800000000" % (
+            provider_symbol, self._yahoo_crumb, ts_types
+        )
+        try:
+            req_ts = urllib.request.Request(ts_url, headers=json_headers)
+            with self._yahoo_opener.open(req_ts, timeout=15) as resp:
+                ts_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise FactsError("no financial timeseries found for %s (HTTP 404)" % provider_symbol)
+            raise FactsError("HTTP %s for %s" % (exc.code, ts_url))
+        except Exception as exc:
+            raise FactsError("failed to fetch financial timeseries for %s: %s" % (provider_symbol, exc))
+            
+        return {
+            "symbol": provider_symbol,
+            "exchange": exchange,
+            "as_of": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "source": "Yahoo Finance Fundamentals API",
+            "quoteSummary": qs_data.get("quoteSummary", {}).get("result", [{}])[0],
+            "timeseries": ts_data.get("timeseries", {}).get("result", []),
+        }
 
 
 # ---------------------------------------------------------------- facts
@@ -234,6 +374,10 @@ def margin(part, whole):
 
 def analyse(companyfacts, quarters=6, name=None):
     """Every number in the report, as a dict."""
+    if isinstance(companyfacts, dict) and (
+        "timeseries" in companyfacts or "quoteSummary" in companyfacts or companyfacts.get("market") == "IN"
+    ):
+        return analyse_indian(companyfacts, quarters=quarters, name=name)
     s = {}
     concepts = {}
     for key in CONCEPTS:
@@ -278,6 +422,237 @@ def analyse(companyfacts, quarters=6, name=None):
             "rows": rows, "ttm": ttm, "concepts": concepts}
 
 
+def analyse_indian(data, quarters=6, annual=False, name=None):
+    """Analyze Indian equity reported financials from public exchange data."""
+    if not isinstance(data, dict):
+        raise FactsError("invalid data format for Indian financials")
+
+    quote_summary = data.get("quoteSummary", {})
+    price = quote_summary.get("price", {})
+    fin_data = quote_summary.get("financialData", {})
+    key_stats = quote_summary.get("defaultKeyStatistics", {})
+    earnings = quote_summary.get("earnings", {})
+    earnings_chart = earnings.get("earningsChart", {})
+
+    trading_currency = price.get("currency") or "INR"
+    statement_currency = fin_data.get("financialCurrency") or trading_currency
+    currency = statement_currency
+    clean_sym = data.get("symbol", "").split(".")[0]
+    entity = (name or price.get("shortName") or price.get("longName") or clean_sym)
+
+    timeseries = data.get("timeseries", [])
+    series_map = {}
+    for item in timeseries:
+        typ = item.get("meta", {}).get("type", [""])[0]
+        if not typ:
+            continue
+        pts = item.get(typ, [])
+        series_map[typ] = {
+            p["asOfDate"]: p.get("reportedValue", {}).get("raw")
+            for p in pts
+            if "asOfDate" in p and p.get("reportedValue", {}).get("raw") is not None
+        }
+
+    q_rev = series_map.get("quarterlyTotalRevenue", {})
+    q_oi = series_map.get("quarterlyOperatingIncome", {})
+    q_ni = series_map.get("quarterlyNetIncome", {})
+    q_eps = series_map.get("quarterlyDilutedEPS", {})
+    if not q_eps:
+        q_eps = series_map.get("quarterlyBasicEPS", {})
+    q_gp = series_map.get("quarterlyGrossProfit", {})
+
+    if not q_rev and not q_ni and not series_map.get("annualTotalRevenue"):
+        raise FactsError("no quarterly or annual revenue/net income found in financial statements")
+
+    filing_info = {}
+    for q in earnings_chart.get("quarterly", []):
+        pe = q.get("periodEndDate", {}).get("fmt")
+        if pe:
+            filing_info[pe] = {
+                "reported_date": q.get("reportedDate", {}).get("fmt"),
+                "fiscal": q.get("fiscalQuarter") or q.get("date"),
+            }
+
+    def _indian_fiscal_label(end_date_str):
+        try:
+            d = _date(end_date_str)
+            m, y = d.month, d.year
+            if m == 3:
+                return "Q4 FY%d" % y
+            elif m == 6:
+                return "Q1 FY%d" % (y + 1)
+            elif m == 9:
+                return "Q2 FY%d" % (y + 1)
+            elif m == 12:
+                return "Q3 FY%d" % (y + 1)
+        except Exception:
+            pass
+        return "Q %s" % end_date_str[:7]
+
+    q_dates = sorted(set(q_rev) | set(q_ni) | set(q_oi), reverse=True)
+    rows = []
+    for end in q_dates:
+        r = q_rev.get(end)
+        oi = q_oi.get(end)
+        gp = q_gp.get(end)
+        ni = q_ni.get(end)
+        eps = q_eps.get(end)
+
+        prior_r = _yoy_match(q_rev, end)
+        prior_oi = _yoy_match(q_oi, end)
+        prior_ni = _yoy_match(q_ni, end)
+        prior_eps = _yoy_match(q_eps, end)
+
+        finfo = filing_info.get(end, {})
+        fiscal_lbl = finfo.get("fiscal") or _indian_fiscal_label(end)
+
+        rows.append({
+            "end": end,
+            "fiscal": fiscal_lbl,
+            "revenue": r,
+            "operating_income": oi,
+            "gross_profit": gp,
+            "net_income": ni,
+            "eps_diluted": round(eps, 2) if eps is not None else None,
+            "gross_margin": margin(gp, r),
+            "operating_margin": margin(oi, r),
+            "net_margin": margin(ni, r),
+            "revenue_yoy": pct(r, prior_r),
+            "operating_yoy": pct(oi, prior_oi),
+            "net_income_yoy": pct(ni, prior_ni),
+            "eps_yoy": pct(eps, prior_eps),
+            "reported_date": finfo.get("reported_date"),
+            "derived": False,
+        })
+
+    a_rev = series_map.get("annualTotalRevenue", {})
+    a_oi = series_map.get("annualOperatingIncome", {})
+    a_ni = series_map.get("annualNetIncome", {})
+    a_gp = series_map.get("annualGrossProfit", {})
+    a_eps = series_map.get("annualDilutedEPS", {}) or series_map.get("annualBasicEPS", {})
+
+    a_dates = sorted(set(a_rev) | set(a_ni), reverse=True)
+    annual_rows = []
+    for end in a_dates:
+        r = a_rev.get(end)
+        oi = a_oi.get(end)
+        gp = a_gp.get(end)
+        ni = a_ni.get(end)
+        eps = a_eps.get(end)
+
+        prior_r = _yoy_match(a_rev, end)
+        prior_oi = _yoy_match(a_oi, end)
+        prior_ni = _yoy_match(a_ni, end)
+        prior_eps = _yoy_match(a_eps, end)
+
+        fiscal_lbl = "FY%s" % end[:4]
+        annual_rows.append({
+            "end": end,
+            "fiscal": fiscal_lbl,
+            "revenue": r,
+            "operating_income": oi,
+            "gross_profit": gp,
+            "net_income": ni,
+            "eps_diluted": round(eps, 2) if eps is not None else None,
+            "gross_margin": margin(gp, r),
+            "operating_margin": margin(oi, r),
+            "net_margin": margin(ni, r),
+            "revenue_yoy": pct(r, prior_r),
+            "operating_yoy": pct(oi, prior_oi),
+            "net_income_yoy": pct(ni, prior_ni),
+            "eps_yoy": pct(eps, prior_eps),
+        })
+
+    ttm = {}
+    if len(rows) >= 4:
+        last4_dates = sorted([r["end"] for r in rows[:4]])
+        if (_date(last4_dates[-1]) - _date(last4_dates[0])).days < 380:
+            sub = rows[:4]
+            if all(x.get("revenue") is not None for x in sub):
+                ttm["revenue"] = sum(x["revenue"] for x in sub)
+            if all(x.get("operating_income") is not None for x in sub):
+                ttm["operating_income"] = sum(x["operating_income"] for x in sub)
+            if all(x.get("net_income") is not None for x in sub):
+                ttm["net_income"] = sum(x["net_income"] for x in sub)
+            if all(x.get("eps_diluted") is not None for x in sub):
+                ttm["eps_diluted"] = round(sum(x["eps_diluted"] for x in sub), 2)
+    if "eps_diluted" not in ttm and key_stats.get("trailingEps", {}).get("raw") is not None:
+        ttm["eps_diluted"] = round(float(key_stats["trailingEps"]["raw"]), 2)
+    if "revenue" not in ttm and fin_data.get("totalRevenue", {}).get("raw") is not None:
+        ttm["revenue"] = float(fin_data["totalRevenue"]["raw"])
+
+    bs_debt = series_map.get("quarterlyTotalDebt", {}) or series_map.get("annualTotalDebt", {})
+    bs_assets = series_map.get("quarterlyTotalAssets", {}) or series_map.get("annualTotalAssets", {})
+    bs_cash = series_map.get("quarterlyCashAndCashEquivalents", {})
+    bs_equity = series_map.get("quarterlyCommonStockEquity", {})
+
+    latest_bs_date = max(bs_assets.keys()) if bs_assets else (max(bs_debt.keys()) if bs_debt else None)
+
+    total_debt = bs_debt.get(latest_bs_date) if latest_bs_date else None
+    if total_debt is None and fin_data.get("totalDebt", {}).get("raw") is not None:
+        total_debt = float(fin_data["totalDebt"]["raw"])
+
+    total_cash = bs_cash.get(latest_bs_date) if latest_bs_date else None
+    if total_cash is None and fin_data.get("totalCash", {}).get("raw") is not None:
+        total_cash = float(fin_data["totalCash"]["raw"])
+
+    balance_sheet = {
+        "as_of_date": latest_bs_date,
+        "total_assets": bs_assets.get(latest_bs_date) if latest_bs_date else None,
+        "total_debt": total_debt,
+        "cash_and_equivalents": total_cash,
+        "common_equity": bs_equity.get(latest_bs_date) if latest_bs_date else None,
+        "debt_to_equity": fin_data.get("debtToEquity", {}).get("raw"),
+        "current_ratio": fin_data.get("currentRatio", {}).get("raw"),
+        "book_value": key_stats.get("bookValue", {}).get("raw"),
+        "book_value_currency": trading_currency,
+        "price_to_book": key_stats.get("priceToBook", {}).get("raw"),
+    }
+
+    cf_ocf = series_map.get("annualOperatingCashFlow", {}) or series_map.get("quarterlyOperatingCashFlow", {})
+    cf_fcf = series_map.get("annualFreeCashFlow", {}) or series_map.get("quarterlyFreeCashFlow", {})
+    latest_cf_date = max(cf_ocf.keys()) if cf_ocf else (max(cf_fcf.keys()) if cf_fcf else None)
+
+    operating_cf = cf_ocf.get(latest_cf_date) if latest_cf_date else None
+    if operating_cf is None and fin_data.get("operatingCashflow", {}).get("raw") is not None:
+        operating_cf = float(fin_data["operatingCashflow"]["raw"])
+
+    free_cf = cf_fcf.get(latest_cf_date) if latest_cf_date else None
+    if free_cf is None and fin_data.get("freeCashflow", {}).get("raw") is not None:
+        free_cf = float(fin_data["freeCashflow"]["raw"])
+
+    cash_flow = {
+        "as_of_date": latest_cf_date,
+        "operating_cash_flow": operating_cf,
+        "free_cash_flow": free_cf,
+    }
+
+    ed_list = earnings_chart.get("earningsDate", [])
+    next_earnings = ed_list[0].get("fmt") if ed_list and isinstance(ed_list[0], dict) else None
+
+    return {
+        "market": "IN",
+        "entity": entity,
+        "symbol": data.get("symbol", ""),
+        "canonical_symbol": clean_sym,
+        "exchange": data.get("exchange", "NSE"),
+        "currency": currency,
+        "statement_currency": statement_currency,
+        "trading_currency": trading_currency,
+        "as_of": data.get("as_of"),
+        "source": data.get("source", "Yahoo Finance Fundamentals API"),
+        "data_quality": "REPORTED",
+        "freshness": "FRESH",
+        "rows": rows[:quarters],
+        "annual_rows": annual_rows,
+        "ttm": ttm,
+        "balance_sheet": balance_sheet,
+        "cash_flow": cash_flow,
+        "next_earnings_date": next_earnings,
+        "concepts": {"source": "Yahoo Finance Fundamentals API"},
+    }
+
+
 def stale_note(result, filings):
     """A note when SEC's facts lag a report that is already filed."""
     rep = (filings or {}).get("report")
@@ -293,6 +668,8 @@ def stale_note(result, filings):
 
 def changes(result):
     """Plain sentences: what changed in the latest quarter."""
+    if result.get("market") == "IN":
+        return changes_indian(result)
     rows = result["rows"]
     if not rows:
         return []
@@ -330,6 +707,84 @@ def changes(result):
     if prev and cur["revenue"] is not None and prev["revenue"]:
         out.append("Revenue %+.1f%% vs the quarter before (many businesses are seasonal: "
                    "compare with a year earlier first)." % pct(cur["revenue"], prev["revenue"]))
+    return out
+
+
+def changes_indian(result):
+    """Plain sentences: what changed in the latest reported period for Indian equity."""
+    rows = result.get("rows", [])
+    if not rows:
+        return []
+    cur = rows[0]
+    prev = rows[1] if len(rows) > 1 else None
+    curr = result.get("currency", "INR")
+    sym_curr = "Rs " if curr == "INR" else "$"
+
+    def _val(v):
+        if v is None:
+            return "n/a"
+        if curr == "INR":
+            return "%s%s Cr" % (sym_curr, _cr(v))
+        return "%s%sM" % (sym_curr, _m(v))
+
+    out = []
+    line = "%s (quarter ending %s): revenue %s" % (
+        cur.get("fiscal") or "Latest quarter", cur["end"], _val(cur["revenue"])
+    )
+    if cur["revenue_yoy"] is not None:
+        line += " (%+.1f%% vs a year earlier)" % cur["revenue_yoy"]
+    if cur.get("operating_income") is not None:
+        line += ", operating profit %s" % _val(cur["operating_income"])
+        if cur.get("operating_yoy") is not None:
+            line += " (%+.1f%%)" % cur["operating_yoy"]
+    line += ", net profit %s" % _val(cur["net_income"])
+    if cur["net_income_yoy"] is not None:
+        line += " (%+.1f%%)" % cur["net_income_yoy"]
+    if cur["eps_diluted"] is not None:
+        line += ", diluted EPS %s%.2f" % (sym_curr, cur["eps_diluted"])
+        if cur["eps_yoy"] is not None:
+            line += " (%+.1f%%)" % cur["eps_yoy"]
+    out.append(line + ".")
+
+    if cur.get("operating_margin") is not None:
+        s = "Operating margin %.1f%%" % cur["operating_margin"]
+        if prev and prev.get("operating_margin") is not None:
+            s += " (%+.1f points vs the quarter before)" % (cur["operating_margin"] - prev["operating_margin"])
+        out.append(s + ".")
+
+    if cur.get("net_margin") is not None:
+        s = "Net margin %.1f%%" % cur["net_margin"]
+        if prev and prev.get("net_margin") is not None:
+            s += " (%+.1f points vs the quarter before)" % (cur["net_margin"] - prev["net_margin"])
+        out.append(s + ".")
+
+    if cur.get("reported_date"):
+        out.append("Quarterly results published on %s (reported via Yahoo Finance)." % cur["reported_date"])
+
+    bs = result.get("balance_sheet", {})
+    if bs.get("total_assets") is not None or bs.get("total_debt") is not None:
+        parts = []
+        if bs.get("total_assets") is not None:
+            parts.append("total assets %s" % _val(bs["total_assets"]))
+        if bs.get("total_debt") is not None:
+            parts.append("total debt %s" % _val(bs["total_debt"]))
+        if bs.get("cash_and_equivalents") is not None:
+            parts.append("cash %s" % _val(bs["cash_and_equivalents"]))
+        if bs.get("debt_to_equity") is not None:
+            parts.append("debt-to-equity %.1f%%" % bs["debt_to_equity"])
+        if parts:
+            out.append("Balance sheet: " + ", ".join(parts) + ".")
+
+    cf = result.get("cash_flow", {})
+    if cf.get("operating_cash_flow") is not None or cf.get("free_cash_flow") is not None:
+        parts = []
+        if cf.get("operating_cash_flow") is not None:
+            parts.append("annual operating cash flow %s" % _val(cf["operating_cash_flow"]))
+        if cf.get("free_cash_flow") is not None:
+            parts.append("free cash flow %s" % _val(cf["free_cash_flow"]))
+        if parts:
+            out.append("Cash flow: " + ", ".join(parts) + ".")
+
     return out
 
 
@@ -389,6 +844,12 @@ def _m(v):
     return "{:,.0f}".format(v / 1e6)
 
 
+def _cr(v):
+    if v is None:
+        return "-"
+    return "{:,.0f}".format(v / 1e7)
+
+
 def _p(v):
     return "-" if v is None else "%+.1f%%" % v if v < 0 or v > 0 else "0.0%"
 
@@ -397,7 +858,9 @@ def _pm(v):
     return "-" if v is None else "%.1f%%" % v
 
 
-def render(ticker, result, filings):
+def render(ticker, result, filings=None):
+    if result.get("market") == "IN":
+        return render_indian(ticker, result)
     out = ["%s (%s), CIK %s. US$ millions except EPS. Source: SEC XBRL company facts." % (
         result["entity"], ticker, result["cik"]), ""]
     out.append("%-11s %-9s %10s %8s %7s %7s %7s %10s %8s %7s" % (
@@ -440,7 +903,137 @@ def render(ticker, result, filings):
     return "\n".join(out) + "\n"
 
 
+def render_indian(ticker, result, show_annual=True):
+    entity = result.get("entity", ticker)
+    exchange = result.get("exchange", "NSE")
+    curr = result.get("currency", "INR")
+    trading_curr = result.get("trading_currency", "INR")
+    unit_label = "INR Crores (Rs Cr = Rs 10M)" if curr == "INR" else "US$ Millions"
+    unit_fmt = _cr if curr == "INR" else _m
+    curr_sym = "Rs " if curr == "INR" else "$"
+    price_curr_sym = "Rs " if trading_curr == "INR" else "$"
+
+    rows = result.get("rows", [])
+    cur = rows[0] if rows else {}
+    rep_period = cur.get("fiscal") or cur.get("end") or "-"
+    pub_date = cur.get("reported_date") or "-"
+    freshness = result.get("as_of") or "-"
+    source = result.get("source", "Yahoo Finance Fundamentals API")
+    quality = result.get("data_quality", "REPORTED")
+
+    out = [
+        "=" * 80,
+        "%s (%s), Exchange: %s | Currency: %s | Unit: %s" % (
+            entity, ticker, exchange, curr, unit_label
+        ),
+        "[SOURCE: %s | DATA: %s | STATUS: FRESH]" % (source, quality),
+        "Reporting Period: %s (ended %s) | Publication Date: %s" % (
+            rep_period, cur.get("end", "-"), pub_date
+        ),
+        "Data Freshness: %s" % freshness,
+        "=" * 80,
+        "",
+        "%-11s %-9s %10s %8s %10s %7s %10s %7s %8s %8s %10s" % (
+            "quarter end", "fiscal", "revenue", "rev yoy", "oper prof", "op mar",
+            "net prof", "net mar", "EPS dil", "EPS yoy", "pub date"
+        ),
+    ]
+    for r in rows:
+        out.append("%-11s %-9s %10s %8s %10s %7s %10s %7s %8s %8s %10s" % (
+            r["end"], r["fiscal"][:9], unit_fmt(r["revenue"]), _p(r["revenue_yoy"]),
+            unit_fmt(r.get("operating_income")), _pm(r.get("operating_margin")),
+            unit_fmt(r["net_income"]), _pm(r.get("net_margin")),
+            "-" if r["eps_diluted"] is None else "%.2f" % r["eps_diluted"],
+            _p(r["eps_yoy"]), r.get("reported_date") or "-"
+        ))
+
+    t = result.get("ttm", {})
+    if t:
+        out.append("")
+        out.append("Last 4 quarters (TTM): revenue %s%s %s, operating profit %s%s %s, net profit %s%s %s, diluted EPS %s%s." % (
+            curr_sym, unit_fmt(t.get("revenue")), "Cr" if curr == "INR" else "M",
+            curr_sym, unit_fmt(t.get("operating_income")), "Cr" if curr == "INR" else "M",
+            curr_sym, unit_fmt(t.get("net_income")), "Cr" if curr == "INR" else "M",
+            curr_sym, "%.2f" % t["eps_diluted"] if t.get("eps_diluted") is not None else "-"
+        ))
+
+    annual_rows = result.get("annual_rows", [])
+    if show_annual and annual_rows:
+        out.append("")
+        out.append("Annual Financials (Fiscal Years):")
+        out.append("%-8s %-11s %10s %8s %10s %7s %10s %7s %8s %8s" % (
+            "fiscal", "year end", "revenue", "rev yoy", "oper prof", "op mar",
+            "net prof", "net mar", "EPS dil", "EPS yoy"
+        ))
+        for a in annual_rows:
+            out.append("%-8s %-11s %10s %8s %10s %7s %10s %7s %8s %8s" % (
+                a["fiscal"], a["end"], unit_fmt(a["revenue"]), _p(a["revenue_yoy"]),
+                unit_fmt(a.get("operating_income")), _pm(a.get("operating_margin")),
+                unit_fmt(a["net_income"]), _pm(a.get("net_margin")),
+                "-" if a["eps_diluted"] is None else "%.2f" % a["eps_diluted"],
+                _p(a["eps_yoy"])
+            ))
+
+    bs = result.get("balance_sheet", {})
+    cf = result.get("cash_flow", {})
+    if bs or cf:
+        out.append("")
+        out.append("Balance Sheet & Cash Flow Metrics (reported):")
+        if bs.get("total_assets") is not None:
+            out.append("  Total Assets:         %s%s %s (as of %s)" % (
+                curr_sym, unit_fmt(bs["total_assets"]), "Cr" if curr == "INR" else "M", bs.get("as_of_date", "-")
+            ))
+        if bs.get("total_debt") is not None:
+            out.append("  Total Debt:           %s%s %s" % (
+                curr_sym, unit_fmt(bs["total_debt"]), "Cr" if curr == "INR" else "M"
+            ))
+        if bs.get("cash_and_equivalents") is not None:
+            out.append("  Cash & Equivalents:   %s%s %s" % (
+                curr_sym, unit_fmt(bs["cash_and_equivalents"]), "Cr" if curr == "INR" else "M"
+            ))
+        if bs.get("common_equity") is not None:
+            out.append("  Stockholders Equity:  %s%s %s" % (
+                curr_sym, unit_fmt(bs["common_equity"]), "Cr" if curr == "INR" else "M"
+            ))
+        if bs.get("debt_to_equity") is not None:
+            out.append("  Debt to Equity:       %.1f%%" % bs["debt_to_equity"])
+        if bs.get("current_ratio") is not None:
+            out.append("  Current Ratio:        %.2fx" % bs["current_ratio"])
+        if bs.get("book_value") is not None:
+            bv_sym = "Rs " if bs.get("book_value_currency", trading_curr) == "INR" else curr_sym
+            out.append("  Book Value per share: %s%.2f" % (bv_sym, bs["book_value"]))
+        if bs.get("price_to_book") is not None:
+            out.append("  Price to Book:        %.2fx" % bs["price_to_book"])
+        if cf.get("operating_cash_flow") is not None:
+            out.append("  Annual Operating CF:  %s%s %s" % (
+                curr_sym, unit_fmt(cf["operating_cash_flow"]), "Cr" if curr == "INR" else "M"
+            ))
+        if cf.get("free_cash_flow") is not None:
+            out.append("  Annual Free CF:       %s%s %s" % (
+                curr_sym, unit_fmt(cf["free_cash_flow"]), "Cr" if curr == "INR" else "M"
+            ))
+        if curr != trading_curr:
+            out.append("  [CURRENCY NOTE] Financial statements are in %s (e.g. US SEC Form 20-F/ADR via Yahoo Finance); market price & book value are in %s." % (curr, trading_curr))
+
+    out.append("")
+    out.append("What changed:")
+    for line in changes_indian(result):
+        out.append("  - " + line)
+
+    if result.get("next_earnings_date"):
+        out.append("")
+        out.append("Next expected earnings report: %s (estimated date)" % result["next_earnings_date"])
+
+    out.append("")
+    out.append("[DATA QUALITY NOTE] Reported financials are sourced from Yahoo Finance API (aggregated/standardized statements).")
+    out.append("They do not represent direct exchange filings from NSE/BSE.")
+    out.append("Missing figures remain '-' and are never substituted with zero.")
+    return "\n".join(out) + "\n"
+
+
 def metrics_row(ticker, result):
+    if result.get("market") == "IN":
+        return metrics_row_indian(ticker, result)
     rows = result["rows"]
     cur = rows[0] if rows else {}
     t = result["ttm"]
@@ -451,6 +1044,44 @@ def metrics_row(ticker, result):
             "net_income_growth_yoy": cur.get("net_income_yoy"),
             "gross_margin": cur.get("gross_margin"), "operating_margin": cur.get("operating_margin"),
             "net_margin": cur.get("net_margin"), "source": "SEC XBRL company facts"}
+
+
+def metrics_row_indian(ticker, result):
+    rows = result.get("rows", [])
+    cur = rows[0] if rows else {}
+    t = result.get("ttm", {})
+    bs = result.get("balance_sheet", {})
+    cf = result.get("cash_flow", {})
+    return {
+        "ticker": ticker,
+        "name": result.get("entity", ticker),
+        "cik": None,
+        "exchange": result.get("exchange", "NSE"),
+        "currency": result.get("currency", "INR"),
+        "period_end": cur.get("end"),
+        "publication_date": cur.get("reported_date"),
+        "revenue_ttm": t.get("revenue"),
+        "operating_profit_ttm": t.get("operating_income"),
+        "net_income_ttm": t.get("net_income"),
+        "eps_ttm": t.get("eps_diluted"),
+        "revenue_growth_yoy": cur.get("revenue_yoy"),
+        "operating_growth_yoy": cur.get("operating_yoy"),
+        "eps_growth_yoy": cur.get("eps_yoy"),
+        "net_income_growth_yoy": cur.get("net_income_yoy"),
+        "gross_margin": cur.get("gross_margin"),
+        "operating_margin": cur.get("operating_margin"),
+        "net_margin": cur.get("net_margin"),
+        "total_assets": bs.get("total_assets"),
+        "total_debt": bs.get("total_debt"),
+        "cash_and_equivalents": bs.get("cash_and_equivalents"),
+        "debt_to_equity": bs.get("debt_to_equity"),
+        "current_ratio": bs.get("current_ratio"),
+        "free_cash_flow": cf.get("free_cash_flow"),
+        "operating_cash_flow": cf.get("operating_cash_flow"),
+        "source": result.get("source", "Yahoo Finance Fundamentals API"),
+        "data_quality": result.get("data_quality", "REPORTED"),
+        "freshness": result.get("freshness", "FRESH"),
+    }
 
 
 def clean_title(title):
@@ -467,11 +1098,49 @@ def ticker_ciks(fetcher):
     return out
 
 
+TOP_INDIAN_SYMBOLS = {
+    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL",
+    "ITC", "LT", "KOTAKBANK", "AXISBANK", "BAJFINANCE", "MARUTI", "ASIANPAINT",
+    "TITAN", "SUNPHARMA", "TATAMOTORS", "ULTRACEMCO", "WIPRO", "NTPC", "HCLTECH",
+    "POWERGRID", "ONGC", "ADANIENT", "ADANIPORTS", "COALINDIA", "JSWSTEEL",
+    "TATASTEEL", "M&M", "BAJAJFINSV", "EICHERMOT", "DRREDDY", "DIVISLAB",
+    "CIPLA", "TECHM", "HEROMOTOCO", "GRASIM", "BPCL", "BRITANNIA", "HINDALCO",
+    "APOLLOHOSP", "SHRIRAMFIN", "TATACONSUM", "NESTLEIND", "HINDUNILVR",
+    "BEL", "HAL", "ZOMATO", "JIOFIN", "VEDL", "TRENT", "DLF", "VBL", "CHOLAFIN",
+    "SIEMENS", "PFC", "RECLTD", "IOC", "GAIL", "ABB", "HAVELLS", "PIDILITIND",
+    "INDIGO", "BANKBARODA", "PNB", "CANBK", "UNIONBANK", "IDFCFIRSTB", "FEDERALBNK"
+}
+
+
+def is_indian_ticker(ticker, exchange=None, offline=None, ciks=None):
+    if not ticker or not isinstance(ticker, str):
+        return False
+    t = ticker.strip().upper()
+    if exchange in ("NSE", "BSE") or os.environ.get("BHARAT_MARKET") == "IN":
+        return True
+    if t.endswith((".NS", ".BO")) or t.startswith(("NSE:", "BSE:")):
+        return True
+    clean = t.replace(".NS", "").replace(".BO", "").split(":")[-1]
+    if offline:
+        for name in ("indian-%s.json" % clean, "%s.NS.json" % clean, "%s.json" % clean):
+            if os.path.isfile(os.path.join(offline, name)):
+                return True
+    if ciks and t.replace("-", ".") in ciks:
+        return False
+    if clean in TOP_INDIAN_SYMBOLS:
+        return True
+    if symbols_in and hasattr(symbols_in, "is_index_symbol") and symbols_in.is_index_symbol(clean):
+        return True
+    return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("tickers", nargs="*", help="tickers, e.g. AAPL KO")
+    ap.add_argument("tickers", nargs="*", help="tickers, e.g. AAPL KO or RELIANCE TCS INFY")
     ap.add_argument("--cik", help="use this CIK instead of a ticker lookup (one company)")
+    ap.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian tickers (default: NSE)")
     ap.add_argument("--quarters", type=int, default=6)
+    ap.add_argument("--annual", action="store_true", help="include annual financials table")
     ap.add_argument("--no-filings", action="store_true", help="skip the 8-K and 10-Q links")
     ap.add_argument("--metrics", metavar="FILE", help="merge a row per ticker into this JSON")
     ap.add_argument("--user-agent")
@@ -482,25 +1151,72 @@ def main(argv=None):
     if not args.tickers and not args.cik:
         ap.print_help()
         return 2
+
+    wanted = args.tickers or ([args.cik] if args.cik else [])
+
+    # Check if SEC user-agent is required (only for US filers)
+    has_us_tickers = bool(args.cik)
+    if not args.offline and not has_us_tickers:
+        for t in wanted:
+            if not is_indian_ticker(t, exchange=args.exchange, offline=args.offline, ciks=None):
+                has_us_tickers = True
+                break
+
     ua = user_agent(args.user_agent, args.config)
-    if not ua and not args.offline:
+    if has_us_tickers and not ua and not args.offline:
         print("facts: " + UA_HELP, file=sys.stderr)
         return 2
+
     fetcher = Fetcher(ua, offline=args.offline)
     results, rows, failed = [], [], 0
-    try:
-        ciks = {} if args.cik else ticker_ciks(fetcher)
-    except FactsError as exc:
-        print("facts: %s" % exc, file=sys.stderr)
-        return 2
-    wanted = args.tickers or [args.cik]
+    ciks = {}
+    if not args.cik and (has_us_tickers or not wanted or args.offline):
+        try:
+            ciks = ticker_ciks(fetcher)
+        except FactsError:
+            ciks = {}
+
     for t in wanted:
         tick = t.upper()
+        # 1. Determine if Indian or US
+        if not args.cik and is_indian_ticker(tick, exchange=args.exchange, offline=args.offline, ciks=ciks):
+            try:
+                data = fetcher.get_indian(tick, exchange=args.exchange)
+                result = analyse_indian(data, quarters=args.quarters, annual=args.annual)
+                changes_lines = changes_indian(result)
+            except FactsError as exc:
+                print("facts: %s: %s" % (tick, exc), file=sys.stderr)
+                failed += 1
+                continue
+            results.append({"ticker": tick, "result": result, "filings": None,
+                            "changes": changes_lines, "note": None})
+            rows.append(metrics_row_indian(tick, result))
+            if not args.json:
+                sys.stdout.write(render_indian(tick, result, show_annual=args.annual))
+                sys.stdout.write("\n")
+            continue
+
+        # 2. US SEC XBRL
         if args.cik:
             cik, name = str(args.cik).zfill(10), None
         else:
             cik, name = ciks.get(tick.replace("-", "."), (None, None))
         if not cik:
+            # Check if online Indian lookup works as fallback
+            if not args.offline:
+                try:
+                    data = fetcher.get_indian(tick, exchange=args.exchange)
+                    result = analyse_indian(data, quarters=args.quarters, annual=args.annual)
+                    changes_lines = changes_indian(result)
+                    results.append({"ticker": tick, "result": result, "filings": None,
+                                    "changes": changes_lines, "note": None})
+                    rows.append(metrics_row_indian(tick, result))
+                    if not args.json:
+                        sys.stdout.write(render_indian(tick, result, show_annual=args.annual))
+                        sys.stdout.write("\n")
+                    continue
+                except FactsError:
+                    pass
             print("facts: no SEC CIK for %s (is it a US filer? ETFs and foreign filers "
                   "may not have XBRL facts)" % tick, file=sys.stderr)
             failed += 1

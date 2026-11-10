@@ -220,6 +220,189 @@ NIFTY_NEXT_50_CONSTITUENTS = [
 
 NIFTY_100_CONSTITUENTS = NIFTY_50_CONSTITUENTS + NIFTY_NEXT_50_CONSTITUENTS
 
+BANKNIFTY_CONSTITUENTS = [
+    ("AUBANK", "AU Small Finance Bank Ltd."),
+    ("AXISBANK", "Axis Bank Ltd."),
+    ("BANDHANBNK", "Bandhan Bank Ltd."),
+    ("BANKBARODA", "Bank of Baroda"),
+    ("FEDERALBNK", "The Federal Bank Ltd."),
+    ("HDFCBANK", "HDFC Bank Ltd."),
+    ("ICICIBANK", "ICICI Bank Ltd."),
+    ("IDFCFIRSTB", "IDFC First Bank Ltd."),
+    ("INDUSINDBK", "IndusInd Bank Ltd."),
+    ("KOTAKBANK", "Kotak Mahindra Bank Ltd."),
+    ("PNB", "Punjab National Bank"),
+    ("SBIN", "State Bank of India"),
+]
+
+FINNIFTY_CONSTITUENTS = [
+    ("AXISBANK", "Axis Bank Ltd."),
+    ("BAJAJFINSV", "Bajaj Finserv Ltd."),
+    ("BAJFINANCE", "Bajaj Finance Ltd."),
+    ("CHOLAFIN", "Cholamandalam Investment and Finance Co. Ltd."),
+    ("HDFCBANK", "HDFC Bank Ltd."),
+    ("HDFCLIFE", "HDFC Life Insurance Co. Ltd."),
+    ("ICICIBANK", "ICICI Bank Ltd."),
+    ("ICICIGI", "ICICI Lombard General Insurance Co. Ltd."),
+    ("ICICIPRULI", "ICICI Prudential Life Insurance Co. Ltd."),
+    ("KOTAKBANK", "Kotak Mahindra Bank Ltd."),
+    ("MUTHOOTFIN", "Muthoot Finance Ltd."),
+    ("PFC", "Power Finance Corporation Ltd."),
+    ("RECLTD", "REC Ltd."),
+    ("SBICARD", "SBI Cards and Payment Services Ltd."),
+    ("SBILIFE", "SBI Life Insurance Co. Ltd."),
+    ("SBIN", "State Bank of India"),
+    ("SHRIRAMFIN", "Shriram Finance Ltd."),
+]
+
+SENSEX_CONSTITUENTS = [
+    ("ASIANPAINT", "Asian Paints Ltd."),
+    ("AXISBANK", "Axis Bank Ltd."),
+    ("BAJAJ-AUTO", "Bajaj Auto Ltd."),
+    ("BAJFINANCE", "Bajaj Finance Ltd."),
+    ("BAJAJFINSV", "Bajaj Finserv Ltd."),
+    ("BHARTIARTL", "Bharti Airtel Ltd."),
+    ("HCLTECH", "HCL Technologies Ltd."),
+    ("HDFCBANK", "HDFC Bank Ltd."),
+    ("HINDALCO", "Hindalco Industries Ltd."),
+    ("HINDUNILVR", "Hindustan Unilever Ltd."),
+    ("ICICIBANK", "ICICI Bank Ltd."),
+    ("INDUSINDBK", "IndusInd Bank Ltd."),
+    ("INFY", "Infosys Ltd."),
+    ("ITC", "ITC Ltd."),
+    ("JSWSTEEL", "JSW Steel Ltd."),
+    ("KOTAKBANK", "Kotak Mahindra Bank Ltd."),
+    ("LT", "Larsen & Toubro Ltd."),
+    ("M&M", "Mahindra & Mahindra Ltd."),
+    ("MARUTI", "Maruti Suzuki India Ltd."),
+    ("NESTLEIND", "Nestle India Ltd."),
+    ("NTPC", "NTPC Ltd."),
+    ("POWERGRID", "Power Grid Corporation of India Ltd."),
+    ("RELIANCE", "Reliance Industries Ltd."),
+    ("SBIN", "State Bank of India"),
+    ("SUNPHARMA", "Sun Pharmaceutical Industries Ltd."),
+    ("TATASTEEL", "Tata Steel Ltd."),
+    ("TCS", "Tata Consultancy Services Ltd."),
+    ("TECHM", "Tech Mahindra Ltd."),
+    ("TITAN", "Titan Company Ltd."),
+    ("ULTRACEMCO", "UltraTech Cement Ltd."),
+]
+
+INDEX_INSTRUMENTS_CONSTITUENTS = [
+    ("NIFTY", "NIFTY 50 Benchmark Index"),
+    ("BANKNIFTY", "NIFTY Bank Banking Index"),
+    ("FINNIFTY", "NIFTY Financial Services Index"),
+    ("MIDCPNIFTY", "NIFTY Midcap Select Index"),
+    ("SENSEX", "BSE SENSEX 30 Index"),
+    ("BANKEX", "BSE BANKEX Index"),
+]
+
+# Prominent mid-cap equities completing the NIFTY 200 universe
+NIFTY_MIDCAP_100_CONSTITUENTS = [
+    ("AARTIIND", "Aarti Industries Ltd."),
+    ("ACC", "ACC Ltd."),
+    ("ALKEM", "Alkem Laboratories Ltd."),
+    ("ASHOKLEY", "Ashok Leyland Ltd."),
+    ("ASTRAL", "Astral Ltd."),
+    ("ATUL", "Atul Ltd."),
+    ("AUBANK", "AU Small Finance Bank Ltd."),
+    ("BALKRISIND", "Balkrishna Industries Ltd."),
+    ("BANDHANBNK", "Bandhan Bank Ltd."),
+    ("BATAINDIA", "Bata India Ltd."),
+    ("BHARATFORG", "Bharat Forge Ltd."),
+    ("BIOCON", "Biocon Ltd."),
+    ("COFORGE", "Coforge Ltd."),
+    ("CROMPTON", "Crompton Greaves Consumer Electricals Ltd."),
+    ("CUMMINSIND", "Cummins India Ltd."),
+    ("DALBHARAT", "Dalmia Bharat Ltd."),
+    ("DEEPAKNTR", "Deepak Nitrite Ltd."),
+    ("DELHIVERY", "Delhivery Ltd."),
+    ("DIXON", "Dixon Technologies (India) Ltd."),
+    ("FEDERALBNK", "The Federal Bank Ltd."),
+    ("FORTIS", "Fortis Healthcare Ltd."),
+    ("GLENMARK", "Glenmark Pharmaceuticals Ltd."),
+    ("GMRINFRA", "GMR Airports Infrastructure Ltd."),
+    ("GODREJPROP", "Godrej Properties Ltd."),
+    ("GUJGASLTD", "Gujarat Gas Ltd."),
+    ("HINDPETRO", "Hindustan Petroleum Corporation Ltd."),
+    ("HONAUT", "Honeywell Automation India Ltd."),
+    ("IGL", "Indraprastha Gas Ltd."),
+    ("INDHOTEL", "The Indian Hotels Company Ltd."),
+    ("INDIAMART", "IndiaMART InterMESH Ltd."),
+    ("INDIANB", "Indian Bank"),
+    ("INDIGO", "InterGlobe Aviation Ltd."),
+    ("IPCALAB", "IPCA Laboratories Ltd."),
+    ("JINDALSTEL", "Jindal Steel & Power Ltd."),
+    ("JUBLFOOD", "Jubilant FoodWorks Ltd."),
+    ("KPITTECH", "KPIT Technologies Ltd."),
+    ("L&TFH", "L&T Finance Holdings Ltd."),
+    ("LAURUSLABS", "Laurus Labs Ltd."),
+    ("LICHSGFIN", "LIC Housing Finance Ltd."),
+    ("LUPIN", "Lupin Ltd."),
+    ("MANAPPURAM", "Manappuram Finance Ltd."),
+    ("MARICO", "Marico Ltd."),
+    ("MAXHEALTH", "Max Healthcare Institute Ltd."),
+    ("METROPOLIS", "Metropolis Healthcare Ltd."),
+    ("MFSL", "Max Financial Services Ltd."),
+    ("MGL", "Mahanagar Gas Ltd."),
+    ("MOTILALOFS", "Motilal Oswal Financial Services Ltd."),
+    ("MRF", "MRF Ltd."),
+    ("MUTHOOTFIN", "Muthoot Finance Ltd."),
+    ("NATIONALUM", "National Aluminium Company Ltd."),
+    ("NAVINFLUOR", "Navin Fluorine International Ltd."),
+    ("NMDC", "NMDC Ltd."),
+    ("OBEROIRLTY", "Oberoi Realty Ltd."),
+    ("OFSS", "Oracle Financial Services Software Ltd."),
+    ("PAGEIND", "Page Industries Ltd."),
+    ("PERSISTENT", "Persistent Systems Ltd."),
+    ("PETRONET", "Petronet LNG Ltd."),
+    ("PHOENIXLTD", "The Phoenix Mills Ltd."),
+    ("PIIND", "PI Industries Ltd."),
+    ("POLYCAB", "Polycab India Ltd."),
+    ("POONAWALLA", "Poonawalla Fincorp Ltd."),
+    ("PRESTIGE", "Prestige Estates Projects Ltd."),
+    ("PVRINOX", "PVR INOX Ltd."),
+    ("RAMCOCEM", "The Ramco Cements Ltd."),
+    ("SAIL", "Steel Authority of India Ltd."),
+    ("SBICARD", "SBI Cards and Payment Services Ltd."),
+    ("SCHAEFFLER", "Schaeffler India Ltd."),
+    ("SOLARINDS", "Solar Industries India Ltd."),
+    ("SONACOMS", "Sona BLW Precision Forgings Ltd."),
+    ("STARHEALTH", "Star Health and Allied Insurance Co. Ltd."),
+    ("SUNDARMFIN", "Sundaram Finance Ltd."),
+    ("SUPREMEIND", "Supreme Industries Ltd."),
+    ("SUZLON", "Suzlon Energy Ltd."),
+    ("SYNGENE", "Syngene International Ltd."),
+    ("TATACHEM", "Tata Chemicals Ltd."),
+    ("TATACOMM", "Tata Communications Ltd."),
+    ("TATAELXSI", "Tata Elxsi Ltd."),
+    ("TATATECH", "Tata Technologies Ltd."),
+    ("TIINDIA", "Tube Investments of India Ltd."),
+    ("TORNTPHARM", "Torrent Pharmaceuticals Ltd."),
+    ("TRIDENT", "Trident Ltd."),
+    ("UBL", "United Breweries Ltd."),
+    ("UNIONBANK", "Union Bank of India"),
+    ("UPL", "UPL Ltd."),
+    ("VOLTAS", "Voltas Ltd."),
+    ("WHIRLPOOL", "Whirlpool of India Ltd."),
+    ("YESBANK", "Yes Bank Ltd."),
+    ("ZEEL", "Zee Entertainment Enterprises Ltd."),
+    ("ZOMATO", "Zomato Ltd."),
+    ("ZYDUSLIFE", "Zydus Lifesciences Ltd."),
+    ("AMBER", "Amber Enterprises India Ltd."),
+    ("ANGELONE", "Angel One Ltd."),
+    ("BBL", "Bharat Bijlee Ltd."),
+    ("CDSL", "Central Depository Services (India) Ltd."),
+    ("CLEAN", "Clean Science and Technology Ltd."),
+    ("DATAPATTNS", "Data Patterns (India) Ltd."),
+    ("ECLERX", "eClerx Services Ltd."),
+    ("HAPPSTMNDS", "Happiest Minds Technologies Ltd."),
+    ("KAYNES", "Kaynes Technology India Ltd."),
+    ("MAPMYINDIA", "C.E. Info Systems Ltd."),
+]
+
+NIFTY_200_CONSTITUENTS = sorted(list(dict(NIFTY_100_CONSTITUENTS + NIFTY_MIDCAP_100_CONSTITUENTS).items()))
+
 NYSE_HOLIDAYS = {
     "2026-01-01": "New Year's Day",
     "2026-01-19": "Martin Luther King, Jr. Day",
@@ -258,6 +441,9 @@ SETUPS = [
     ("reclaim_ma20", "reclaimed the 20-day average"),
     ("oversold", "oversold (RSI under 30)"),
     ("oversold_bounce", "oversold bounce"),
+    ("ma_crossover", "moving average crossover"),
+    ("trend_following", "trend following"),
+    ("rsi_momentum", "RSI momentum"),
 ]
 LABEL = dict(SETUPS)
 
@@ -706,15 +892,42 @@ def build_universe(texts):
     return sorted(kept.items()), counts, created
 
 
-def build_universe_in(index="NIFTY50", instruments_cache=None, offline_path=None):
+def build_universe_in(index="NIFTY50", instruments_cache=None, offline_path=None, exchange="NSE", symbols=None, config_path=None):
     """Build Indian stock universe for scanning.
     Supported indices:
     - NIFTY50: 50 prominent large-cap equities.
     - NIFTY100: 100 large-cap and mid-cap equities.
+    - NIFTY200: 200 large-cap, mid-cap, and growth equities.
+    - NIFTY500: Broad market equity universe.
+    - BANKNIFTY: 12 prominent banking sector equities.
+    - FINNIFTY: Financial services sector equities.
+    - SENSEX: 30 BSE blue-chip equities.
+    - BSE100: BSE 100 benchmark equities.
+    - INDICES: Benchmark index instruments (NIFTY, BANKNIFTY, SENSEX, etc.).
     - FNO: Available eligible F&O stocks.
+    - ALL / CASH: All listed cash-market equities on the exchange.
+    - CUSTOM: Custom user-provided symbols list.
     """
     idx = (index or "NIFTY50").strip().upper()
+    exch = (exchange or "NSE").strip().upper()
     counts = {}
+
+    if not symbols and config_path:
+        cfg = read_json(config_path, "config", required=False) or {}
+        symbols = cfg.get("symbols") or cfg.get("watchlist")
+
+    if symbols or idx in ("CUSTOM", "WATCHLIST"):
+        kept = []
+        sym_list = symbols or []
+        for s in sym_list:
+            clean = str(s).strip().upper()
+            if clean:
+                kept.append((clean, clean))
+        kept = sorted(kept)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "Custom Symbol List"
+
     if idx == "NIFTY50":
         kept = sorted(NIFTY_50_CONSTITUENTS)
         counts["rows"] = len(kept)
@@ -725,6 +938,96 @@ def build_universe_in(index="NIFTY50", instruments_cache=None, offline_path=None
         counts["rows"] = len(kept)
         counts["keep"] = len(kept)
         return kept, counts, "NSE NIFTY 100 Index"
+    elif idx == "NIFTY200":
+        kept = sorted(NIFTY_200_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "NSE NIFTY 200 Index"
+    elif idx in ("NIFTY500", "500"):
+        # Combine NIFTY 200 with cached instrument universe or expanded list
+        cache_path = instruments_cache or "trader/state/instruments.json"
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                insts = doc.get("instruments", {})
+                kept = [(sym, rec.get("name", sym)) for sym, rec in sorted(insts.items())
+                        if rec.get("instrument_type") == "EQUITY"]
+                if len(kept) >= 100:
+                    counts["rows"] = len(insts)
+                    counts["keep"] = len(kept)
+                    return kept[:500], counts, "NSE NIFTY 500 / Broad Market Master Cache"
+            except Exception:
+                pass
+        # Fallback to NIFTY 200 if cache unavailable
+        kept = sorted(NIFTY_200_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "NSE NIFTY 200 Index (Broad Market proxy)"
+    elif idx in ("BANKNIFTY", "NIFTYBANK"):
+        kept = sorted(BANKNIFTY_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "NSE NIFTY Bank Index"
+    elif idx in ("FINNIFTY", "NIFTYFIN"):
+        kept = sorted(FINNIFTY_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "NSE NIFTY Financial Services Index"
+    elif idx == "SENSEX":
+        kept = sorted(SENSEX_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "BSE SENSEX 30 Index"
+    elif idx in ("BSE100", "BSE_100"):
+        kept = sorted(list(dict(SENSEX_CONSTITUENTS + NIFTY_100_CONSTITUENTS).items()))
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "BSE 100 Index"
+    elif idx in ("INDEX", "INDICES"):
+        kept = sorted(INDEX_INSTRUMENTS_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "Benchmark Index Instruments"
+    elif idx in ("ALL", "CASH", "ALL_EQUITIES"):
+        # Load all eligible cash-market equities from offline master or cache
+        if offline_path and os.path.isdir(offline_path):
+            eq_csv = os.path.join(offline_path, "EQUITY_L.csv")
+            bse_csv = os.path.join(offline_path, "Equity.csv")
+            if exch == "BSE" and os.path.isfile(bse_csv) and instruments is not None:
+                bse_records = instruments.parse_bse_equity_csv(bse_csv)
+                kept = [(sym, rec.get("name", sym)) for sym, rec in sorted(bse_records.items())]
+                counts["rows"] = len(bse_records)
+                counts["keep"] = len(kept)
+                return kept, counts, "BSE Cash Equity Listed Master (Offline Files)"
+            elif os.path.isfile(eq_csv) and instruments is not None:
+                eq_records = instruments.parse_equity_l_csv(eq_csv)
+                kept = [(sym, rec.get("name", sym)) for sym, rec in sorted(eq_records.items())
+                        if not rec.get("is_trade_to_trade")]
+                counts["rows"] = len(eq_records)
+                counts["keep"] = len(kept)
+                return kept, counts, "NSE Cash Equity Listed Master (Offline Files)"
+        cache_path = instruments_cache or "trader/state/instruments.json"
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                insts = doc.get("instruments", {})
+                kept = [(sym, rec.get("name", sym)) for sym, rec in sorted(insts.items())
+                        if rec.get("instrument_type") == "EQUITY" and
+                        (exch == "ALL" or rec.get("exchange", "NSE") == exch) and
+                        not rec.get("is_trade_to_trade")]
+                if kept:
+                    counts["rows"] = len(insts)
+                    counts["keep"] = len(kept)
+                    return kept, counts, "%s Cash Equities Master Cache (%s)" % (exch, cache_path)
+            except Exception:
+                pass
+        # Fallback to NIFTY 200
+        kept = sorted(NIFTY_200_CONSTITUENTS)
+        counts["rows"] = len(kept)
+        counts["keep"] = len(kept)
+        return kept, counts, "%s Listed Equities (NIFTY 200 proxy)" % exch
     elif idx in ("FNO", "F&O"):
         # Check offline path for EQUITY_L.csv and fo_mktlots.csv
         if offline_path and os.path.isdir(offline_path):
@@ -760,7 +1063,7 @@ def build_universe_in(index="NIFTY50", instruments_cache=None, offline_path=None
         counts["keep"] = len(kept)
         return kept, counts, "NSE F&O Eligible (NIFTY 100 proxy)"
     else:
-        raise ScanError("Unsupported Indian index %r: choose NIFTY50, NIFTY100, or FNO" % index)
+        raise ScanError("Unsupported Indian index %r: choose NIFTY50, NIFTY100, NIFTY200, NIFTY500, BANKNIFTY, FINNIFTY, SENSEX, BSE100, INDICES, ALL, or FNO" % index)
 
 
 # ---------------------------------------------------------------- daily setups
@@ -796,15 +1099,15 @@ def daily_closes(series, now_utc, market="US"):
     return sorted(out.items())
 
 
-def find_setups(closes):
+def find_setups(closes, strategy_cfg=None):
     """closes (oldest first, >= 30) -> (setup keys, numbers)."""
     c = closes
     last = c[-1]
     hi20 = max(c[-21:-1])
     ma20 = sum(c[-20:]) / 20.0
     ma20_prev = sum(c[-21:-1]) / 20.0
-    run = c[-6] / c[-16] - 1
-    rng5 = (max(c[-5:]) - min(c[-5:])) / last
+    run = c[-6] / c[-16] - 1 if c[-16] > 0 else 0.0
+    rng5 = (max(c[-5:]) - min(c[-5:])) / last if last > 0 else 0.0
     r = rsi(c)
     r_prev = rsi(c[:-1])
     tags = []
@@ -818,11 +1121,32 @@ def find_setups(closes):
         tags.append("oversold")
     if r_prev is not None and r_prev < 30 and last > c[-2]:
         tags.append("oversold_bounce")
+
+    # Configurable Strategy Extensions (evaluated when enabled in strategy configuration)
+    sc = strategy_cfg or {}
+    enabled = sc.get("enable_extended_strategies") or sc.get("strategy") in ("ma_crossover", "trend", "trend_following", "rsi_momentum")
+    if enabled:
+        ma_fast = int(sc.get("ma_fast_period") or 9)
+        ma_slow = int(sc.get("ma_slow_period") or 21)
+        if len(c) >= ma_slow + 1:
+            f_curr = sum(c[-ma_fast:]) / float(ma_fast)
+            f_prev = sum(c[-ma_fast - 1:-1]) / float(ma_fast)
+            s_curr = sum(c[-ma_slow:]) / float(ma_slow)
+            s_prev = sum(c[-ma_slow - 1:-1]) / float(ma_slow)
+            if f_prev <= s_prev and f_curr > s_curr:
+                tags.append("ma_crossover")
+            if last > f_curr > s_curr:
+                tags.append("trend_following")
+
+        rsi_thresh = float(sc.get("rsi_momentum_threshold") or 60.0)
+        if r is not None and r >= rsi_thresh:
+            tags.append("rsi_momentum")
+
     return tags, {"rsi": r, "rsi_prev": r_prev, "high20": hi20, "ma20": ma20,
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US"):
+def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strategy_cfg=None):
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
@@ -847,7 +1171,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US"):
         d_last = bars[-1][0]
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
-        tags, nums = find_setups(closes)
+        tags, nums = find_setups(closes, strategy_cfg=strategy_cfg)
         if tags:
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
@@ -1055,15 +1379,40 @@ def fetch_spark(symbols, rng, interval, pause, a=None, market="US"):
     return data, failed
 
 
+def read_json(path, what=None, required=False):
+    if not path or not os.path.exists(path):
+        if required:
+            raise ScanError("no %s file at %s" % (what or "JSON", path))
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as e:
+        if required:
+            raise ScanError("could not read %s at %s: %s" % (what or "JSON", path, e))
+        return None
+
+
 def read_symbols(a, offline_syms=None):
-    if a.symbols:
+    cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"
+    cfg = read_json(cfg_path, "config", required=False) or {}
+    cfg_syms = cfg.get("symbols")
+    cfg_wl = cfg.get("watchlist")
+    if getattr(a, "symbols", None):
         syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
-    elif a.watchlist:
+    elif getattr(a, "watchlist", None):
         syms = symbols_from_file(a.watchlist)
-    elif offline_syms is not None and not a.universe:
+    elif cfg_syms:
+        if isinstance(cfg_syms, list):
+            syms = [str(s).strip().upper() for s in cfg_syms if str(s).strip()]
+        else:
+            syms = [s for s in re.split(r"[,\s]+", str(cfg_syms).upper()) if s]
+    elif cfg_wl:
+        syms = symbols_from_file(cfg_wl)
+    elif offline_syms is not None and not getattr(a, "universe", None):
         syms = sorted(offline_syms)  # offline: every chart in the file, unless a list was given
     else:
-        path = a.universe or DEFAULT_UNIVERSE
+        path = getattr(a, "universe", None) or DEFAULT_UNIVERSE
         if not os.path.exists(path):
             raise ScanError("no %s yet: run `scan.py universe` first, or pass --symbols" % path)
         syms = symbols_from_file(path)
@@ -1071,7 +1420,7 @@ def read_symbols(a, offline_syms=None):
     for s in syms:
         if s not in out:
             out.append(s)
-    if a.limit:
+    if getattr(a, "limit", None):
         out = out[:a.limit]
     if not out:
         raise ScanError("no symbols to scan")
@@ -1129,11 +1478,17 @@ def money(x, market="US"):
 def cmd_universe(a):
     t0 = time.time()
     market = get_market_profile(a)
+    cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"
+    cfg = read_json(cfg_path, "config", required=False) or {}
     if market == "IN":
-        index = getattr(a, "index", None) or "NIFTY50"
+        index = getattr(a, "index", None) or cfg.get("universe") or cfg.get("index") or "NIFTY50"
+        exchange = getattr(a, "exchange", None) or cfg.get("exchange") or cfg.get("primary_exchange") or "NSE"
+        symbols = getattr(a, "symbols", None) or cfg.get("symbols")
+        if isinstance(symbols, str):
+            symbols = [s for s in re.split(r"[,\s]+", symbols.upper()) if s]
         instruments_cache = getattr(a, "instruments", None) or "trader/state/instruments.json"
         kept, counts, created = build_universe_in(index=index, instruments_cache=instruments_cache,
-                                                  offline_path=a.offline)
+                                                  offline_path=a.offline, exchange=exchange, symbols=symbols)
         if not a.no_write:
             d = os.path.dirname(a.out)
             if d:
@@ -1144,11 +1499,11 @@ def cmd_universe(a):
         dropped = {k: v for k, v in counts.items() if k not in ("keep", "rows")}
         if a.json:
             print(json.dumps({"count": len(kept), "rows": counts.get("rows", len(kept)),
-                              "index": index.upper(), "source": created,
+                              "index": index.upper(), "exchange": exchange.upper(), "source": created,
                               "out": None if a.no_write else a.out,
                               "seconds": round(time.time() - t0, 1)}, indent=2))
         else:
-            print("NSE/BSE Indian stock universe (%s): %d securities." % (index.upper(), len(kept)))
+            print("NSE/BSE Indian stock universe (%s / %s): %d securities." % (exchange.upper(), index.upper(), len(kept)))
             if not a.no_write:
                 print("Wrote %s (one SYMBOL|Name a line)." % a.out)
         return 0 if kept else 1
@@ -1197,6 +1552,12 @@ def cmd_universe(a):
 def cmd_daily(a):
     t0 = time.time()
     market = get_market_profile(a)
+    cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"
+    cfg = read_json(cfg_path, "config", required=False) or {}
+    strategy_cfg = dict(cfg.get("strategy_params") or cfg)
+    if getattr(a, "strategy", None):
+        strategy_cfg["strategy"] = a.strategy
+        strategy_cfg["enable_extended_strategies"] = True
     now = parse_now(a.now, market="IN") if market == "IN" else parse_now(a.now)
     offline_syms = None
     if a.offline:
@@ -1207,7 +1568,9 @@ def cmd_daily(a):
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a, market=market)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, market=market)
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, market=market, strategy_cfg=strategy_cfg)
+    if getattr(a, "strategy", None):
+        hits = [h for h in hits if a.strategy in h.get("setups", [])]
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
@@ -1364,10 +1727,12 @@ def main(argv=None):
     p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--json", action="store_true")
     p.add_argument("--market", choices=["US", "IN"], help="market profile: US (Nasdaq/NYSE) or IN (NSE/BSE)")
-    p.add_argument("--index", choices=["NIFTY50", "NIFTY100", "FNO"], default="NIFTY50",
-                   help="Indian index constituent list: NIFTY50, NIFTY100, or FNO")
+    p.add_argument("--index", default="NIFTY50",
+                   help="Indian index constituent list: NIFTY50, NIFTY100, NIFTY200, NIFTY500, BANKNIFTY, FINNIFTY, SENSEX, BSE100, INDICES, ALL, or FNO")
+    p.add_argument("--exchange", choices=["NSE", "BSE", "ALL"], default="NSE", help="exchange for cash market equities")
     p.add_argument("--instruments", default="trader/state/instruments.json",
                    help="path to authoritative instrument master cache")
+    p.add_argument("--config", default="trader/config.json", help="path to config JSON")
 
     def common(p, min_price, min_volume):
         g = p.add_mutually_exclusive_group()
@@ -1386,6 +1751,9 @@ def main(argv=None):
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")
         p.add_argument("--market", choices=["US", "IN"], help="market profile: US or IN")
+        p.add_argument("--strategy", choices=["breakout_20d", "bull_flag", "reclaim_ma20", "oversold", "oversold_bounce", "ma_crossover", "trend_following", "rsi_momentum"],
+                       help="filter or highlight a specific setup strategy")
+        p.add_argument("--config", default="trader/config.json", help="path to config JSON")
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
     common(p, 5.0, 1000000)
@@ -1396,19 +1764,6 @@ def main(argv=None):
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this local market time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30/15:00)")
-    p.add_argument("--config", default="trader/config.json")
-    a = ap.parse_args(argv)
-    if not a.cmd:
-        ap.print_help()
-        return 1
-    try:
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
-    except ScanError as e:
-        print("scan.py: %s" % e, file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("scan.py: stopped", file=sys.stderr)
-        return 1
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

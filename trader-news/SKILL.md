@@ -26,6 +26,7 @@ Tool in this folder (standard library Python, no keys):
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers TSLA NVDA --hours 12
+python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE TCS INFY --hours 48  # Indian equities (IST)
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 ```
 
@@ -37,6 +38,7 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 | `trader/plan.json` | the trade you are planning (trader-exit) |
 | `trader/portfolio.json` | what you hold (trader-broker records fills there) |
 | Yahoo Finance headline RSS | `https://feeds.finance.yahoo.com/rss/2.0/headline?s=TSLA&region=US&lang=en-US` |
+| Google News India corporate RSS | `https://news.google.com/rss/search?q=<QUERY>&hl=en-IN&gl=IN&ceid=IN:en` |
 | Yahoo Finance chart endpoint | the last price against yesterday's close (unofficial, can lag) |
 | SEC EDGAR company Atom feed | 8-K by default (`--forms 8-K,10-Q` for more); needs `sec_user_agent` in `trader/config.json` or `SEC_USER_AGENT`, else filings are skipped with a note |
 | `trader/state/news.json` | what has been shown (kept 30 days) and each ticker's CIK |

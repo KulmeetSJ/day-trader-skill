@@ -282,9 +282,14 @@ def plain_parts(order, market=None):
     sym = order.get("symbol", "?")
     typ = str(order.get("type", "market"))
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
+    contracts = order.get("contracts")
     if is_bracket(order):
         how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
-        parts = ["%s %s %s, %s, %s" % (side, _str_num(order.get("qty")), sym, how, tif)]
+        if contracts:
+            qty_desc = "%s (%s contract%s)" % (_str_num(order.get("qty")), contracts, "" if contracts == 1 else "s")
+        else:
+            qty_desc = _str_num(order.get("qty"))
+        parts = ["%s %s %s, %s, %s" % (side, qty_desc, sym, how, tif)]
         if order.get("stop_loss_stop_price") is not None:
             leg = "stop-loss %s" % _p(order["stop_loss_stop_price"])
             if order.get("stop_loss_limit_price") is not None:
@@ -296,6 +301,9 @@ def plain_parts(order, market=None):
         if loss is not None:
             parts.append("max loss about %s if the stop fills at %s (it can fill worse in a fast market)"
                          % (_money(loss, market=market), _p(stop)))
+        if order.get("transaction_costs"):
+            tc = order["transaction_costs"]
+            parts.append("est charges %s" % _money(tc["total"], market=market))
         return parts
     if order.get("notional") is not None:
         what = "%s of %s" % (_money(order["notional"], market=market), sym)
@@ -372,7 +380,7 @@ def load_state(path):
 def latest(state, fp, today):
     """The latest decision recorded today for this fingerprint, or None."""
     found = None
-    for rec in state.get("orders", []):
+    for rec in (state or {}).get("orders", []):
         if rec.get("fingerprint") == fp and rec_day(rec) == today:
             found = rec
     return found
@@ -449,11 +457,20 @@ def render(order, idx, total, cfg, risk, state, today, market="US"):
 def ticket_json(order, idx, cfg, risk, state, today, market="US"):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
-    return {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
-            "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
-            "tool_input": tool_input(order), "why": order.get("why", ""),
-            "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
+           "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
+           "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+           "tool_input": tool_input(order), "why": order.get("why", ""),
+           "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    if order.get("asset_type"):
+        res["asset_type"] = order["asset_type"]
+    if order.get("contracts"):
+        res["contracts"] = order["contracts"]
+    if order.get("lot_size"):
+        res["lot_size"] = order["lot_size"]
+    if order.get("transaction_costs"):
+        res["transaction_costs"] = order["transaction_costs"]
+    return res
 
 
 # ---------------------------------------------------------------- fills -> portfolio

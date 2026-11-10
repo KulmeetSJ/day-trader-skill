@@ -204,5 +204,135 @@ class Check(unittest.TestCase):
         self.assertEqual(state["last_check"], now.isoformat())
 
 
+class IndianNews(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "state", "news.json")
+        self.now_in = "2026-11-10T22:00:00+00:00"
+        self.base = ["--offline", DIR, "--state", self.state, "--now", self.now_in,
+                     "--portfolio", os.path.join(self.tmp.name, "none.json"),
+                     "--watchlist", os.path.join(self.tmp.name, "none.json"),
+                     "--plan", os.path.join(self.tmp.name, "none.json")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_symbol_normalization(self):
+        # Case insensitivity, suffixes, exchange prefixes
+        self.assertEqual(news.normalize_ticker("reliance"), ("RELIANCE", "NSE"))
+        self.assertEqual(news.normalize_ticker("TCS.NS"), ("TCS", "NSE"))
+        self.assertEqual(news.normalize_ticker("BSE:INFY"), ("INFY", "BSE"))
+        self.assertEqual(news.normalize_ticker("HDFCBANK.BO"), ("HDFCBANK", "BSE"))
+        self.assertEqual(news.normalize_ticker("AAPL"), ("AAPL", None))
+
+        # Yahoo Finance ticker conversion
+        self.assertEqual(news.yahoo_symbol("RELIANCE"), "RELIANCE.NS")
+        self.assertEqual(news.yahoo_symbol("INFY", exchange="BSE"), "INFY.BO")
+        self.assertEqual(news.yahoo_symbol("TCS.NS"), "TCS.NS")
+        self.assertEqual(news.yahoo_symbol("AAPL"), "AAPL")
+        self.assertEqual(news.yahoo_symbol("BRK.B"), "BRK-B")
+
+    def test_ist_time_and_timestamp_preservation(self):
+        utc = datetime.datetime(2026, 11, 10, 7, 21, 45, tzinfo=datetime.timezone.utc)
+        ist = news.to_ist(utc)
+        self.assertEqual(ist.hour, 12)
+        self.assertEqual(ist.minute, 51)
+        self.assertEqual(ist.second, 45)
+
+    def test_google_news_rss_parsing_and_attribution(self):
+        items = news.parse_rss(raw("google-RELIANCE.xml"), "RELIANCE", default_source="Google News")
+        self.assertGreater(len(items), 10)
+        first = items[0]
+        self.assertTrue(first["publisher"])
+        self.assertTrue(first["source_url"].startswith("http"))
+        self.assertEqual(first["ticker"], "RELIANCE")
+        self.assertIsNotNone(first["time"])
+        self.assertIn("IST", first["time_ist"])
+
+    def test_distinguish_price_movement_vs_actual_news(self):
+        # Automated quote tracker headlines must be flagged
+        tracker1 = "Reliance Industries Share Price - Live NSE: RELIANCE Stock Price & Chart - Upstox"
+        tracker2 = "INFY Share Price Today - Infosys Ltd. Stock Price Live NSE/BSE - Univest"
+        tracker3 = "HDFC Bank Limited (HDFCBANK.NS) stock price, news, quote and history - Yahoo Finance Australia"
+        self.assertTrue(news.is_price_movement_headline(tracker1))
+        self.assertTrue(news.is_price_movement_headline(tracker2))
+        self.assertTrue(news.is_price_movement_headline(tracker3))
+
+        # Genuine news and corporate announcements must not be flagged as price movements
+        news1 = "Retail investors shed stocks, but crowd into Reliance, HDFC Bank - Livemint"
+        news2 = "TCS schedules analyst meetings in Mumbai and Singapore for November 2026 - scanx.trade"
+        news3 = "Infosys Consolidated September 2026 Net Sales at Rs 49,244.00 crore - Moneycontrol"
+        self.assertFalse(news.is_price_movement_headline(news1))
+        self.assertFalse(news.is_price_movement_headline(news2))
+        self.assertFalse(news.is_price_movement_headline(news3))
+
+    def test_deduplication_across_feeds(self):
+        story1 = {
+            "id": "rss:111", "source": "Livemint", "source_url": "https://www.livemint.com",
+            "publisher": "Livemint", "kind": "headline", "ticker": "RELIANCE",
+            "title": "Retail investors shed stocks, but crowd into Reliance, HDFC Bank - Livemint",
+            "summary": "Report on investor activity", "link": "https://news.google.com/1",
+            "time": datetime.datetime(2026, 11, 10, 7, 21, 45, tzinfo=datetime.timezone.utc),
+            "touches": ["RELIANCE"]
+        }
+        story2 = {
+            "id": "rss:222", "source": "TradingView", "source_url": "https://www.tradingview.com",
+            "publisher": "TradingView", "kind": "headline", "ticker": "RELIANCE",
+            "title": "Retail investors shed stocks, but crowd into Reliance, HDFC Bank - TradingView",
+            "summary": "Syndicated article on investor activity", "link": "https://news.google.com/2",
+            "time": datetime.datetime(2026, 11, 10, 10, 35, 11, tzinfo=datetime.timezone.utc),
+            "touches": ["HDFCBANK", "RELIANCE"]
+        }
+        deduped = news.dedupe([story1, story2])
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["touches"], ["HDFCBANK", "RELIANCE"])
+
+    def test_three_indian_companies_offline_announcements(self):
+        # Validate multi-ticker invocation for RELIANCE, TCS and INFY with actual corporate announcements
+        code, out, err = run(["--tickers", "RELIANCE", "TCS", "INFY", "--hours", "72"] + self.base)
+        self.assertEqual(code, 0, err)
+
+        # Check moves lines with IST timestamps
+        self.assertIn("RELIANCE", out)
+        self.assertIn("TCS", out)
+        self.assertIn("INFY", out)
+        self.assertIn("at 15:28 IST", out)
+
+        # Check actual known corporate developments retrieved from fixtures
+        self.assertIn("Reliance", out)
+        self.assertIn("TCS", out)
+        self.assertIn("Infosys", out)
+
+        # Check IST publication timestamps and checked line
+        self.assertIn("IST", out)
+        self.assertIn("Checked 2026-11-11 03:30 IST", out)
+
+        # Verify no em-dash in output
+        self.assertNotIn(chr(0x2014), out)
+
+    def test_indian_json_output_fields(self):
+        code, out, err = run(["--tickers", "RELIANCE", "TCS", "--hours", "72", "--json"] + self.base)
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIn("moves", data)
+        self.assertIn("items", data)
+        self.assertGreater(len(data["items"]), 5)
+        for item in data["items"]:
+            self.assertIn("source", item)
+            self.assertIn("publisher", item)
+            self.assertIn("time", item)
+            self.assertIn("link", item)
+            self.assertIn("ticker", item)
+
+    def test_mixed_us_and_indian_tickers(self):
+        # Test TSLA (US) and RELIANCE (India) in one run
+        code, out, err = run(["--tickers", "TSLA", "RELIANCE", "--hours", "2400", "--no-sec"] + self.base)
+        self.assertEqual(code, 0, err)
+        self.assertIn("TSLA", out)
+        self.assertIn("RELIANCE", out)
+        self.assertIn("ET", out)
+        self.assertIn("IST", out)
+
+
 if __name__ == "__main__":
     unittest.main()

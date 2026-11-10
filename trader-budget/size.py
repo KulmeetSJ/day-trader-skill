@@ -93,10 +93,266 @@ DEFAULTS = {
     "paper": True,
     "blocked": [],
     "allow_options": False,
+    "allow_futures": False,
+    "futures_margin_pct": 20.0,
     "allow_margin": False,
     "allow_short": False,
     "pdt_guard": False,
 }
+
+
+REGULATORY_SCHEDULES = {
+    # Key is effective start date (YYYY-MM-DD)
+    "2026-04-01": {
+        "description": "Finance Act 2026 (STT revision) & NSE Circular 2026-03-01 (Txn charge revision)",
+        "stt": {
+            "equity_intraday_sell": 0.00025,       # 0.025% on sell
+            "equity_delivery_buy": 0.001,           # 0.1% on buy
+            "equity_delivery_sell": 0.001,          # 0.1% on sell
+            "futures_sell": 0.0005,                 # 0.05% on sell (increased from 0.02%)
+            "options_sell": 0.0015,                 # 0.15% on sell premium (increased from 0.1%)
+            "options_exercised": 0.0015,            # 0.15% on intrinsic value
+        },
+        "nse_txn": {
+            "cash": 307.0 / 1e7,                    # Rs 307 / crore per side = 0.0000307 (incl IPFT)
+            "futures": 183.0 / 1e7,                 # Rs 183 / crore per side = 0.0000183 (incl IPFT)
+            "options": 3553.0 / 1e7,                # Rs 3,553 / crore per side = 0.0003553 (incl IPFT)
+        },
+        "sebi": 10.0 / 1e7,                         # Rs 10 / crore per side = 0.000001
+        "stamp_duty_buy": {
+            "equity_intraday": 0.00003,             # 0.003%
+            "equity_delivery": 0.00015,             # 0.015%
+            "futures": 0.00002,                     # 0.002%
+            "options": 0.00003,                     # 0.003%
+        },
+        "gst_rate": 0.18,
+    },
+    "2024-10-01": {
+        "description": "Finance Act 2024 STT revision",
+        "stt": {
+            "equity_intraday_sell": 0.00025,
+            "equity_delivery_buy": 0.001,
+            "equity_delivery_sell": 0.001,
+            "futures_sell": 0.0002,                 # 0.02% on sell
+            "options_sell": 0.001,                  # 0.1% on sell premium
+            "options_exercised": 0.00125,           # 0.125% on intrinsic value
+        },
+        "nse_txn": {
+            "cash": 297.0 / 1e7,
+            "futures": 173.0 / 1e7,
+            "options": 3503.0 / 1e7,
+        },
+        "sebi": 10.0 / 1e7,
+        "stamp_duty_buy": {
+            "equity_intraday": 0.00003,
+            "equity_delivery": 0.00015,
+            "futures": 0.00002,
+            "options": 0.00003,
+        },
+        "gst_rate": 0.18,
+    },
+}
+
+
+def get_regulatory_schedule(as_of_date=None):
+    """Retrieve regulatory transaction charge schedule for a given date."""
+    if as_of_date is None:
+        eff_keys = sorted(REGULATORY_SCHEDULES.keys(), reverse=True)
+        return eff_keys[0], REGULATORY_SCHEDULES[eff_keys[0]]
+    if isinstance(as_of_date, (datetime.datetime, datetime.date)):
+        dt_str = as_of_date.strftime("%Y-%m-%d")
+    else:
+        dt_str = str(as_of_date).strip()[:10]
+    for k in sorted(REGULATORY_SCHEDULES.keys(), reverse=True):
+        if dt_str >= k:
+            return k, REGULATORY_SCHEDULES[k]
+    earliest_key = sorted(REGULATORY_SCHEDULES.keys())[0]
+    return earliest_key, REGULATORY_SCHEDULES[earliest_key]
+
+
+def calculate_indian_transaction_charges(
+    asset_type="EQUITY",
+    side="buy",
+    entry_price=0.0,
+    exit_price=0.0,
+    qty=0,
+    trading_style="intraday",
+    as_of_date=None,
+    exercised=False,
+    intrinsic_value=None,
+    spot_price=None,
+    strike=None,
+    option_type="CE",
+):
+    """Calculate statutory transaction charges and brokerage for Indian markets (NSE/BSE).
+    
+    Includes effective-date-based schedules (1 April 2026 STT rates and 1 March 2026 NSE rates).
+    
+    Statutory Levies:
+    - STT (Securities Transaction Tax):
+        Equity Intraday: 0.025% on sell turnover
+        Equity Positional/Delivery: 0.1% on buy and sell turnover
+        Futures: 0.05% on sell turnover (effective 2026-04-01)
+        Options: 0.15% on sell premium turnover (effective 2026-04-01)
+        Exercised Options: 0.15% on intrinsic value
+    - Exchange Transaction Charges (NSE revised effective 2026-03-01, incl. IPFT):
+        Cash: Rs 307 per crore per side (0.00307%)
+        Futures: Rs 183 per crore per side (0.00183%)
+        Options: Rs 3,553 per crore of premium per side (0.03553%)
+    - SEBI Turnover Charges: Rs 10 per crore (0.0001% of turnover)
+    - Stamp Duty (Buy side only):
+        Equity Intraday: 0.003%
+        Equity Positional: 0.015%
+        Futures: 0.002%
+        Options: 0.003%
+    - GST: 18% on (Exchange Charges + SEBI Charges + Brokerage)
+    
+    Brokerage Estimate (Segregated from statutory levies):
+    - Discount broker model: min(Rs 20, 0.03%) per order for intraday/futures, Rs 20 flat for options, Rs 0 delivery.
+    """
+    entry_val = float(entry_price or 0.0) * float(qty or 0)
+    exit_val = float(exit_price or entry_price or 0.0) * float(qty or 0)
+    turnover = entry_val + exit_val
+    asset = str(asset_type or "EQUITY").upper()
+    style = str(trading_style or "intraday").lower()
+    eff_date, schedule = get_regulatory_schedule(as_of_date)
+
+    if turnover <= 0:
+        empty_statutory = {
+            "stt": 0.0, "exchange_charges": 0.0, "sebi_charges": 0.0,
+            "stamp_duty": 0.0, "gst": 0.0, "total": 0.0,
+            "exchange": "NSE", "effective_date": eff_date,
+            "rates_source": "Statutory levies: STT, NSE Txn (incl IPFT), Stamp Duty, SEBI",
+        }
+        empty_brokerage = {
+            "brokerage": 0.0, "gst": 0.0, "total": 0.0, "is_estimate": True,
+            "model": "Standard discount broker model",
+            "disclaimer": "Brokerage is an estimate and varies by broker. Not an official exchange charge.",
+        }
+        empty_pnl = {
+            "gross_pnl": 0.0, "statutory_charges": 0.0, "brokerage_charges": 0.0,
+            "total_charges": 0.0, "net_pnl": 0.0, "breakeven_exit_price": 0.0, "profit_margin_pct": 0.0,
+        }
+        return {
+            "brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0,
+            "sebi_charges": 0.0, "stamp_duty": 0.0, "gst": 0.0, "total": 0.0,
+            "effective_date": eff_date,
+            "statutory": empty_statutory,
+            "brokerage_estimate": empty_brokerage,
+            "profitability_impact": empty_pnl,
+        }
+
+    # Brokerage (Estimated discount broker tariff, not official exchange charge)
+    if asset == "OPTIONS":
+        brokerage = 40.0  # Rs 20 on buy + Rs 20 on sell
+    elif style == "positional" and asset == "EQUITY":
+        brokerage = 0.0   # Free delivery brokerage standard model
+    else:
+        brokerage = min(20.0, round(0.0003 * entry_val, 2)) + min(20.0, round(0.0003 * exit_val, 2))
+
+    # STT (Securities Transaction Tax)
+    if exercised:
+        if intrinsic_value is not None:
+            iv_unit = max(0.0, float(intrinsic_value))
+        elif spot_price is not None and strike is not None:
+            if str(option_type).upper() == "PE":
+                iv_unit = max(0.0, float(strike) - float(spot_price))
+            else:
+                iv_unit = max(0.0, float(spot_price) - float(strike))
+        else:
+            iv_unit = max(0.0, float(exit_price or 0.0))
+        tot_iv = iv_unit * float(qty or 0)
+        stt = round(schedule["stt"]["options_exercised"] * tot_iv, 2)
+    elif asset == "OPTIONS":
+        stt = round(schedule["stt"]["options_sell"] * exit_val, 2)
+    elif asset == "FUTURES":
+        stt = round(schedule["stt"]["futures_sell"] * exit_val, 2)
+    elif style == "positional":
+        stt_buy = round(schedule["stt"]["equity_delivery_buy"] * entry_val, 2)
+        stt_sell = round(schedule["stt"]["equity_delivery_sell"] * exit_val, 2)
+        stt = round(stt_buy + stt_sell, 2)
+    else:
+        stt = round(schedule["stt"]["equity_intraday_sell"] * exit_val, 2)
+
+    # Exchange charges (NSE circular effective 2026-03-01, incl IPFT)
+    if asset == "OPTIONS":
+        exch = round(schedule["nse_txn"]["options"] * turnover, 2)
+    elif asset == "FUTURES":
+        exch = round(schedule["nse_txn"]["futures"] * turnover, 2)
+    else:
+        exch = round(schedule["nse_txn"]["cash"] * turnover, 2)
+
+    # SEBI turnover charges: Rs 10 / crore (0.0001% of turnover)
+    sebi = round(schedule["sebi"] * turnover, 2)
+
+    # Stamp duty: buy side only
+    if asset == "OPTIONS":
+        stamp = round(schedule["stamp_duty_buy"]["options"] * entry_val, 2)
+    elif asset == "FUTURES":
+        stamp = round(schedule["stamp_duty_buy"]["futures"] * entry_val, 2)
+    elif style == "positional":
+        stamp = round(schedule["stamp_duty_buy"]["equity_delivery"] * entry_val, 2)
+    else:
+        stamp = round(schedule["stamp_duty_buy"]["equity_intraday"] * entry_val, 2)
+
+    # GST: 18% on services
+    gst_statutory = round(schedule["gst_rate"] * (exch + sebi), 2)
+    gst_brokerage = round(schedule["gst_rate"] * brokerage, 2)
+    gst = round(schedule["gst_rate"] * (brokerage + exch + sebi), 2)
+
+    statutory_total = round(stt + exch + sebi + stamp + gst_statutory, 2)
+    brokerage_total = round(brokerage + gst_brokerage, 2)
+    total_charges = round(brokerage + stt + exch + sebi + stamp + gst, 2)
+
+    gross_pnl = round(exit_val - entry_val, 2)
+    net_pnl = round(gross_pnl - total_charges, 2)
+    breakeven_exit_price = round((entry_val + total_charges) / qty, 2) if qty > 0 else 0.0
+    profit_margin_pct = round((net_pnl / entry_val) * 100, 2) if entry_val > 0 else 0.0
+
+    statutory = {
+        "stt": stt,
+        "exchange_charges": exch,
+        "sebi_charges": sebi,
+        "stamp_duty": stamp,
+        "gst": gst_statutory,
+        "total": statutory_total,
+        "exchange": "NSE",
+        "effective_date": eff_date,
+        "rates_source": "Statutory levies: STT (Finance Act), NSE Txn (Circular 2026), Stamp Duty, SEBI",
+    }
+
+    brokerage_estimate = {
+        "brokerage": brokerage,
+        "gst": gst_brokerage,
+        "total": brokerage_total,
+        "is_estimate": True,
+        "model": "Standard discount broker model (Rs 20 flat / max 0.03%)",
+        "disclaimer": "Brokerage is an estimate and varies by broker. Not an official exchange charge.",
+    }
+
+    profitability_impact = {
+        "gross_pnl": gross_pnl,
+        "statutory_charges": statutory_total,
+        "brokerage_charges": brokerage_total,
+        "total_charges": total_charges,
+        "net_pnl": net_pnl,
+        "breakeven_exit_price": breakeven_exit_price,
+        "profit_margin_pct": profit_margin_pct,
+    }
+
+    return {
+        "brokerage": brokerage,
+        "stt": stt,
+        "exchange_charges": exch,
+        "sebi_charges": sebi,
+        "stamp_duty": stamp,
+        "gst": gst,
+        "total": total_charges,
+        "effective_date": eff_date,
+        "statutory": statutory,
+        "brokerage_estimate": brokerage_estimate,
+        "profitability_impact": profitability_impact,
+    }
 EPS = 1e-9
 FRESH_MINUTES = 15
 SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
@@ -385,10 +641,38 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     side = str(plan.get("side") or "buy").strip().lower()
     if side != "buy":
         raise SizeError("this pack sizes long (buy) day trades only; the plan says %r" % side)
+    
+    asset_type = plan.get("asset_type")
+    if not asset_type:
+        if plan.get("option_contract"):
+            asset_type = "OPTIONS"
+        elif symbols_in and symbols_in.is_derivative_symbol(sym):
+            deriv_meta = symbols_in.parse_derivative_symbol(sym)
+            asset_type = "OPTIONS" if deriv_meta.get("instrument_type") == "OPT" else "FUTURES"
+        else:
+            asset_type = "EQUITY"
+
+    if asset_type == "OPTIONS":
+        if not c.get("allow_options"):
+            raise SizeError("options are not enabled: set allow_options: true in trader/config.json")
+    elif asset_type == "FUTURES":
+        if c.get("allow_futures") is False:
+            raise SizeError("futures are not enabled: set allow_futures: true in trader/config.json")
+
     if today and plan.get("date") and str(plan["date"]) != today:
-        tz_lbl = "IST" if market == "IN" else "New York"
-        raise SizeError("the plan is for %s and today is %s in %s: make a new plan with trader-exit"
-                        % (plan["date"], today, tz_lbl))
+        is_allowed_off_hours = False
+        if market == "IN" and calendar_in:
+            try:
+                last_td = calendar_in.get_last_trading_day(today)
+                is_trading, _, _ = calendar_in.is_trading_day_in(today)
+                if (not is_trading and str(plan["date"]) == str(last_td)) or plan.get("is_historical_analysis") or plan.get("trading_style") == "positional":
+                    is_allowed_off_hours = True
+            except Exception:
+                pass
+        if not is_allowed_off_hours:
+            tz_lbl = "IST" if market == "IN" else "New York"
+            raise SizeError("the plan is for %s and today is %s in %s: make a new plan with trader-exit"
+                            % (plan["date"], today, tz_lbl))
     entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
     for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
         if v is None or v <= 0:
@@ -432,6 +716,18 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
 
     # Indian instrument metadata: lot size, tick size, Trade-to-Trade check
     lot_size = int(plan.get("lot_size") or 1)
+    if asset_type == "EQUITY" and not (symbols_in and symbols_in.is_derivative_symbol(sym)):
+        # Cash equity trades in shares (lot_size=1). F&O contract lot sizes must not apply to cash equity.
+        lot_size = int(plan.get("equity_lot_size") or 1)
+    elif lot_size <= 1 and (asset_type in ("OPTIONS", "FUTURES") or (symbols_in and symbols_in.is_derivative_symbol(sym))):
+        if plan.get("option_contract") and plan["option_contract"].get("lot_size"):
+            lot_size = int(plan["option_contract"]["lot_size"])
+        elif market == "IN" and instruments:
+            fo_lot = instruments.get_fo_lot_size(sym)
+            if fo_lot:
+                lot_size = int(fo_lot)
+    if asset_type in ("OPTIONS", "FUTURES") and lot_size <= 1:
+        raise SizeError("Cannot authoritatively resolve F&O lot size for derivative %r: missing or incomplete instrument metadata" % sym)
     if lot_size <= 0:
         lot_size = 1
     tick_size = _f(plan.get("tick_size")) or (0.05 if market == "IN" else 0.01)
@@ -490,10 +786,15 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if not is_t2t:
         if qty == 0:
             if bound[0] == "max loss":
-                unit_lbl = ("one lot (%d shares)" % lot_size) if lot_size > 1 else "one share"
-                refusal = ("%s risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
-                           "No order. Skip this trade, or plan a closer stop with trader-exit."
-                           % (unit_lbl, money(risk, market=market), _price(ref), _price(stop), money(max_loss, market=market)))
+                if lot_size > 1:
+                    one_lot_risk = risk * lot_size
+                    refusal = ("the risk of one lot of %s (%d shares) is %s, more than your %s max loss per trade. "
+                               "No order. Skip this trade, or plan a closer stop with trader-exit."
+                               % (sym, lot_size, money(one_lot_risk, market=market), money(max_loss, market=market)))
+                else:
+                    refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
+                               "No order. Skip this trade, or plan a closer stop with trader-exit."
+                               % (money(risk, market=market), _price(ref), _price(stop), money(max_loss, market=market)))
             else:
                 unit_lbl = ("one lot of %s (%d shares)" % (sym, lot_size)) if lot_size > 1 else ("one share of %s" % sym)
                 refusal = ("%s costs %s, more than your %s limit (%s). No order."
@@ -506,6 +807,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
                        % (qty, "" if qty == 1 else "s", sym, money(cost, market=market), money(min_order, market=market)))
 
+    trading_style = plan.get("trading_style") or c.get("trading_style") or "intraday"
     res = {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
@@ -516,7 +818,12 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "asset_type": asset_type, "trading_style": trading_style,
     }
+    if plan.get("option_contract"):
+        res["option_contract"] = plan["option_contract"]
+    if lot_size > 1:
+        res["contracts"] = qty // lot_size
     if market == "IN":
         res["market"] = "IN"
         res["currency"] = "INR"
@@ -524,6 +831,18 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         res["tick_size"] = tick_size
         if is_t2t:
             res["is_trade_to_trade"] = True
+        res["transaction_costs"] = calculate_indian_transaction_charges(
+            asset_type=asset_type,
+            side="buy",
+            entry_price=ref,
+            exit_price=target,
+            qty=qty,
+            trading_style=trading_style,
+            as_of_date=today,
+        )
+    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "data_status", "is_simulated"):
+        if k in plan:
+            res[k] = plan[k]
     return res
 
 
@@ -552,10 +871,31 @@ def bracket_order(s):
                  "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
                  "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
     })
+    if s.get("asset_type") and s["asset_type"] != "EQUITY":
+        o["asset_type"] = s["asset_type"]
+        o["plan"]["asset_type"] = s["asset_type"]
+    if s.get("lot_size") and s["lot_size"] > 1:
+        o["lot_size"] = s["lot_size"]
+        o["contracts"] = int(s["qty"]) // s["lot_size"]
+        o["plan"]["lot_size"] = s["lot_size"]
+        o["plan"]["contracts"] = o["contracts"]
+    if s.get("option_contract"):
+        o["option_contract"] = s["option_contract"]
+        o["plan"]["option_contract"] = s["option_contract"]
+    if s.get("trading_style") and s["trading_style"] != "intraday":
+        o["trading_style"] = s["trading_style"]
+        o["plan"]["trading_style"] = s["trading_style"]
+    if s.get("transaction_costs"):
+        o["transaction_costs"] = s["transaction_costs"]
+        o["plan"]["transaction_costs"] = s["transaction_costs"]
     if market == "IN":
         o["market"] = "IN"
         o["currency"] = "INR"
         o["plan"]["market"] = "IN"
+    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "data_status", "is_simulated"):
+        if k in s:
+            o[k] = s[k]
+            o["plan"][k] = s[k]
     return o
 
 
@@ -586,9 +926,24 @@ def plan_report(s, order, notes=()):
         lines.append("No order: " + s["refusal"])
         lines.append("Education and tooling, not financial advice.")
         return "\n".join(lines)
-    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
-                 % (s["qty"], s["symbol"], money(s["cost"], market=market), _price(s["entry"]), s["qty"],
-                    _price(s["risk_per_share"]), money(s["max_loss"], market=market)))
+    if s.get("asset_type") in ("OPTIONS", "FUTURES") or order.get("contracts"):
+        c_num = order.get("contracts", s["qty"] // s.get("lot_size", 1))
+        lines.append("Size: %d contract%s (%d shares, lot size %d) of %s = %s at %s. Max loss at the stop: %d x %s = %s."
+                     % (c_num, "" if c_num == 1 else "s", s["qty"], s.get("lot_size", 1), s["symbol"],
+                        money(s["cost"], market=market), _price(s["entry"]), s["qty"],
+                        _price(s["risk_per_share"]), money(s["max_loss"], market=market)))
+    else:
+        lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
+                     % (s["qty"], s["symbol"], money(s["cost"], market=market), _price(s["entry"]), s["qty"],
+                        _price(s["risk_per_share"]), money(s["max_loss"], market=market)))
+    if s.get("option_contract", {}).get("is_simulated") or order.get("tier") == "SIMULATED":
+        lines.append("DATA NOTICE: Simulated option pricing (Black-Scholes model). NOT live market quotes.")
+    if s.get("transaction_costs"):
+        tc = s["transaction_costs"]
+        lines.append("Est transaction charges: %s (STT %s, Exch %s, GST %s, Brokerage %s)"
+                     % (money(tc["total"], market=market), money(tc["stt"], market=market),
+                        money(tc["exchange_charges"], market=market), money(tc["gst"], market=market),
+                        money(tc["brokerage"], market=market)))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
@@ -969,6 +1324,7 @@ def run_weights(a, cfg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Size a day trade to your budget and max loss (trader-budget).")
+    ap.add_argument("action", nargs="?", choices=["trade", "plan"], help=argparse.SUPPRESS)
     ap.add_argument("--plan", default="trader/plan.json", help="the trade plan (default trader/plan.json)")
     ap.add_argument("--config", default="trader/config.json", help="rules (default trader/config.json)")
     ap.add_argument("--budget", type=float, help="override the budget in the config")

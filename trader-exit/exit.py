@@ -621,8 +621,10 @@ def read_config(path, market="US"):
     return cfg
 
 
-def resolve_flat_by(day, explicit, cfg, entry_time, market="US"):
+def resolve_flat_by(day, explicit, cfg, entry_time, market="US", trading_style="intraday"):
     """(HH:MM, note). The config's flat-by moves up with an early close."""
+    if trading_style == "positional":
+        return "positional", "positional trade: multi-day hold permitted"
     def_flat = DEFAULTS_IN["flat_by"] if market == "IN" else DEFAULTS["flat_by"]
     t = parse_hhmm(explicit or cfg.get("flat_by") or def_flat, "--flat-by" if explicit else "flat_by", market=market)
     note = ""
@@ -651,6 +653,8 @@ def gather(a):
         raise PlanError("use --from or --symbol, not both")
     if a.side in ("sell", "short"):
         raise PlanError("v2 plans longs only: no stops above a short entry. Plan a buy instead.")
+    style = getattr(a, "trading_style", None)
+    asset_type = getattr(a, "asset_type", None)
     if a.symbol:
         if a.entry is None:
             raise PlanError("--symbol needs --entry PRICE")
@@ -658,7 +662,8 @@ def gather(a):
             raise PlanError("give both --or-high and --or-low, or neither")
         info = {"symbol": a.symbol.upper(), "entry": a.entry, "setup": a.setup or ("orb" if a.or_high is not None else "level"),
                 "date": a.date, "entry_time": a.time, "entry_bar": a.entry_bar, "interval": a.interval or "5m",
-                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags", "doc": None}
+                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags", "doc": None,
+                "trading_style": style or "intraday", "asset_type": asset_type}
     else:
         path = a.from_path or "trader/entry.json"
         doc = read_json(path, "entry (run /trader-entry first, or give --symbol and --entry)")
@@ -675,7 +680,13 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path, "doc": doc}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path, "doc": doc,
+                "trading_style": style or doc.get("trading_style") or "intraday",
+                "asset_type": asset_type or doc.get("asset_type")}
+        if doc.get("option_contract"):
+            info["option_contract"] = doc["option_contract"]
+            if not info.get("asset_type"):
+                info["asset_type"] = "OPTIONS"
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
     if info["interval"] not in INTERVALS:
@@ -694,21 +705,50 @@ def build_plan(a, now_utc):
             pass
     cfg_market = read_config(a.config, market=market) if market == "IN" else cfg
 
+    trading_style = info.get("trading_style") or cfg_market.get("trading_style") or "intraday"
+    asset_type = info.get("asset_type") or cfg_market.get("asset_type") or "EQUITY"
+    option_contract = info.get("option_contract")
+
+    # If symbol is a derivative symbol (e.g. NIFTY26MAR24000CE)
+    if market == "IN" and symbols_in and symbols_in.is_derivative_symbol(info["symbol"]):
+        deriv_meta = symbols_in.parse_derivative_symbol(info["symbol"])
+        if deriv_meta:
+            asset_type = "OPTIONS" if deriv_meta.get("instrument_type") == "OPT" else "FUTURES"
+            if deriv_meta.get("instrument_type") == "OPT" and not option_contract:
+                option_contract = {
+                    "symbol": info["symbol"],
+                    "underlying": deriv_meta.get("underlying"),
+                    "expiry": deriv_meta.get("expiry_date"),
+                    "strike": deriv_meta.get("strike"),
+                    "option_type": deriv_meta.get("option_type")
+                }
+
     # Instrument metadata resolution (tick size, lot size, T2T)
     tick_size = None
     lot_size = 1
     if market == "IN":
         inst_path = getattr(a, "instruments", "trader/state/instruments.json")
-        if instruments and os.path.exists(inst_path):
+        if instruments and inst_path and os.path.exists(inst_path):
             try:
                 cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=info.get("date"))
                 rec = instruments.resolve_instrument(info["symbol"], cache, require_intraday=True)
                 tick_size = Decimal(str(rec.get("tick_size") or "0.05"))
-                lot_size = rec.get("fo_lot_size") or rec.get("lot_size") or 1
+                # Derivatives trade in F&O contract lots; cash equities trade in shares (lot_size=1)
+                if asset_type in ("OPTIONS", "FUTURES"):
+                    lot_size = rec.get("fo_lot_size") or rec.get("lot_size") or 1
+                else:
+                    lot_size = rec.get("lot_size") or 1
             except instruments.InstrumentMetadataError as exc:
                 raise PlanError(str(exc))
         else:
             tick_size = TICK_IN
+
+    if asset_type in ("OPTIONS", "FUTURES") and instruments:
+        fo_lot = instruments.get_fo_lot_size(info["symbol"])
+        if fo_lot:
+            lot_size = fo_lot
+            if option_contract:
+                option_contract["lot_size"] = fo_lot
 
     stop_text = a.stop
     if not stop_text:
@@ -737,7 +777,7 @@ def build_plan(a, now_utc):
         atr, atr_n = atr_of(bars)
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n, market=market, tick_size=tick_size)
-    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg_market, entry_time, market=market)
+    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg_market, entry_time, market=market, trading_style=trading_style)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(round_tick(info["or_high"], tick=c["tick_size"])),
@@ -751,6 +791,14 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if asset_type:
+        plan["asset_type"] = asset_type
+    if option_contract:
+        plan["option_contract"] = option_contract
+        if not lot_size or lot_size == 1:
+            lot_size = option_contract.get("lot_size", 1)
+    if trading_style:
+        plan["trading_style"] = trading_style
     if market == "IN":
         plan["market"] = "IN"
         plan["currency"] = "INR"
@@ -760,6 +808,10 @@ def build_plan(a, now_utc):
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
+    d = info.get("doc") or {}
+    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "last_data_timestamp", "data_status", "is_simulated"):
+        if k in d:
+            plan[k] = d[k]
     warnings = []
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
@@ -797,7 +849,19 @@ def describe(plan):
     out.append("  Target        %s  %s" % (money(plan["target"], market=market), plan["target_label"]))
     out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"], market=market), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
-    out.append("  Flat by       %s %s, win or lose: no overnight hold" % (plan["flat_by"], tz_label))
+    if plan.get("option_contract"):
+        opt = plan["option_contract"]
+        out.append("  Option        %s %s %s, exp %s (lot %s)" % (
+            opt.get("underlying", plan["symbol"]),
+            opt.get("strike", ""),
+            opt.get("option_type", ""),
+            opt.get("expiry", ""),
+            plan.get("lot_size", 1)
+        ))
+    if plan.get("flat_by") == "positional":
+        out.append("  Hold          positional: multi-day hold permitted")
+    else:
+        out.append("  Flat by       %s %s, win or lose: no overnight hold" % (plan["flat_by"], tz_label))
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
@@ -867,6 +931,8 @@ def main(argv=None):
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM market time (default: config flat_by, 15:55 ET or 15:20 IST)")
+    p.add_argument("--asset-type", choices=["EQUITY", "FUTURES", "OPTIONS"], help="asset type")
+    p.add_argument("--trading-style", choices=["intraday", "positional"], help="trading style")
     p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
     p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
     p.add_argument("--config", default="trader/config.json")

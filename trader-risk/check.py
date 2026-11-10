@@ -307,11 +307,11 @@ def window_check(now_et, c):
     return [], warns
 
 
-def window_check_in(now_ist, c):
+def window_check_in(now_ist, c, trading_style="intraday"):
     """Reasons an Indian entry cannot be placed now (IST). Empty when the window is off."""
     before = hhmm(c.get("no_entries_before"), "no_entries_before")
     after = hhmm(c.get("no_entries_after"), "no_entries_after")
-    if before is None and after is None:
+    if before is None and after is None and trading_style != "positional":
         return [], []
     warns = []
     d, t = now_ist.date(), now_ist.time().replace(second=0, microsecond=0)
@@ -325,6 +325,8 @@ def window_check_in(now_ist, c):
     if t < OPEN_IN or now_ist.time() >= CLOSE_IN:
         return ["window: the market is closed (%s IST; the session is %s to %s)"
                 % (stamp, OPEN_IN.strftime("%H:%M"), CLOSE_IN.strftime("%H:%M"))], warns
+    if trading_style == "positional":
+        return [], warns
     if before is not None and t < before:
         return ["window: no new entries before %s IST (it is %s)" % (before.strftime("%H:%M"),
                                                                      t.strftime("%H:%M"))], warns
@@ -578,21 +580,44 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                          % (oc or "advanced_instructions"))
 
         # asset
+        is_opt = False
+        is_fut = False
+        deriv_meta = None
         if sym and OCC.match(sym.replace(" ", "")):
+            is_opt = True
+        elif sym and market == "IN" and symbols_in and symbols_in.is_derivative_symbol(sym):
+            deriv_meta = symbols_in.parse_derivative_symbol(sym)
+            if deriv_meta:
+                if deriv_meta.get("instrument_type") == "OPT":
+                    is_opt = True
+                elif deriv_meta.get("instrument_type") == "FUT":
+                    is_fut = True
+        elif o.get("asset_type") == "OPTIONS" or o.get("option_contract"):
+            is_opt = True
+        elif o.get("asset_type") == "FUTURES":
+            is_fut = True
+
+        if is_opt:
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
             else:
-                warns.append("option order: options can lose 100%% of what you pay")
+                warns.append("option order: options can lose 100% of what you pay")
+        elif is_fut:
+            if c.get("allow_futures") is False:
+                reasons.append("asset: %s is a futures contract; futures are off "
+                               "(\"allow_futures\": false)" % sym)
+            else:
+                warns.append("futures order: leveraged derivative instrument")
         elif sym:
             if market == "IN":
                 if "/" in sym or not TICKER_IN.match(sym):
                     reasons.append("asset: %s does not look like an Indian stock ticker (NSE/BSE); "
-                                   "this pack trades stocks and ETFs only" % sym)
+                                    "this pack trades stocks and ETFs only" % sym)
             else:
                 if "/" in sym or not TICKER.match(sym):
                     reasons.append("asset: %s does not look like a US stock or ETF ticker; "
-                                   "this pack trades stocks and ETFs only" % sym)
+                                    "this pack trades stocks and ETFs only" % sym)
 
         # the reference price: what one share costs to get in
         plan_entry = _f(plan.get("entry"))
@@ -686,6 +711,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                              % (sym, money(pos_after, market=market), 100.0 * pos_after / total, money(total, market=market),
                                 _pct(c["max_position_pct"])))
         if side == "sell" and sym and kind == "entry":
+            if is_opt:
+                reasons.append("options: options selling / naked short options are prohibited (undefined risk)")
             if q is not None:
                 over = q > held + 1e-9
             elif value is not None:
@@ -695,6 +722,43 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if over and not c.get("allow_short"):
                 reasons.append("short: selling more %s than you hold (%s shares); short selling is off. "
                                "If you bought it, record the fill first (ticket.py fill)" % (sym, _num(held)))
+
+        # Lot size check
+        lot_size = int(o.get("lot_size") or plan.get("lot_size") or 1)
+        if lot_size <= 1 and market == "IN" and instruments and (is_opt or is_fut or (symbols_in and symbols_in.is_derivative_symbol(sym))):
+            try:
+                fo_lot = instruments.get_fo_lot_size(sym)
+                if fo_lot and fo_lot > 1:
+                    lot_size = int(fo_lot)
+            except Exception:
+                pass
+        if market == "IN" and (is_opt or is_fut) and lot_size <= 1:
+            reasons.append("metadata: cannot authoritatively resolve contract lot size for %s: missing or incomplete instrument metadata" % sym)
+        elif lot_size > 1:
+            q_val = _f(qty)
+            if q_val is not None:
+                q_int = int(round(q_val))
+                if q_int % lot_size != 0 or q_int <= 0:
+                    later.append("lot size: %s requires whole lot multiples of %d (got qty %s)" % (sym, lot_size, qty))
+
+        # Expiry check for derivative contracts
+        expiry_val = o.get("expiry") or plan.get("expiry") or (o.get("option_contract") or {}).get("expiry")
+        if not expiry_val and deriv_meta:
+            expiry_val = deriv_meta.get("expiry_date")
+        if market == "IN" and (is_opt or is_fut) and not expiry_val:
+            reasons.append("metadata: missing contract expiry date for derivative %s" % sym)
+        elif expiry_val:
+            try:
+                exp_d = datetime.date.fromisoformat(str(expiry_val))
+                if exp_d < now_local.date():
+                    reasons.append("expiry: contract %s expired on %s" % (sym, exp_d.isoformat()))
+                elif exp_d == now_local.date() and kind == "entry":
+                    if now_local.time() > datetime.time(14, 30):
+                        later.append("expiry cutoff: new derivative entries on expiry day (%s) are blocked after 14:30 IST to avoid physical delivery / gamma explosion" % exp_d.isoformat())
+                    else:
+                        warns.append("expiry day: contract %s expires today at 15:30 IST" % sym)
+            except ValueError:
+                pass
 
         # day-trade checks: stop, loss, reward:risk, daily loss, trades, window, pdt
         max_loss = risk_ps = rr = stop = target = None
@@ -752,7 +816,19 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
+            order_style = str(o.get("trading_style") or plan.get("trading_style") or c.get("trading_style") or "").lower()
+            if market == "IN" and order_style == "positional":
+                order_win_reasons, _ = window_check_in(now_local, c, trading_style="positional")
+            else:
+                order_win_reasons = win_reasons
+            is_paper = bool(c.get("paper", True))
+            is_off_hours_allowed = is_paper and (bool(c.get("allow_off_hours")) or bool(o.get("is_historical_analysis")) or bool(plan.get("is_historical_analysis")))
+            if is_off_hours_allowed and order_win_reasons:
+                tz_label = "IST" if market == "IN" else "New York"
+                stamp = now_local.strftime("%a %Y-%m-%d %H:%M")
+                warns.append("off-hours paper trading analysis: market is closed (%s %s). Order evaluated for next trading session." % (stamp, tz_label))
+            else:
+                later.extend(order_win_reasons)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -903,6 +979,7 @@ def load_prices(pdoc):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Check proposed orders against your limits (trader-risk).")
+    ap.add_argument("orders_pos", nargs="?", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--orders", default="trader/orders.json")
     ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--portfolio", default="trader/portfolio.json",
@@ -915,14 +992,18 @@ def main(argv=None):
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in market local time)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
+    ap.add_argument("--allow-off-hours", action="store_true", help="allow paper trade risk evaluation outside market hours")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:
-        doc = read_json(a.orders, "orders file (run trader-budget first)")
+        orders_file = a.orders_pos or a.orders
+        doc = read_json(orders_file, "orders file (run trader-budget first)")
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % a.orders)
         cfg = read_json(a.config, "config", required=False) or {}
+        if getattr(a, "allow_off_hours", False):
+            cfg["allow_off_hours"] = True
         market = getattr(a, "market", None) or get_market_profile(a, orders, cfg)
         now = parse_now(a.now, market=market)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):

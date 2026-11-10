@@ -159,5 +159,206 @@ class Cli(unittest.TestCase):
                          ["RevenueFromContractWithCustomerExcludingAssessedTax"])
 
 
+class RelianceAnalysis(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(DIR, "indian-RELIANCE.json")) as fh:
+            data = json.load(fh)
+        self.r = facts.analyse(data, quarters=6)
+
+    def test_quarterly_metrics(self):
+        self.assertEqual(self.r["market"], "IN")
+        self.assertEqual(self.r["entity"], "RELIANCE INDUSTRIES LTD")
+        self.assertEqual(self.r["currency"], "INR")
+        self.assertEqual(self.r["exchange"], "NSE")
+        q = self.r["rows"][0]
+        self.assertEqual(q["end"], "2026-09-30")
+        self.assertEqual(q["fiscal"], "2Q2027")
+        self.assertEqual(q["revenue"], 3306010000000.0)
+        self.assertEqual(q["operating_income"], 413010000000.0)
+        self.assertEqual(q["net_income"], 255480000000.0)
+        self.assertEqual(q["eps_diluted"], 18.88)
+        self.assertEqual(q["operating_margin"], 12.5)
+        self.assertEqual(q["net_margin"], 7.7)
+        self.assertEqual(q["reported_date"], "2026-10-30")
+        self.assertFalse(q["derived"])
+
+    def test_yoy_growth_and_margins(self):
+        q1 = next(r for r in self.r["rows"] if r["end"] == "2026-06-30")
+        self.assertEqual(q1["revenue_yoy"], 27.0)
+        self.assertEqual(q1["operating_yoy"], 11.5)
+        self.assertEqual(q1["net_income_yoy"], -22.4)
+        self.assertEqual(q1["eps_yoy"], -22.4)
+        self.assertEqual(q1["operating_margin"], 10.5)
+        self.assertEqual(q1["net_margin"], 6.8)
+
+    def test_annual_financials(self):
+        a = self.r["annual_rows"]
+        self.assertEqual(len(a), 4)
+        fy26 = a[0]
+        self.assertEqual(fy26["fiscal"], "FY2026")
+        self.assertEqual(fy26["end"], "2026-03-31")
+        self.assertEqual(fy26["revenue"], 10572190000000.0)
+        self.assertEqual(fy26["operating_income"], 1213770000000.0)
+        self.assertEqual(fy26["net_income"], 807750000000.0)
+        self.assertEqual(fy26["eps_diluted"], 59.69)
+        self.assertEqual(fy26["revenue_yoy"], 9.6)
+        self.assertEqual(fy26["operating_yoy"], 7.9)
+        self.assertEqual(fy26["net_income_yoy"], 16.0)
+
+    def test_balance_sheet_and_cash_flow(self):
+        bs = self.r["balance_sheet"]
+        self.assertEqual(bs["as_of_date"], "2026-09-30")
+        self.assertEqual(bs["total_assets"], 22750330000000.0)
+        self.assertEqual(bs["total_debt"], 4053220000000.0)
+        self.assertEqual(bs["cash_and_equivalents"], 1817230000000.0)
+        self.assertEqual(bs["debt_to_equity"], 44.325)
+        self.assertEqual(bs["current_ratio"], 1.135)
+        self.assertEqual(bs["book_value"], 697.916)
+
+        cf = self.r["cash_flow"]
+        self.assertEqual(cf["operating_cash_flow"], 1921130000000.0)
+        self.assertEqual(cf["free_cash_flow"], 691970000000.0)
+
+    def test_trailing_twelve_months(self):
+        self.assertEqual(self.r["ttm"]["revenue"], 11990330000000.0)
+        self.assertEqual(self.r["ttm"]["operating_income"], 1344470000000.0)
+        self.assertEqual(self.r["ttm"]["net_income"], 821100000000.0)
+        self.assertEqual(self.r["ttm"]["eps_diluted"], 60.68)
+
+    def test_what_changed_in_words(self):
+        lines = facts.changes(self.r)
+        self.assertTrue(any("revenue Rs 330,601 Cr" in l for l in lines))
+        self.assertTrue(any("operating profit Rs 41,301 Cr" in l for l in lines))
+        self.assertTrue(any("Operating margin 12.5%" in l for l in lines))
+        self.assertTrue(any("total assets Rs 2,275,033 Cr" in l for l in lines))
+        self.assertTrue(any("annual operating cash flow Rs 192,113 Cr" in l for l in lines))
+
+    def test_source_attribution(self):
+        self.assertEqual(self.r["source"], "Yahoo Finance Fundamentals API")
+        rendered = facts.render_indian("RELIANCE", self.r)
+        self.assertIn("[SOURCE: Yahoo Finance Fundamentals API | DATA: REPORTED | STATUS: FRESH]", rendered)
+        self.assertNotIn("filed with NSE/BSE", rendered)
+
+
+class TcsAnalysis(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(DIR, "indian-TCS.json")) as fh:
+            data = json.load(fh)
+        self.r = facts.analyse(data, quarters=6)
+
+    def test_quarterly_and_annual_financials(self):
+        self.assertEqual(self.r["entity"], "TATA CONSULTANCY SERV LT")
+        q = self.r["rows"][0]
+        self.assertEqual(q["end"], "2026-09-30")
+        self.assertEqual(q["revenue"], 731880000000.0)
+        self.assertEqual(q["operating_income"], 175530000000.0)
+        self.assertEqual(q["net_income"], 138840000000.0)
+        self.assertEqual(q["eps_diluted"], 38.37)
+        self.assertEqual(q["operating_margin"], 24.0)
+        self.assertEqual(q["net_margin"], 19.0)
+        self.assertEqual(q["reported_date"], "2026-10-08")
+
+        q1 = self.r["rows"][1]
+        self.assertEqual(q1["revenue_yoy"], 13.9)
+        self.assertEqual(q1["eps_yoy"], 4.6)
+
+        self.assertEqual(self.r["ttm"]["revenue"], 2832480000000.0)
+        self.assertEqual(self.r["ttm"]["operating_income"], 697500000000.0)
+        self.assertEqual(self.r["ttm"]["net_income"], 516080000000.0)
+        self.assertEqual(self.r["ttm"]["eps_diluted"], 142.66)
+
+
+class InfosysAnalysis(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(DIR, "indian-INFY.json")) as fh:
+            data = json.load(fh)
+        self.r = facts.analyse(data, quarters=6)
+
+    def test_quarterly_and_missing_values_preserved(self):
+        self.assertEqual(self.r["entity"], "INFOSYS LIMITED")
+        self.assertEqual(self.r["currency"], "USD")
+        q0 = self.r["rows"][0]
+        self.assertEqual(q0["end"], "2026-09-30")
+        self.assertEqual(q0["revenue"], 5145000000.0)
+        self.assertEqual(q0["revenue_yoy"], 1.4)
+        self.assertEqual(q0["operating_income"], 1079000000.0)
+        self.assertEqual(q0["operating_yoy"], 1.3)
+        self.assertEqual(q0["net_income"], 817000000.0)
+        self.assertEqual(q0["net_income_yoy"], -2.6)
+        self.assertEqual(q0["eps_diluted"], 0.20)
+        self.assertEqual(q0["reported_date"], "2026-10-23")
+
+        # 2025-09-30 quarter in fixture has no diluted EPS
+        q_old = next(r for r in self.r["rows"] if r["end"] == "2025-09-30")
+        self.assertIsNone(q_old["eps_diluted"])
+        # Because prior EPS is None, latest quarter eps_yoy must be None, not 0.0
+        self.assertIsNone(q0["eps_yoy"])
+
+    def test_infy_currency_and_book_value_distinction(self):
+        self.assertEqual(self.r["statement_currency"], "USD")
+        self.assertEqual(self.r["trading_currency"], "INR")
+        self.assertEqual(self.r["balance_sheet"]["book_value_currency"], "INR")
+        rendered = facts.render_indian("INFY", self.r)
+        # Book value is in INR (Rs), not in USD ($)
+        self.assertIn("Book Value per share: Rs 240.59", rendered)
+        self.assertNotIn("Book Value per share: $240.59", rendered)
+        self.assertIn("[CURRENCY NOTE]", rendered)
+        self.assertIn("[SOURCE: Yahoo Finance Fundamentals API", rendered)
+        self.assertNotIn("filed with NSE/BSE", rendered)
+
+
+class IndianCli(unittest.TestCase):
+    def test_cli_offline_rendering(self):
+        code, out, err = run(["RELIANCE", "--offline", DIR])
+        self.assertEqual(code, 0, err)
+        self.assertIn("RELIANCE INDUSTRIES LTD (RELIANCE)", out)
+        self.assertIn("Exchange: NSE", out)
+        self.assertIn("INR Crores", out)
+        self.assertIn("330,601", out)
+        self.assertIn("2026-10-30", out)
+        self.assertIn("[SOURCE:", out)
+        self.assertIn("DATA: REPORTED", out)
+        self.assertIn("STATUS: FRESH", out)
+        self.assertNotIn(chr(0x2014), out)
+
+    def test_cli_offline_annual(self):
+        code, out, err = run(["RELIANCE", "--offline", DIR, "--annual"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Annual Financials (Fiscal Years):", out)
+        self.assertIn("FY2026", out)
+        self.assertIn("1,057,219", out)
+        self.assertIn("+9.6%", out)
+
+    def test_cli_offline_json(self):
+        code, out, err = run(["RELIANCE", "--offline", DIR, "--json", "--quarters", "3"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(len(data), 1)
+        res = data[0]["result"]
+        self.assertEqual(res["market"], "IN")
+        self.assertEqual(len(res["rows"]), 3)
+        self.assertEqual(len(res["annual_rows"]), 4)
+        self.assertEqual(res["balance_sheet"]["total_debt"], 4053220000000.0)
+
+    def test_cli_offline_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trader", "metrics.json")
+            code, out, err = run(["RELIANCE", "TCS", "--offline", DIR, "--metrics", path])
+            self.assertEqual(code, 0, err)
+            with open(path) as fh:
+                data = json.load(fh)
+        rows = {r["ticker"]: r for r in data["companies"]}
+        self.assertEqual(sorted(rows), ["RELIANCE", "TCS"])
+        self.assertEqual(rows["RELIANCE"]["exchange"], "NSE")
+        self.assertEqual(rows["RELIANCE"]["currency"], "INR")
+        self.assertEqual(rows["RELIANCE"]["period_end"], "2026-09-30")
+        self.assertEqual(rows["RELIANCE"]["publication_date"], "2026-10-30")
+        self.assertEqual(rows["RELIANCE"]["revenue_ttm"], 11990330000000.0)
+        self.assertEqual(rows["RELIANCE"]["operating_profit_ttm"], 1344470000000.0)
+        self.assertEqual(rows["RELIANCE"]["eps_ttm"], 60.68)
+        self.assertEqual(rows["TCS"]["eps_ttm"], 142.66)
+        self.assertEqual(rows["RELIANCE"]["data_quality"], "REPORTED")
+
+
 if __name__ == "__main__":
     unittest.main()

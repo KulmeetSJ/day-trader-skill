@@ -69,10 +69,12 @@ try:
     import calendar_in
     import symbols_in
     import instruments
+    import data_in
 except ImportError:
     calendar_in = None
     symbols_in = None
     instruments = None
+    data_in = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 PAUSE = 0.5      # seconds between requests to the free endpoint
@@ -308,7 +310,10 @@ def next_open(d, market="US"):
 # ---------------------------------------------------------------- Yahoo
 
 def yahoo_symbol(sym):
-    return sym.upper().replace(".", "-")
+    s = str(sym).upper()
+    if s.endswith((".NS", ".BO")) or s.startswith("^"):
+        return s
+    return s.replace(".", "-")
 
 
 def chart_path(sym, rng, interval):
@@ -507,8 +512,22 @@ def early_cutoff(day, t, close_dt):
     return moved if moved.time() > OPEN else close_dt
 
 
+def rsi_val(closes, n=14):
+    """Wilder's RSI on closes."""
+    if len(closes) < n + 1:
+        return None
+    g = [max(0.0, closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+    lo = [max(0.0, closes[i - 1] - closes[i]) for i in range(1, len(closes))]
+    ag, al = sum(g[:n]) / n, sum(lo[:n]) / n
+    for i in range(n, len(g)):
+        ag = (ag * (n - 1) + g[i]) / n
+        al = (al * (n - 1) + lo[i]) / n
+    return 100 - 100 / (1 + ag / al) if al else 100.0
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None, market=None):
+             min_volume_x=None, cfg=None, market=None, trading_style="intraday",
+             option_strategy=None, strike_selection="ATM"):
     """Pure function: the setup's status at now_utc from one session's bars."""
     market = market or chart.get("market") or "US"
     cfg = cfg or dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
@@ -517,8 +536,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    if setup not in ("orb", "level"):
-        raise EntryError("--setup is orb or level")
+    valid_setups = ("orb", "level", "ma_crossover", "trend", "rsi_momentum", "options_orb")
+    if setup not in valid_setups:
+        raise EntryError("--setup is orb, level, ma_crossover, trend, rsi_momentum, or options_orb")
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
     n_or = or_minutes * 60 // step
@@ -531,31 +551,73 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
+           "trading_style": trading_style,
            "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS if market == "US" else True,
            "market": market, "currency": "INR" if market == "IN" else "USD", "_bars": []}
     dt = chart.get("data_time")
     res["data_time"] = to_local(utc_of(dt), market=market).strftime("%Y-%m-%d %H:%M:%S") if dt else None
     ok, why = trading_day(day, market=market)
-    if not ok:
-        res.update(status="no-data", phase="closed", reason="the %s is closed today (%s)" % (exchange, why),
-                   next_open=next_open(day, market=market))
-        return res
-    o, c = session(day, market=market)
-    open_dt = datetime.datetime.combine(day, o)
-    close_dt = datetime.datetime.combine(day, c)
+    chart_bars = chart.get("bars", [])
+    valid_bar_dates = sorted(list(set(to_local(utc_of(b["t"]), market=market).date()
+                                      for b in chart_bars if not (b["t"] % step))))
+
+    is_live_continuous = False
+    is_historical = False
+    eval_day = day
+
+    if ok:
+        o, c = session(day, market=market)
+        open_dt = datetime.datetime.combine(day, o)
+        close_dt = datetime.datetime.combine(day, c)
+        if open_dt <= local < close_dt:
+            is_live_continuous = True
+        elif local < open_dt:
+            is_live_continuous = False
+        else:
+            is_historical = (market == "IN")
+    else:
+        if market == "IN" and valid_bar_dates:
+            eval_day = valid_bar_dates[-1]
+            is_historical = True
+        else:
+            res.update(status="no-data", phase="closed", reason="the %s is closed today (%s)" % (exchange, why),
+                       next_open=next_open(day, market=market))
+            return res
+
+    if is_historical and eval_day != day:
+        s_eval = session(eval_day, market=market)
+        if s_eval:
+            o, c = s_eval
+            open_dt = datetime.datetime.combine(eval_day, o)
+            close_dt = datetime.datetime.combine(eval_day, c)
+        else:
+            open_dt = datetime.datetime.combine(eval_day, datetime.time(9, 15) if market == "IN" else OPEN)
+            close_dt = datetime.datetime.combine(eval_day, datetime.time(15, 30) if market == "IN" else CLOSE)
+
+    res["date"] = eval_day.isoformat()
+    res["is_live_signal"] = is_live_continuous
+    res["is_historical_analysis"] = is_historical
+    res["last_trading_session"] = eval_day.isoformat()
+    res["last_data_timestamp"] = res.get("data_time")
+    res["data_status"] = "stale" if (day - eval_day).days >= 1 else "delayed"
+    res["is_simulated"] = False
+
     early = c != (NSE_CLOSE if market == "IN" else CLOSE)
-    before = datetime.datetime.combine(day, parse_hhmm(cfg["no_entries_before"], "no_entries_before", market=market))
-    cutoff = early_cutoff(day, parse_hhmm(cfg["no_entries_after"], "no_entries_after", market=market), close_dt)
+    before = datetime.datetime.combine(eval_day, parse_hhmm(cfg["no_entries_before"], "no_entries_before", market=market))
+    if str(trading_style).lower() == "positional":
+        cutoff = close_dt - datetime.timedelta(minutes=5)
+    else:
+        cutoff = early_cutoff(eval_day, parse_hhmm(cfg["no_entries_after"], "no_entries_after", market=market), close_dt)
     or_end = open_dt + datetime.timedelta(minutes=or_minutes)
-    res.update(opens=hm(o), closes=hm(c), early_close=NYSE_EARLY_CLOSE.get(day.isoformat()) if market == "US" else None,
+    res.update(opens=hm(o), closes=hm(c), early_close=NYSE_EARLY_CLOSE.get(eval_day.isoformat()) if market == "US" else None,
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
 
     by_slot = {}
-    for b in chart["bars"]:
+    for b in chart_bars:
         if b["t"] % step:
             continue                       # Yahoo's live tick (10:49:45) is not a bar
         et = to_local(utc_of(b["t"]), market=market)
-        if et.date() != day or not (open_dt <= et < close_dt):
+        if et.date() != eval_day or not (open_dt <= et < close_dt):
             continue
         slot = int((et - open_dt).total_seconds()) // step
         by_slot[slot] = dict(b, et=et, end=et + datetime.timedelta(seconds=step), slot=slot)
@@ -565,10 +627,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     for slot in sorted(by_slot):
         b = by_slot[slot]
         end_ts = b["t"] + step
-        if end_ts <= now_ts:
-            # Closed by the clock. On live data it counts once Yahoo has caught up: its last
-            # trade is at or after the close, a later bar exists, or a minute has passed.
-            if dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
+        if is_historical or end_ts <= now_ts:
+            if is_historical or dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
                 bars.append(b)
             else:
                 pending = b
@@ -581,7 +641,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["_bars"] = bars
     res["bars_closed"] = len(bars)
 
-    if local < open_dt:
+    if not is_historical and local < open_dt:
         open_label = "9:15" if market == "IN" else "9:30"
         res.update(phase="pre-open", reason="the %s opens at %s%s" % (
             exchange, open_label, " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
@@ -592,9 +652,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if or_bars:
         res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
-                                "complete": local >= or_end, "avg_volume": int(round(avg_vol))}
-    if setup == "orb":
-        if local < or_end:
+                                "complete": (is_historical or local >= or_end), "avg_volume": int(round(avg_vol))}
+    if setup in ("orb", "options_orb"):
+        if not is_historical and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
             return res
@@ -602,22 +662,62 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
             return res
         lvl = max(b["h"] for b in or_bars)
-    else:
+    elif setup == "level":
         lvl = float(level)
+    else:
+        lvl = float(chart.get("prev_close") or (bars[0]["c"] if bars else 100.0))
     res["level"] = r2(lvl)
 
-    first_slot = n_or if setup == "orb" else 0
+    first_slot = n_or if setup in ("orb", "options_orb") else 0
     trig, thin = None, []
-    for b in bars:
-        if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
-            continue
-        if b["c"] > lvl:
-            vx = (b["v"] / avg_vol) if avg_vol else None
-            if min_volume_x and (vx is None or vx < min_volume_x):
-                thin.append(b)
+
+    if setup in ("orb", "level", "options_orb"):
+        for b in bars:
+            if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
                 continue
-            trig = b
-            break
+            if b["c"] > lvl:
+                vx = (b["v"] / avg_vol) if avg_vol else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                break
+    elif setup == "ma_crossover":
+        fast_n, slow_n = 9, 21
+        for i in range(slow_n, len(bars)):
+            b = bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            f_curr = sum(x["c"] for x in bars[i - fast_n + 1:i + 1]) / float(fast_n)
+            f_prev = sum(x["c"] for x in bars[i - fast_n:i]) / float(fast_n)
+            s_curr = sum(x["c"] for x in bars[i - slow_n + 1:i + 1]) / float(slow_n)
+            s_prev = sum(x["c"] for x in bars[i - slow_n:i]) / float(slow_n)
+            if f_prev <= s_prev and f_curr > s_curr:
+                trig = b
+                break
+    elif setup == "trend":
+        fast_n, slow_n = 9, 21
+        for i in range(slow_n, len(bars)):
+            b = bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            f_curr = sum(x["c"] for x in bars[i - fast_n + 1:i + 1]) / float(fast_n)
+            s_curr = sum(x["c"] for x in bars[i - slow_n + 1:i + 1]) / float(slow_n)
+            if b["c"] > f_curr > s_curr:
+                trig = b
+                break
+    elif setup == "rsi_momentum":
+        closes = [b["c"] for b in bars]
+        for i in range(15, len(bars)):
+            b = bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            r = rsi_val(closes[:i + 1])
+            r_prev = rsi_val(closes[:i])
+            if r is not None and r >= 60.0 and (r_prev is None or r_prev < 60.0):
+                trig = b
+                break
+
     last = bars[-1] if bars else None
     if last:
         res["last"] = {"bar_start": hm(last["et"]), "close": r2(last["c"]),
@@ -625,22 +725,64 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
-        res.update(status="triggered", phase="open" if local < close_dt else "after-close",
+        res.update(status="triggered", phase="open" if is_live_continuous else "after-close",
                    reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
+
+        # Options-specific enrichment
+        if setup == "options_orb" and data_in:
+            try:
+                sym_clean = chart["symbol"]
+                if symbols_in:
+                    try:
+                        sym_clean = symbols_in.normalize_symbol(sym_clean)
+                    except Exception:
+                        pass
+                chain = data_in.fetch_option_chain(sym_clean, spot_price=trig["c"])
+                sel_strike = chain.select_strike(strategy=strike_selection or "ATM", option_type="CE")
+                contract = chain.get_contract(sel_strike, "CE")
+                if contract:
+                    fo_lot = None
+                    if instruments:
+                        try:
+                            fo_lot = instruments.get_fo_lot_size(sym_clean)
+                        except Exception:
+                            pass
+                    lot_sz = fo_lot or (25 if sym_clean in ("NIFTY", "^NSEI") else 1)
+                    tier_val = str(contract.get("tier", "SIMULATED")).replace("DataTier.", "")
+                    res["option_contract"] = {
+                        "symbol": contract["symbol"],
+                        "underlying": sym_clean,
+                        "strike": sel_strike,
+                        "option_type": "CE",
+                        "expiry": chain.expiry,
+                        "premium": contract["last_price"],
+                        "lot_size": lot_sz,
+                        "greeks": contract.get("greeks", {}),
+                        "tier": tier_val,
+                        "is_simulated": tier_val == "SIMULATED",
+                    }
+                    if tier_val == "SIMULATED":
+                        res["is_simulated"] = True
+                    res["trigger"]["option_symbol"] = contract["symbol"]
+                    res["trigger"]["option_premium"] = contract["last_price"]
+            except Exception:
+                pass
+
         if dt and utc_of(dt) < local_to_utc(trig["end"], market=market):
             res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
                                 % to_local(utc_of(dt), market=market).strftime("%H:%M:%S"))
         return res
     if not bars:
-        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        res.update(status="no-data", phase="open" if is_live_continuous else "closed",
+                   reason="Yahoo sent no bars for %s yet" % eval_day.isoformat())
         return res
     what = ("close above the range high %s%.2f" % (curr, lvl)) if setup == "orb" else ("close above %s%.2f" % (curr, lvl))
-    if local >= cutoff and not (pending and pending["end"] <= cutoff):
-        res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
+    if (is_historical or local >= cutoff) and not (pending and pending["end"] <= cutoff):
+        res.update(status="expired", phase="after-close" if not is_live_continuous else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
         return res
@@ -687,6 +829,23 @@ def entry_doc(res, now_utc):
         doc["market"] = res["market"]
     if res.get("currency"):
         doc["currency"] = res["currency"]
+    if res.get("option_contract"):
+        doc["option_contract"] = res["option_contract"]
+        doc["asset_type"] = "OPTIONS"
+    if res.get("trading_style"):
+        doc["trading_style"] = res["trading_style"]
+    if res.get("is_live_signal") is not None:
+        doc["is_live_signal"] = bool(res.get("is_live_signal", False))
+    if res.get("is_historical_analysis") is not None:
+        doc["is_historical_analysis"] = bool(res.get("is_historical_analysis", False))
+    if res.get("last_trading_session"):
+        doc["last_trading_session"] = res["last_trading_session"]
+    if res.get("last_data_timestamp") or res.get("data_time"):
+        doc["last_data_timestamp"] = res.get("last_data_timestamp") or res.get("data_time")
+    if res.get("data_status"):
+        doc["data_status"] = res["data_status"]
+    if res.get("is_simulated") is not None:
+        doc["is_simulated"] = bool(res.get("is_simulated", False))
     return doc
 
 
@@ -720,8 +879,14 @@ def describe(res):
     market = res.get("market", "US")
     curr = "\u20b9" if market == "IN" else "$"
     tz_label = "IST" if market == "IN" else "ET"
-    head = "%s  %s %s %s  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars)
+    is_hist = bool(res.get("is_historical_analysis"))
+    sess_date = res.get("last_trading_session", res["date"])
+    if is_hist:
+        head = "%s  %s %s %s  %s on %s bars [HISTORICAL ANALYSIS -- Market CLOSED, Session: %s]" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars, sess_date)
+    else:
+        head = "%s  %s %s %s  %s on %s bars (Yahoo, free, can lag)" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -735,23 +900,34 @@ def describe(res):
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        out.append("TRIGGERED %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
-            t["time"], curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
-            (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
-        step = INTERVALS[res["interval"]] // 60
-        if res.get("minutes_since", 0) > step and res.get("last"):
-            out.append("That was %d minutes ago; the last close is %s%.2f (%s bar). A late entry is a different "
-                       "trade: the price, the stop distance and the odds have moved." % (
-                           res["minutes_since"], curr, res["last"]["close"], res["last"]["bar_start"]))
-        if res.get("data_note"):
-            out.append(res["data_note"] + ".")
-        if res.get("minutes_since", 0) > step:
-            out.append("Nothing was placed.")
+        if is_hist:
+            out.append("[HISTORICAL ANALYSIS] TRIGGERED on session %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
+                sess_date, curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+                "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
+                (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+            out.append("Market is CLOSED. Evaluated on historical candles from session %s (Data status: %s)." % (
+                sess_date, str(res.get("data_status", "stale")).upper()))
+            out.append("NOT a live-session signal. Orders evaluated outside market hours are for research and paper trading only. Nothing was placed.")
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
         else:
-            out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
-        out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
-                   "(exit.py plan --from trader/entry.json).")
+            out.append("TRIGGERED %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
+                t["time"], curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+                "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
+                (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+            step = INTERVALS[res["interval"]] // 60
+            if res.get("minutes_since", 0) > step and res.get("last"):
+                out.append("That was %d minutes ago; the last close is %s%.2f (%s bar). A late entry is a different "
+                           "trade: the price, the stop distance and the odds have moved." % (
+                               res["minutes_since"], curr, res["last"]["close"], res["last"]["bar_start"]))
+            if res.get("data_note"):
+                out.append(res["data_note"] + ".")
+            if res.get("minutes_since", 0) > step:
+                out.append("Nothing was placed.")
+            else:
+                out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
     else:
         out.append("%s  %s." % (label, res["reason"]))
         f = res.get("forming")
@@ -913,14 +1089,18 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 def _opts(a, cfg):
     if a.side in ("sell", "short"):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup == "orb" and a.level is not None:
+    if a.setup in ("orb", "options_orb") and a.level is not None:
         raise EntryError("--level is for --setup level (an orb's level is its range high)")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
+    trading_style = getattr(a, "trading_style", None) or cfg.get("trading_style") or "intraday"
+    option_strategy = getattr(a, "option_strategy", None) or cfg.get("option_strategy")
+    strike_selection = getattr(a, "strike_selection", None) or cfg.get("strike_selection") or "ATM"
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "trading_style": trading_style,
+            "option_strategy": option_strategy, "strike_selection": strike_selection}
 
 
 def _load(a, sym, now, market="US"):
@@ -1056,7 +1236,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def common(p):
-        p.add_argument("--setup", choices=["orb", "level"], default="orb")
+        p.add_argument("--setup", default="orb",
+                       help="entry setup: orb, level, ma_crossover, trend, rsi_momentum, or options_orb")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
@@ -1066,6 +1247,10 @@ def main(argv=None):
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
         p.add_argument("--config", default="trader/config.json")
         p.add_argument("--market", choices=["US", "IN"], help="market profile (US or IN)")
+        p.add_argument("--trading-style", choices=["intraday", "positional"], default=None,
+                       help="trading style: intraday (default) or positional")
+        p.add_argument("--option-strategy", default=None, help="option strategy: long_call, long_put, etc.")
+        p.add_argument("--strike-selection", default="ATM", help="strike selection: ATM, ITM1, ITM2, OTM1, OTM2")
 
     p = sub.add_parser("check", help="the setup's status right now")
     p.add_argument("symbol")

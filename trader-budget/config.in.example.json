@@ -1,6 +1,20 @@
 {
   "market": "IN",
   "currency": "INR",
+  "exchange": "NSE",
+  "asset_type": "EQUITY",
+  "universe": "NIFTY50",
+  "watchlist": [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HDFCBANK",
+    "ICICIBANK"
+  ],
+  "trading_style": "intraday",
+  "strategy": "orb",
+  "timeframe": "5m",
+  "data_provider": "yahoo",
   "budget": 100000,
   "cash_buffer_pct": 10,
   "max_position_pct": 75,
@@ -20,9 +34,12 @@
   "paper": true,
   "blocked": [],
   "allow_options": false,
+  "allow_futures": false,
+  "option_strategy": "long_call",
+  "strike_selection": "ATM",
+  "track_transaction_costs": true,
   "allow_margin": false,
   "allow_short": false,
   "pdt_guard": false,
   "primary_exchange": "NSE"
 }
-

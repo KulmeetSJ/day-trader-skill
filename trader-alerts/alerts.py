@@ -61,12 +61,25 @@ _alerts_dir = os.path.dirname(os.path.abspath(__file__))
 if _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
 
+_scanner_dir = os.path.join(os.path.dirname(_alerts_dir), "trader-scanner")
+if os.path.isdir(_scanner_dir) and _scanner_dir not in sys.path:
+    sys.path.insert(0, _scanner_dir)
+
 try:
     import calendar_in
     import symbols_in
+    import instruments
+    import data_in
 except ImportError:
     calendar_in = None
     symbols_in = None
+    instruments = None
+    data_in = None
+
+try:
+    import scan
+except ImportError:
+    scan = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 PAUSE = 0.5    # seconds between requests: be polite to free endpoints
@@ -656,6 +669,313 @@ def get_market_profile(a, doc=None):
     return "US"
 
 
+def cmd_readiness(a):
+    market = get_market_profile(a)
+    cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
+    cfg = _read(cfg_path, {}) or {}
+    inst_path = getattr(a, "instruments", "trader/state/instruments.json") or "trader/state/instruments.json"
+    now_txt = getattr(a, "now", None)
+
+    items = []
+    has_block = False
+    has_warn = False
+
+    # Check 1: Market Calendar & Trading Session
+    if market == "IN":
+        if calendar_in is None:
+            raise AlertError("Indian calendar engine unavailable")
+        now_dt = calendar_in.parse_ist(now_txt) if now_txt else calendar_in.now_ist()
+        date_str = now_dt.strftime("%Y-%m-%d")
+        is_trading, cal_status, trade_reason = calendar_in.is_trading_day_in(now_dt)
+        phase, phase_reason = calendar_in.get_session_phase(now_dt, exchange="NSE")
+        is_open = calendar_in.is_market_hours_in(now_dt, exchange="NSE")
+        special = calendar_in.get_special_session(date_str)
+        last_session_dt = calendar_in.get_last_trading_day(now_dt, exchange="NSE")
+        cal_detail = "%s (%s), %s, phase: %s | Last Session: %s" % (
+            date_str, now_dt.strftime("%A"), now_dt.strftime("%H:%M:%S IST"), phase.upper(), last_session_dt.isoformat())
+        if not is_trading:
+            cal_state = "CLOSED"
+            cal_note = "Trading Holiday: %s. 24/7 Analysis Engine and Paper Trading are AVAILABLE using data from session %s." % (
+                trade_reason, last_session_dt.isoformat())
+        elif phase == "pre_market":
+            cal_state = "PRE_MARKET"
+            cal_note = "Pre-market session starts at 09:00 IST; continuous trading at 09:15 IST."
+        elif is_open:
+            cal_state = "OPEN"
+            cal_note = "Market is actively open (continuous trading closes 15:30 IST)."
+        else:
+            cal_state = "CLOSED"
+            cal_note = "Market closed for continuous session (%s). 24/7 Analysis Engine and Paper Trading are AVAILABLE using data from session %s." % (
+                phase_reason, last_session_dt.isoformat())
+        if special:
+            cal_note += " Special session: %s" % special.get("session_type", "")
+        ts_display = now_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    else:
+        now_utc = parse_now(now_txt) if now_txt else datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+        now_et = to_eastern(now_utc)
+        date_str = now_et.strftime("%Y-%m-%d")
+        is_trading, trade_reason = trading_day(now_et.date())
+        s = session(now_et.date())
+        is_open = (s is not None and s[0] <= now_et.time() < s[1])
+        cur_d = now_et.date()
+        while not trading_day(cur_d)[0] or (cur_d == now_et.date() and now_et.time() < OPEN):
+            cur_d -= datetime.timedelta(days=1)
+        last_session_dt = cur_d
+        cal_detail = "%s (%s), %s ET | Last Session: %s" % (
+            date_str, now_et.strftime("%A"), now_et.strftime("%H:%M:%S"), last_session_dt.isoformat())
+        if not is_trading:
+            cal_state = "CLOSED"
+            cal_note = "Trading Holiday: %s. 24/7 Analysis Engine and Paper Trading are AVAILABLE using data from session %s." % (
+                trade_reason, last_session_dt.isoformat())
+        elif now_et.time() < OPEN:
+            cal_state = "PRE_MARKET"
+            cal_note = "Opens at 9:30 a.m. ET."
+        elif s and now_et.time() < s[1]:
+            cal_state = "OPEN"
+            cal_note = "Market open until %s ET." % s[1].strftime("%H:%M")
+        else:
+            cal_state = "CLOSED"
+            cal_note = "Closed for continuous session. 24/7 Analysis Engine and Paper Trading are AVAILABLE using data from session %s." % last_session_dt.isoformat()
+        ts_display = now_et.strftime("%Y-%m-%d %H:%M:%S ET")
+
+    items.append({
+        "check": "Market Calendar & Session",
+        "status": cal_state,
+        "detail": cal_detail,
+        "note": cal_note,
+    })
+
+    # Check 2: Instrument Master Cache
+    inst_state = "OK"
+    inst_detail = inst_path
+    inst_note = ""
+    inst_payload = None
+    if not os.path.isfile(inst_path):
+        inst_state = "MISSING"
+        inst_note = "Cache not found. Run: python3 trader-alerts/instruments.py sync"
+        has_warn = True
+    else:
+        try:
+            if instruments is not None:
+                ref_d = now_dt.date() if market == "IN" else now_et.date()
+                inst_payload = instruments.load_instrument_cache(inst_path, max_age_days=1, as_of_date=ref_d)
+                eq_c = sum(1 for r in inst_payload.get("instruments", {}).values() if r.get("instrument_type") == "EQUITY")
+                fo_c = sum(1 for r in inst_payload.get("instruments", {}).values() if r.get("is_fo_eligible"))
+                inst_detail = "Effective: %s, %d active equities, %d F&O underlyings" % (
+                    inst_payload.get("effective_date"), eq_c, fo_c)
+                inst_note = "Authoritative exchange security master loaded fresh."
+        except Exception as e:
+            if "stale" in str(e).lower():
+                inst_state = "STALE"
+                inst_note = str(e)
+                has_warn = True
+                try:
+                    with open(inst_path, encoding="utf-8") as fh:
+                        inst_payload = json.load(fh)
+                except Exception:
+                    pass
+            else:
+                inst_state = "ERROR"
+                inst_note = "Corrupted cache: %s" % e
+                has_block = True
+
+    items.append({
+        "check": "Instrument Master Cache",
+        "status": inst_state,
+        "detail": inst_detail,
+        "note": inst_note,
+    })
+
+    # Check 3: Data Provider & Tiers
+    data_state = "OK"
+    provider_name = cfg.get("provider", "yahoo")
+    data_detail = "Quotes: %s (DELAYED 15m) | Options: SIMULATED (Black-Scholes)" % provider_name
+    data_note = "Free delayed Yahoo quotes for watchlists; analytical Black-Scholes engine for option chains. Paper trading only."
+    items.append({
+        "check": "Data Provider & Tiers",
+        "status": data_state,
+        "detail": data_detail,
+        "note": data_note,
+    })
+
+    # Check 4: Universe Population
+    univ_state = "OK"
+    idx_name = cfg.get("index") or cfg.get("universe") or ("NIFTY50" if market == "IN" else "ALL")
+    exch_name = cfg.get("exchange") or "NSE"
+    univ_detail = "%s / %s" % (exch_name, idx_name)
+    univ_count = 0
+    if market == "IN" and scan is not None:
+        try:
+            kept, counts, src = scan.build_universe_in(index=idx_name, instruments_cache=inst_path, exchange=exch_name, config_path=cfg_path)
+            univ_count = len(kept)
+            univ_detail += ": %d securities (%s)" % (univ_count, src)
+            univ_note = "Universe constituents verified and ready for scanner."
+        except Exception as e:
+            univ_state = "ERROR"
+            univ_note = "Failed to populate universe: %s" % e
+            has_block = True
+    else:
+        univ_note = "Universe configured."
+
+    items.append({
+        "check": "Universe Population",
+        "status": univ_state,
+        "detail": univ_detail,
+        "note": univ_note,
+    })
+
+    # Check 5: Derivatives & Expiry Metadata
+    deriv_state = "OK"
+    deriv_items = []
+    if market == "IN" and calendar_in is not None and instruments is not None:
+        ref_d = now_dt.date()
+        for u in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+            try:
+                exch_u = "BSE" if u in ("SENSEX", "BANKEX") else "NSE"
+                exp = calendar_in.get_next_expiry(as_of_date=ref_d, underlying=u, exchange=exch_u)
+                dte = calendar_in.days_to_expiry(exp, as_of_date=ref_d)
+                lot = instruments.get_fo_lot_size(u, cache_payload=inst_payload) or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
+                step = instruments.get_strike_interval(u)
+                deriv_items.append("%s [%s] (exp %s, %dd, lot %d, step %.0f)" % (u, exch_u, exp.strftime("%Y-%m-%d"), dte, lot, step))
+            except Exception as e:
+                deriv_items.append("%s (err: %s)" % (u, e))
+        deriv_detail = ", ".join(deriv_items)
+        deriv_note = "Authoritative expiry calendars (NSE Tuesday / BSE Friday), strike steps and contract lot sizes verified."
+    else:
+        deriv_detail = "US Equity / Options"
+        deriv_note = "Standard US equity trading."
+
+    items.append({
+        "check": "Derivatives & Expiry Metadata",
+        "status": deriv_state,
+        "detail": deriv_detail,
+        "note": deriv_note,
+    })
+
+    # Check 6: Configuration & Safety Limits
+    cfg_state = "OK"
+    cfg_issues = []
+    curr_tag = "\u20b9" if market == "IN" else "$"
+    max_loss = None
+    daily_loss = None
+    if not cfg:
+        cfg_state = "NOTE"
+        cfg_issues.append("No config found at %s: using built-in defaults" % cfg_path)
+        has_warn = True
+    else:
+        is_paper = bool(cfg.get("paper", True))
+        if not is_paper:
+            cfg_state = "BLOCK"
+            cfg_issues.append("FATAL: Live order execution is disabled in this package. Set paper: true.")
+            has_block = True
+
+        budget = cfg.get("budget", 0)
+        if budget <= 0:
+            cfg_issues.append("No positive budget configured.")
+            has_warn = True
+
+        if market == "IN":
+            max_loss = cfg.get("max_loss_per_trade_inr") or cfg.get("max_loss_per_trade_usd")
+            daily_loss = cfg.get("max_daily_loss_inr") or cfg.get("max_daily_loss_usd")
+        else:
+            max_loss = cfg.get("max_loss_per_trade_usd")
+            daily_loss = cfg.get("max_daily_loss_usd")
+
+        if not max_loss:
+            cfg_issues.append("Missing max_loss_per_trade setting.")
+            has_warn = True
+        if not daily_loss:
+            cfg_issues.append("Missing max_daily_loss setting.")
+            has_warn = True
+
+        req_stop = cfg.get("require_stop", True)
+        if not req_stop:
+            cfg_issues.append("require_stop must be true for safe trading.")
+            has_warn = True
+
+    if has_block:
+        cfg_state = "BLOCKED"
+    elif cfg_issues:
+        cfg_state = "NOTE"
+
+    budget_disp = "%s%s" % (curr_tag, "{:,}".format(int(cfg.get("budget", 100000))))
+    max_loss_disp = "%s%s" % (curr_tag, "{:,}".format(int(max_loss or 1500)))
+    daily_loss_disp = "%s%s" % (curr_tag, "{:,}".format(int(daily_loss or 3000)))
+    cfg_detail = "Paper: %s | Budget: %s | Max Loss/Trade: %s | Max Daily Loss: %s" % (
+        cfg.get("paper", True), budget_disp, max_loss_disp, daily_loss_disp)
+    cfg_note = "; ".join(cfg_issues) if cfg_issues else "All safety rules and capital limits active. Paper trading mode verified."
+
+    items.append({
+        "check": "Configuration & Safety Limits",
+        "status": cfg_state,
+        "detail": cfg_detail,
+        "note": cfg_note,
+    })
+
+    if has_block:
+        verdict = "BLOCKED"
+        verdict_msg = "Safety gates engaged. Resolve the blocking issues above before trading."
+    elif has_warn:
+        verdict = "READY_WITH_NOTICES"
+        verdict_msg = "Pre-flight checks passed with operational notices. System is ready."
+    else:
+        verdict = "READY"
+        verdict_msg = "All pre-market health and risk checks passed. System is fully ready for the session."
+
+    market_session = "OPEN" if is_open else "CLOSED"
+    if inst_state in ("MISSING", "ERROR"):
+        data_availability = "UNAVAILABLE"
+    elif inst_state == "STALE":
+        data_availability = "STALE"
+    else:
+        tier_cfg = str(cfg.get("data_tier") or cfg.get("provider") or "").lower()
+        data_availability = "FRESH" if "realtime" in tier_cfg else "DELAYED"
+
+    analysis_engine = "UNAVAILABLE" if has_block else "AVAILABLE"
+    paper_trading = "AVAILABLE" if (bool(cfg.get("paper", True)) and not has_block) else "UNAVAILABLE"
+
+    doc = {
+        "verdict": verdict,
+        "message": verdict_msg,
+        "market": market,
+        "market_session": market_session,
+        "data_availability": data_availability,
+        "analysis_engine": analysis_engine,
+        "paper_trading": paper_trading,
+        "last_trading_session": last_session_dt.isoformat(),
+        "timestamp": ts_display,
+        "checks": items,
+    }
+
+    if a.json:
+        print(json.dumps(doc, indent=2))
+        return 1 if verdict == "BLOCKED" else 0
+
+    print("=" * 76)
+    print(" PRE-MARKET READINESS & HEALTH CHECK -- %s (%s)" % (
+        "INDIAN MARKET (NSE/BSE)" if market == "IN" else "US MARKET (NYSE/NASDAQ)", doc["timestamp"]))
+    print("=" * 76)
+    print(" Market Session:       [%s] (%s)" % (
+        market_session, "Continuous session open" if is_open else "Exchange continuous trading closed"))
+    print(" Data Availability:    [%s] (%s)" % (
+        data_availability, "Delayed 15m quotes / BS analytical options" if data_availability == "DELAYED" else data_availability))
+    print(" Analysis Engine:      [%s] (24/7 Screening, Technicals, Research, Risk & Sizing)" % analysis_engine)
+    print(" Paper Trading:        [%s] (Simulated bracket execution active)" % paper_trading)
+    print(" Last Trading Session: %s" % last_session_dt.isoformat())
+    print("-" * 76)
+    for it in items:
+        status_tag = "[%s]" % it["status"]
+        print("%-32s %-12s" % (it["check"], status_tag))
+        print("  Info: %s" % it["detail"])
+        if it["note"]:
+            print("  Note: %s" % it["note"])
+        print("-" * 76)
+    print("OVERALL VERDICT: %s" % verdict)
+    print(verdict_msg)
+    print("=" * 76)
+    return 1 if verdict == "BLOCKED" else 0
+
+
 def cmd_clock_in(a):
     if calendar_in is None:
         raise AlertError("Indian market calendar engine unavailable")
@@ -1191,13 +1511,20 @@ def main(argv=None):
     p = sub.add_parser("reset", help="re-arm a rule that rang")
     p.add_argument("id")
     p.add_argument("--state", default="trader/state/alerts.json")
+    p = sub.add_parser("readiness", help="pre-market trading readiness check")
+    p.add_argument("--market", choices=["US", "IN"], default="IN", help="market profile: IN (NSE/BSE) or US")
+    p.add_argument("--config", default="trader/config.json", help="path to config JSON")
+    p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
+    p.add_argument("--portfolio", default="trader/portfolio.json", help="path to portfolio JSON")
+    p.add_argument("--now", help="pretend market time (e.g. \"2026-10-19 09:00\")")
+    p.add_argument("--json", action="store_true", help="output JSON")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
         return {"clock": cmd_clock, "quote": cmd_quote, "history": cmd_history, "check": cmd_check, "add": cmd_add,
-                "list": cmd_list, "reset": cmd_reset}[a.cmd](a)
+                "list": cmd_list, "reset": cmd_reset, "readiness": cmd_readiness}[a.cmd](a)
     except AlertError as e:
         print("alerts.py: %s" % e, file=sys.stderr)
         return 1

@@ -202,6 +202,40 @@ def is_trading_day_in(dt, exchange="NSE"):
     return True, status, "regular_session"
 
 
+def is_weekend(dt_or_date_str):
+    """Return True if dt_or_date_str falls on Saturday (5) or Sunday (6)."""
+    dt = parse_ist(dt_or_date_str)
+    return dt.weekday() >= 5
+
+
+def get_last_trading_day(as_of_date=None, exchange="NSE"):
+    """Return the date of the most recent completed or active trading session.
+
+    If as_of_date is during or after pre-market on a trading day (>= 09:00 IST),
+    returns that day. If before 09:00 IST, on a weekend, or on an exchange holiday,
+    walks backward to the preceding trading day.
+    """
+    if as_of_date is None:
+        dt = now_ist()
+    else:
+        dt = parse_ist(as_of_date)
+
+    cur_d = dt.date()
+    is_td, _, _ = is_trading_day_in(cur_d, exchange=exchange)
+    # If dt has time information (datetime), check if pre-open has begun
+    has_time = isinstance(dt, datetime.datetime) and (dt.hour != 0 or dt.minute != 0 or dt.second != 0)
+    if is_td and (not has_time or (dt.hour * 60 + dt.minute >= 9 * 60)):
+        return cur_d
+
+    cur_d -= datetime.timedelta(days=1)
+    for _ in range(40):
+        is_td, _, _ = is_trading_day_in(cur_d, exchange=exchange)
+        if is_td:
+            return cur_d
+        cur_d -= datetime.timedelta(days=1)
+    return cur_d
+
+
 def get_cas_rule_version(dt_or_date_str, exchange="NSE", is_cas_eligible=False):
     """Determine applicable date-effective CAS regulatory regime.
 
@@ -658,4 +692,168 @@ def get_cas_order_permissions(dt, exchange="NSE", is_cas_eligible=False):
             "random_closure_active": False,
             "reason": reason,
         }
+
+
+# -----------------------------------------------------------------------------
+# Derivatives Expiry Calendar Engine
+# -----------------------------------------------------------------------------
+
+def _resolve_date(d):
+    """Normalize string, datetime, or date to datetime.date object."""
+    if d is None:
+        return datetime.datetime.now(IST).date()
+    if isinstance(d, str):
+        return datetime.datetime.strptime(d.strip(), "%Y-%m-%d").date()
+    if isinstance(d, datetime.datetime):
+        return d.date()
+    if isinstance(d, datetime.date):
+        return d
+    raise ValueError("Cannot resolve date: %r" % d)
+
+
+def get_fallback_expiry_weekday(exchange="NSE", underlying=None):
+    """Determine the fallback expiry weekday when not specified in contract masters.
+
+    Authoritative Exchange Specifications (November 2026):
+    - NSE: Tuesday (weekday = 1) for NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY,
+      and individual stock derivatives.
+    - BSE: SENSEX / general BSE contracts expire on Friday (weekday = 4);
+      BSE BANKEX expires on Monday (weekday = 0).
+    When the target expiry day is an exchange holiday, the expiry is adjusted
+    to the preceding trading day.
+    """
+    u = str(underlying or "").strip().upper()
+    exch = str(exchange or "NSE").strip().upper()
+    if u == "BANKEX":
+        return 0  # BSE BANKEX: Monday
+    if u == "SENSEX" or exch == "BSE":
+        return 4  # BSE SENSEX / general BSE: Friday
+    # NSE authoritative specification: Tuesday for all index and stock derivatives
+    return 1
+
+
+def get_monthly_expiry(year, month, weekday=None, exchange="NSE", underlying=None):
+    """Find the monthly derivative expiry date for a given year and month.
+
+    Uses exchange and underlying fallback conventions when weekday is not explicitly passed:
+    - NSE (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, Stocks): Tuesday (1)
+    - BSE SENSEX: Friday (4)
+    - BSE BANKEX: Monday (0)
+    If the target expiry day is an exchange holiday, rolls backward to the preceding trading day.
+    """
+    if weekday is None:
+        weekday = get_fallback_expiry_weekday(exchange=exchange, underlying=underlying)
+
+    import calendar
+    _, last_day = calendar.monthrange(year, month)
+    curr = datetime.date(year, month, last_day)
+
+    # Walk backward from month-end to find the last occurrence of the target weekday
+    while curr.weekday() != weekday:
+        curr -= datetime.timedelta(days=1)
+
+    # If that day is a holiday/non-trading day, roll backward to the previous trading day
+    while True:
+        is_trading, _, _ = is_trading_day_in(curr, exchange=exchange)
+        if is_trading:
+            return curr
+        curr -= datetime.timedelta(days=1)
+
+
+def get_weekly_expiries(year, month, weekday=None, exchange="NSE", underlying=None):
+    """Return all weekly expiry dates for a given month and year.
+
+    Calculates each target weekday in the month, rolling backward if any falls on a holiday.
+    """
+    if weekday is None:
+        weekday = get_fallback_expiry_weekday(exchange=exchange, underlying=underlying)
+
+    import calendar
+    _, last_day = calendar.monthrange(year, month)
+    expiries = []
+    seen = set()
+
+    for day in range(1, last_day + 1):
+        dt = datetime.date(year, month, day)
+        if dt.weekday() == weekday:
+            curr = dt
+            while True:
+                is_trading, _, _ = is_trading_day_in(curr, exchange=exchange)
+                if is_trading:
+                    break
+                curr -= datetime.timedelta(days=1)
+            if curr not in seen:
+                seen.add(curr)
+                expiries.append(curr)
+
+    expiries.sort()
+    return expiries
+
+
+def get_next_expiry(as_of_date=None, expiry_type="weekly", underlying="NIFTY", exchange="NSE"):
+    """Find the earliest active expiry date on or after as_of_date.
+
+    - expiry_type: 'weekly' or 'monthly'
+    - underlying: used to determine exchange convention (e.g. SENSEX -> Friday, NIFTY -> Tuesday)
+    - exchange: 'NSE' or 'BSE'
+    """
+    as_of = _resolve_date(as_of_date)
+    underlying_clean = str(underlying or "").strip().upper()
+    weekday = get_fallback_expiry_weekday(exchange=exchange, underlying=underlying_clean)
+
+    # Check the current month and subsequent months
+    curr_year = as_of.year
+    curr_month = as_of.month
+
+    for _ in range(3):
+        if expiry_type.lower() == "monthly":
+            exp = get_monthly_expiry(curr_year, curr_month, weekday=weekday, exchange=exchange, underlying=underlying_clean)
+            if exp >= as_of:
+                return exp
+        else:
+            weeklies = get_weekly_expiries(curr_year, curr_month, weekday=weekday, exchange=exchange, underlying=underlying_clean)
+            for exp in weeklies:
+                if exp >= as_of:
+                    return exp
+
+        # Advance to next month
+        if curr_month == 12:
+            curr_year += 1
+            curr_month = 1
+        else:
+            curr_month += 1
+
+    raise RuntimeError("Could not resolve next expiry after: %s" % as_of)
+
+
+def days_to_expiry(expiry_date, as_of_date=None, trading_days_only=False, exchange="NSE"):
+    """Calculate days remaining until expiry.
+
+    Returns non-negative integer (0 on expiry date, negative if expired).
+    """
+    exp = _resolve_date(expiry_date)
+    as_of = _resolve_date(as_of_date)
+
+    if not trading_days_only:
+        return (exp - as_of).days
+
+    if exp < as_of:
+        return (exp - as_of).days
+
+    # Count trading days
+    count = 0
+    curr = as_of
+    while curr < exp:
+        is_trading, _, _ = is_trading_day_in(curr, exchange=exchange)
+        if is_trading:
+            count += 1
+        curr += datetime.timedelta(days=1)
+    return count
+
+
+def is_expiry_day(check_date=None, underlying="NIFTY", exchange="NSE"):
+    """Return True if check_date is a contract expiry day for the given instrument."""
+    dt = _resolve_date(check_date)
+    next_exp = get_next_expiry(as_of_date=dt, expiry_type="weekly", underlying=underlying, exchange=exchange)
+    return next_exp == dt
 

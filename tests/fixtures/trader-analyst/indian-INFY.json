@@ -1,0 +1,2684 @@
+{
+  "symbol": "INFY.NS",
+  "as_of": "2026-11-10T13:40:46.575830+00:00",
+  "source": "Yahoo Finance Fundamentals API",
+  "quoteSummary": {
+    "defaultKeyStatistics": {
+      "maxAge": 1,
+      "priceHint": {
+        "raw": 2,
+        "fmt": "2",
+        "longFmt": "2"
+      },
+      "enterpriseValue": {
+        "raw": 4671490490368,
+        "fmt": "4.67T",
+        "longFmt": "4,671,490,490,368"
+      },
+      "forwardPE": {
+        "raw": 14.444146,
+        "fmt": "14.44"
+      },
+      "profitMargins": {
+        "raw": 0.16217,
+        "fmt": "16.22%"
+      },
+      "floatShares": {
+        "raw": 3887293450,
+        "fmt": "3.89B",
+        "longFmt": "3,887,293,450"
+      },
+      "sharesOutstanding": {
+        "raw": 4050376561,
+        "fmt": "4.05B",
+        "longFmt": "4,050,376,561"
+      },
+      "sharesShort": {},
+      "sharesShortPriorMonth": {},
+      "sharesShortPreviousMonthDate": {},
+      "dateShortInterest": {},
+      "sharesPercentSharesOut": {},
+      "heldPercentInsiders": {
+        "raw": 0.15988,
+        "fmt": "15.99%"
+      },
+      "heldPercentInstitutions": {
+        "raw": 0.52085,
+        "fmt": "52.09%"
+      },
+      "shortRatio": {},
+      "shortPercentOfFloat": {},
+      "beta": {
+        "raw": 0.02,
+        "fmt": "0.02"
+      },
+      "impliedSharesOutstanding": {
+        "raw": 4050376561,
+        "fmt": "4.05B",
+        "longFmt": "4,050,376,561"
+      },
+      "morningStarOverallRating": {},
+      "morningStarRiskRating": {},
+      "category": null,
+      "bookValue": {
+        "raw": 240.59229,
+        "fmt": "240.59"
+      },
+      "priceToBook": {
+        "raw": 4.7969117,
+        "fmt": "4.80"
+      },
+      "annualReportExpenseRatio": {},
+      "ytdReturn": {},
+      "qtdReturn": {},
+      "beta3Year": {},
+      "totalAssets": {},
+      "yield": {},
+      "fundFamily": null,
+      "fundInceptionDate": {},
+      "legalType": null,
+      "threeYearAverageReturn": {},
+      "fiveYearAverageReturn": {},
+      "priceToSalesTrailing12Months": {},
+      "lastFiscalYearEnd": {
+        "raw": 1774915200,
+        "fmt": "2026-03-31"
+      },
+      "nextFiscalYearEnd": {
+        "raw": 1806451200,
+        "fmt": "2027-03-31"
+      },
+      "mostRecentQuarter": {
+        "raw": 1790726400,
+        "fmt": "2026-09-30"
+      },
+      "earningsQuarterlyGrowth": {
+        "raw": -0.026,
+        "fmt": "-2.60%"
+      },
+      "revenueQuarterlyGrowth": {},
+      "netIncomeToCommon": {
+        "raw": 3303000064,
+        "fmt": "3.3B",
+        "longFmt": "3,303,000,064"
+      },
+      "trailingEps": {
+        "raw": 75.1,
+        "fmt": "75.10"
+      },
+      "forwardEps": {
+        "raw": 79.90088,
+        "fmt": "79.9"
+      },
+      "pegRatio": {
+        "raw": 2.14,
+        "fmt": "2.14"
+      },
+      "lastSplitFactor": "2:1",
+      "lastSplitDate": {
+        "raw": 1536019200,
+        "fmt": "2018-09-04"
+      },
+      "enterpriseToRevenue": {
+        "raw": 229.366,
+        "fmt": "229.37"
+      },
+      "enterpriseToEbitda": {
+        "raw": 953.755,
+        "fmt": "953.76"
+      },
+      "52WeekChange": {
+        "raw": -0.24583417,
+        "fmt": "-24.58%"
+      },
+      "SandP52WeekChange": {
+        "raw": 0.1027267,
+        "fmt": "10.27%"
+      },
+      "lastDividendValue": {
+        "raw": 26.0,
+        "fmt": "26.00"
+      },
+      "lastDividendDate": {
+        "raw": 1793664000,
+        "fmt": "2026-11-03"
+      },
+      "lastCapGain": {},
+      "annualHoldingsTurnover": {},
+      "latestFundingDate": {},
+      "latestAmountRaised": {},
+      "latestImpliedValuation": {},
+      "latestShareClass": null,
+      "leadInvestor": null,
+      "fundingToDate": {},
+      "totalFundingRounds": {}
+    },
+    "earnings": {
+      "maxAge": 86400,
+      "earningsChart": {
+        "quarterly": [
+          {
+            "date": "4Q2025",
+            "actual": {
+              "raw": 18.5,
+              "fmt": "18.5"
+            },
+            "estimate": {
+              "raw": 17.89055,
+              "fmt": "17.89"
+            },
+            "fiscalQuarter": "3Q2026",
+            "calendarQuarter": "4Q2025",
+            "difference": "0.61",
+            "surprisePct": "3.41",
+            "periodEndDate": {
+              "raw": 1767139200,
+              "fmt": "2025-12-31"
+            },
+            "reportedDate": {
+              "raw": 1768387333,
+              "fmt": "2026-01-14"
+            }
+          },
+          {
+            "date": "1Q2026",
+            "actual": {
+              "raw": 20.98,
+              "fmt": "20.98"
+            },
+            "estimate": {
+              "raw": 18.38586,
+              "fmt": "18.39"
+            },
+            "fiscalQuarter": "4Q2026",
+            "calendarQuarter": "1Q2026",
+            "difference": "2.59",
+            "surprisePct": "14.11",
+            "periodEndDate": {
+              "raw": 1774915200,
+              "fmt": "2026-03-31"
+            },
+            "reportedDate": {
+              "raw": 1776947119,
+              "fmt": "2026-04-23"
+            }
+          },
+          {
+            "date": "2Q2026",
+            "actual": {
+              "raw": 19.17,
+              "fmt": "19.17"
+            },
+            "estimate": {
+              "raw": 19.11846,
+              "fmt": "19.12"
+            },
+            "fiscalQuarter": "1Q2027",
+            "calendarQuarter": "2Q2026",
+            "difference": "0.05",
+            "surprisePct": "0.27",
+            "periodEndDate": {
+              "raw": 1782777600,
+              "fmt": "2026-06-30"
+            },
+            "reportedDate": {
+              "raw": 1784804210,
+              "fmt": "2026-07-23"
+            }
+          },
+          {
+            "date": "3Q2026",
+            "actual": {
+              "raw": 19.3,
+              "fmt": "19.3"
+            },
+            "estimate": {
+              "raw": 19.58457,
+              "fmt": "19.58"
+            },
+            "fiscalQuarter": "2Q2027",
+            "calendarQuarter": "3Q2026",
+            "difference": "-0.28",
+            "surprisePct": "-1.45",
+            "periodEndDate": {
+              "raw": 1790726400,
+              "fmt": "2026-09-30"
+            },
+            "reportedDate": {
+              "raw": 1792768743,
+              "fmt": "2026-10-23"
+            }
+          }
+        ],
+        "currentQuarterEstimate": {
+          "raw": 18.53185,
+          "fmt": "18.53"
+        },
+        "currentQuarterEstimateDate": "4Q",
+        "currentCalendarQuarter": "4Q2026",
+        "currentQuarterEstimateYear": 2026,
+        "currentFiscalQuarter": "3Q2027",
+        "currentPeriodEndDate": {
+          "raw": 1798675200,
+          "fmt": "2026-12-31"
+        },
+        "earningsDate": [
+          {
+            "raw": 1799834400,
+            "fmt": "2027-01-13"
+          }
+        ],
+        "isEarningsDateEstimate": true
+      },
+      "financialsChart": {
+        "yearly": [
+          {
+            "date": 2023,
+            "revenue": {
+              "raw": 1467670000000,
+              "fmt": "1.47T",
+              "longFmt": "1,467,670,000,000"
+            },
+            "earnings": {
+              "raw": 240950000000,
+              "fmt": "240.95B",
+              "longFmt": "240,950,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.16417179,
+              "fmt": "16.42%"
+            }
+          },
+          {
+            "date": 2024,
+            "revenue": {
+              "raw": 1536700000000,
+              "fmt": "1.54T",
+              "longFmt": "1,536,700,000,000"
+            },
+            "earnings": {
+              "raw": 262330000000,
+              "fmt": "262.33B",
+              "longFmt": "262,330,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.17070997,
+              "fmt": "17.07%"
+            }
+          },
+          {
+            "date": 2025,
+            "revenue": {
+              "raw": 1629900000000,
+              "fmt": "1.63T",
+              "longFmt": "1,629,900,000,000"
+            },
+            "earnings": {
+              "raw": 267130000000,
+              "fmt": "267.13B",
+              "longFmt": "267,130,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.16389349,
+              "fmt": "16.39%"
+            }
+          },
+          {
+            "date": 2026,
+            "revenue": {
+              "raw": 1786500000000,
+              "fmt": "1.79T",
+              "longFmt": "1,786,500,000,000"
+            },
+            "earnings": {
+              "raw": 294400000000,
+              "fmt": "294.4B",
+              "longFmt": "294,400,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.1647915,
+              "fmt": "16.48%"
+            }
+          }
+        ],
+        "quarterly": [
+          {
+            "date": "4Q2025",
+            "fiscalQuarter": "3Q2026",
+            "revenue": {
+              "raw": 454790000000,
+              "fmt": "454.79B",
+              "longFmt": "454,790,000,000"
+            },
+            "earnings": {
+              "raw": 66540000000,
+              "fmt": "66.54B",
+              "longFmt": "66,540,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.14630929,
+              "fmt": "14.63%"
+            }
+          },
+          {
+            "date": "1Q2026",
+            "fiscalQuarter": "4Q2026",
+            "revenue": {
+              "raw": 464020000000,
+              "fmt": "464.02B",
+              "longFmt": "464,020,000,000"
+            },
+            "earnings": {
+              "raw": 85010000000,
+              "fmt": "85.01B",
+              "longFmt": "85,010,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.1832033,
+              "fmt": "18.32%"
+            }
+          },
+          {
+            "date": "2Q2026",
+            "fiscalQuarter": "1Q2027",
+            "revenue": {
+              "raw": 482110000000,
+              "fmt": "482.11B",
+              "longFmt": "482,110,000,000"
+            },
+            "earnings": {
+              "raw": 77690000000,
+              "fmt": "77.69B",
+              "longFmt": "77,690,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.1611458,
+              "fmt": "16.11%"
+            }
+          },
+          {
+            "date": "3Q2026",
+            "fiscalQuarter": "2Q2027",
+            "revenue": {
+              "raw": 492440000000,
+              "fmt": "492.44B",
+              "longFmt": "492,440,000,000"
+            },
+            "earnings": {
+              "raw": 78230000000,
+              "fmt": "78.23B",
+              "longFmt": "78,230,000,000"
+            },
+            "profitMargin": {
+              "raw": 0.15886201,
+              "fmt": "15.89%"
+            }
+          }
+        ]
+      },
+      "financialCurrency": "USD",
+      "defaultMethodology": "nongaap"
+    },
+    "summaryProfile": {
+      "address1": "Plot No. 44/97 A",
+      "address2": "3rd cross Electronic City Hosur Road",
+      "city": "Bengaluru",
+      "zip": "56 0100",
+      "country": "India",
+      "phone": "91 80 2852 0261",
+      "fax": "91 80 2852 0362",
+      "website": "https://www.infosys.com",
+      "industry": "Information Technology Services",
+      "industryKey": "information-technology-services",
+      "industryDisp": "Information Technology Services",
+      "sector": "Technology",
+      "sectorKey": "technology",
+      "sectorDisp": "Technology",
+      "longBusinessSummary": "Infosys Limited provides consulting, technology, outsourcing, and digital services worldwide. The company offers insight services, such as applied and generative AI, sustainability services, and Infosys Topaz, an AI-first set of services, solutions, and platforms; blockchain, Internet of Things, and engineering services; cybersecurity and quality engineering services; and enterprise agile DevOps, API economy and microservices, application modernization, and digital process automation. It also provides digital supply chain, Microsoft business application services, Microsoft cloud business, Oracle, SAP, service experience transformation, Salesforce, energy transition, network transformation services, infrastructure services, global capability center, and Infosys Cobalt, a suite of services, solutions, and platforms. In addition, the company offers experience services, including digital marketing, digital commerce, digital interactions, digital workplace services, digital experience, metaverse, and Infosys Aster, a marketing suite; and EdgeVerve, Infosys Finacle, Infosys Live Enterprise Suite, Infosys Cortex, Infosys Meridian, Panaya, Infosys Equinox, Infosys Topaz Fabric, Infosys Wingspan, Infosys Helix, and Infosys Polycloud platforms. It serves aerospace and defense, agriculture, automotive, chemical manufacturing, communication services, consumer packaged goods, education, engineering procurement and construction, financial services, oil and gas, private equity, professional services, public sector, healthcare, high technology, industrial manufacturing, information services and publishing, insurance, life sciences, logistics and distribution, media, entertainment, mining, retail, semiconductor, travel and hospitality, utilities, and waste management industries. The company was formerly known as Infosys Technologies Limited and changed its name to Infosys Limited in June 2011. Infosys Limited was incorporated in 1981 and is headquartered in Bengaluru, India.",
+      "fullTimeEmployees": 328594,
+      "companyOfficers": [],
+      "irWebsite": "http://www.infosys.com/investors/pages/index.aspx",
+      "executiveTeam": [],
+      "maxAge": 86400
+    },
+    "price": {
+      "maxAge": 1,
+      "preMarketChange": {},
+      "preMarketPrice": {},
+      "postMarketChange": {},
+      "postMarketPrice": {},
+      "regularMarketChangePercent": {
+        "raw": -0.014936839,
+        "fmt": "-1.49%"
+      },
+      "regularMarketChange": {
+        "raw": -17.5,
+        "fmt": "-17.50"
+      },
+      "regularMarketTime": 1794218306,
+      "priceHint": {
+        "raw": 2,
+        "fmt": "2",
+        "longFmt": "2"
+      },
+      "regularMarketPrice": {
+        "raw": 1154.1,
+        "fmt": "1,154.10"
+      },
+      "regularMarketDayHigh": {
+        "raw": 1168.0,
+        "fmt": "1,168.00"
+      },
+      "regularMarketDayLow": {
+        "raw": 1139.0,
+        "fmt": "1,139.00"
+      },
+      "regularMarketVolume": {
+        "raw": 10098637,
+        "fmt": "10.10M",
+        "longFmt": "10,098,637.00"
+      },
+      "averageDailyVolume10Day": {
+        "raw": 11204211,
+        "fmt": "11.2M",
+        "longFmt": "11,204,211"
+      },
+      "averageDailyVolume3Month": {
+        "raw": 11421310,
+        "fmt": "11.42M",
+        "longFmt": "11,421,310"
+      },
+      "regularMarketPreviousClose": {
+        "raw": 1171.6,
+        "fmt": "1,171.60"
+      },
+      "regularMarketSource": "FREE_REALTIME",
+      "regularMarketOpen": {
+        "raw": 1167.9,
+        "fmt": "1,167.90"
+      },
+      "strikePrice": {},
+      "openInterest": {},
+      "fulldayChangePercent": {
+        "raw": -0.014936839,
+        "fmt": "-1.49%"
+      },
+      "fulldayChange": {
+        "raw": -17.5,
+        "fmt": "-17.50"
+      },
+      "fulldayPrice": {
+        "raw": 1154.1,
+        "fmt": "1,154.10"
+      },
+      "exchange": "NSI",
+      "exchangeName": "NSE",
+      "exchangeDataDelayedBy": 15,
+      "marketState": "CLOSED",
+      "quoteType": "EQUITY",
+      "symbol": "INFY.NS",
+      "underlyingSymbol": null,
+      "shortName": "INFOSYS LIMITED",
+      "longName": "Infosys Limited",
+      "currency": "INR",
+      "quoteSourceName": "Delayed Quote",
+      "currencySymbol": "\u20b9",
+      "fromCurrency": null,
+      "toCurrency": null,
+      "lastMarket": null,
+      "volume24Hr": {},
+      "volumeAllCurrencies": {},
+      "circulatingSupply": {},
+      "marketCap": {
+        "raw": 4674539225088,
+        "fmt": "4.67T",
+        "longFmt": "4,674,539,225,088.00"
+      }
+    },
+    "financialData": {
+      "maxAge": 86400,
+      "currentPrice": {
+        "raw": 1154.1,
+        "fmt": "1,154.10"
+      },
+      "targetHighPrice": {
+        "raw": 1627.0,
+        "fmt": "1,627.00"
+      },
+      "targetLowPrice": {
+        "raw": 990.0,
+        "fmt": "990.00"
+      },
+      "targetMeanPrice": {
+        "raw": 1200.0952,
+        "fmt": "1,200.10"
+      },
+      "targetMedianPrice": {
+        "raw": 1200.0,
+        "fmt": "1,200.00"
+      },
+      "recommendationMean": {
+        "raw": 2.35714,
+        "fmt": "2.36"
+      },
+      "recommendationKey": "buy",
+      "numberOfAnalystOpinions": {
+        "raw": 42,
+        "fmt": "42",
+        "longFmt": "42"
+      },
+      "totalCash": {
+        "raw": 3976999936,
+        "fmt": "3.98B",
+        "longFmt": "3,976,999,936"
+      },
+      "totalCashPerShare": {
+        "raw": 0.982,
+        "fmt": "0.98"
+      },
+      "ebitda": {
+        "raw": 4897999872,
+        "fmt": "4.9B",
+        "longFmt": "4,897,999,872"
+      },
+      "totalDebt": {
+        "raw": 890000000,
+        "fmt": "890M",
+        "longFmt": "890,000,000"
+      },
+      "quickRatio": {
+        "raw": 1.724,
+        "fmt": "1.72"
+      },
+      "currentRatio": {
+        "raw": 1.974,
+        "fmt": "1.97"
+      },
+      "totalRevenue": {
+        "raw": 20366999552,
+        "fmt": "20.37B",
+        "longFmt": "20,366,999,552"
+      },
+      "debtToEquity": {
+        "raw": 8.567,
+        "fmt": "8.57%"
+      },
+      "revenuePerShare": {
+        "raw": 5.01,
+        "fmt": "5.01"
+      },
+      "returnOnAssets": {
+        "raw": 0.16146,
+        "fmt": "16.15%"
+      },
+      "returnOnEquity": {
+        "raw": 0.29951,
+        "fmt": "29.95%"
+      },
+      "grossProfits": {
+        "raw": 6060000256,
+        "fmt": "6.06B",
+        "longFmt": "6,060,000,256"
+      },
+      "freeCashflow": {
+        "raw": 3300624896,
+        "fmt": "3.3B",
+        "longFmt": "3,300,624,896"
+      },
+      "operatingCashflow": {
+        "raw": 3948999936,
+        "fmt": "3.95B",
+        "longFmt": "3,948,999,936"
+      },
+      "earningsGrowth": {
+        "raw": -0.0,
+        "fmt": "-0.00%"
+      },
+      "revenueGrowth": {
+        "raw": 0.014,
+        "fmt": "1.40%"
+      },
+      "grossMargins": {
+        "raw": 0.29754,
+        "fmt": "29.75%"
+      },
+      "ebitdaMargins": {
+        "raw": 0.24049,
+        "fmt": "24.05%"
+      },
+      "operatingMargins": {
+        "raw": 0.20972,
+        "fmt": "20.97%"
+      },
+      "profitMargins": {
+        "raw": 0.16217,
+        "fmt": "16.22%"
+      },
+      "financialCurrency": "USD"
+    }
+  },
+  "timeseries": [
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualOperatingIncome"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualOperatingIncome": [
+        {
+          "dataId": 20109,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3825000000.0,
+            "fmt": "3.83B"
+          },
+          "businessSegmentData": [
+            {
+              "dataValue": 42000000.0,
+              "segmentType": "Business",
+              "segmentName": "All Other Segments",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 465000000.0,
+              "segmentType": "Business",
+              "segmentName": "Communication",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 639000000.0,
+              "segmentType": "Business",
+              "segmentName": "Energy, Utilities, Resources and Services",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 1346000000.0,
+              "segmentType": "Business",
+              "segmentName": "Financial Services",
+              "isPrimarySegment": 1
+            },
+            {
+              "dataValue": 366000000.0,
+              "segmentType": "Business",
+              "segmentName": "Hi-Tech",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 318000000.0,
+              "segmentType": "Business",
+              "segmentName": "Life Sciences",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 380000000.0,
+              "segmentType": "Business",
+              "segmentName": "Manufacturing",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 793000000.0,
+              "segmentType": "Business",
+              "segmentName": "Retail",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": -524000000.0,
+              "segmentType": "Business",
+              "segmentName": "Unallocable expenses",
+              "isPrimarySegment": 0
+            }
+          ]
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3849000000.0,
+            "fmt": "3.85B"
+          },
+          "businessSegmentData": [
+            {
+              "dataValue": 92000000.0,
+              "segmentType": "Business",
+              "segmentName": "All Other Segments",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 445000000.0,
+              "segmentType": "Business",
+              "segmentName": "Communication",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 664000000.0,
+              "segmentType": "Business",
+              "segmentName": "Energy, Utilities, Resources and Services",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 1127000000.0,
+              "segmentType": "Business",
+              "segmentName": "Financial Services",
+              "isPrimarySegment": 1
+            },
+            {
+              "dataValue": 379000000.0,
+              "segmentType": "Business",
+              "segmentName": "Hi-Tech",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 350000000.0,
+              "segmentType": "Business",
+              "segmentName": "Life Sciences",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 510000000.0,
+              "segmentType": "Business",
+              "segmentName": "Manufacturing",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 832000000.0,
+              "segmentType": "Business",
+              "segmentName": "Retail",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": -565000000.0,
+              "segmentType": "Business",
+              "segmentName": "Unallocable expenses",
+              "isPrimarySegment": 0
+            }
+          ]
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4077000000.0,
+            "fmt": "4.08B"
+          },
+          "businessSegmentData": [
+            {
+              "dataValue": 98000000.0,
+              "segmentType": "Business",
+              "segmentName": "All Other Segments",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 395000000.0,
+              "segmentType": "Business",
+              "segmentName": "Communication",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 721000000.0,
+              "segmentType": "Business",
+              "segmentName": "Energy, Utilities, Resources and Services",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 1312000000.0,
+              "segmentType": "Business",
+              "segmentName": "Financial Services",
+              "isPrimarySegment": 1
+            },
+            {
+              "dataValue": 381000000.0,
+              "segmentType": "Business",
+              "segmentName": "Hi-Tech",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 315000000.0,
+              "segmentType": "Business",
+              "segmentName": "Life Sciences",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 574000000.0,
+              "segmentType": "Business",
+              "segmentName": "Manufacturing",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 844000000.0,
+              "segmentType": "Business",
+              "segmentName": "Retail",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": -569000000.0,
+              "segmentType": "Business",
+              "segmentName": "Unallocable expenses",
+              "isPrimarySegment": 0
+            }
+          ]
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4089000000.0,
+            "fmt": "4.09B"
+          },
+          "businessSegmentData": [
+            {
+              "dataValue": 80000000.0,
+              "segmentType": "Business",
+              "segmentName": "All Other Segments",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 434000000.0,
+              "segmentType": "Business",
+              "segmentName": "Communication",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 675000000.0,
+              "segmentType": "Business",
+              "segmentName": "Energy, Utilities, Resources and Services",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 1427000000.0,
+              "segmentType": "Business",
+              "segmentName": "Financial Services",
+              "isPrimarySegment": 1
+            },
+            {
+              "dataValue": 363000000.0,
+              "segmentType": "Business",
+              "segmentName": "Hi-Tech",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 276000000.0,
+              "segmentType": "Business",
+              "segmentName": "Life Sciences",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 726000000.0,
+              "segmentType": "Business",
+              "segmentName": "Manufacturing",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 799000000.0,
+              "segmentType": "Business",
+              "segmentName": "Retail",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": -695000000.0,
+              "segmentType": "Business",
+              "segmentName": "Unallocable expenses",
+              "isPrimarySegment": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualTotalDebt"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualTotalDebt": [
+        {
+          "dataId": 23386,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1010000000.0,
+            "fmt": "1.01B"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1002000000.0,
+            "fmt": "1.00B"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 962000000.0,
+            "fmt": "962.00M"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 967000000.0,
+            "fmt": "967.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyTotalRevenue"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyTotalRevenue": [
+        {
+          "dataId": 20100,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5076000000.0,
+            "fmt": "5.08B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5099000000.0,
+            "fmt": "5.10B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5040000000.0,
+            "fmt": "5.04B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5082000000.0,
+            "fmt": "5.08B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5145000000.0,
+            "fmt": "5.14B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualTotalRevenue"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualTotalRevenue": [
+        {
+          "dataId": 20100,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 18212000000.0,
+            "fmt": "18.21B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 18562000000.0,
+            "fmt": "18.56B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 19277000000.0,
+            "fmt": "19.28B"
+          }
+        },
+        {
+          "dataId": 20100,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 20158000000.0,
+            "fmt": "20.16B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyCashAndCashEquivalents"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyCashAndCashEquivalents": [
+        {
+          "dataId": 23030,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3539000000.0,
+            "fmt": "3.54B"
+          }
+        },
+        {
+          "dataId": 23030,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2216000000.0,
+            "fmt": "2.22B"
+          }
+        },
+        {
+          "dataId": 23030,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2341000000.0,
+            "fmt": "2.34B"
+          }
+        },
+        {
+          "dataId": 23030,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2287000000.0,
+            "fmt": "2.29B"
+          }
+        },
+        {
+          "dataId": 23030,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2541000000.0,
+            "fmt": "2.54B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualOperatingCashFlow"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualOperatingCashFlow": [
+        {
+          "dataId": 26014,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2853000000.0,
+            "fmt": "2.85B"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3148000000.0,
+            "fmt": "3.15B"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4351000000.0,
+            "fmt": "4.35B"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4039000000.0,
+            "fmt": "4.04B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyCapitalExpenditure"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyCapitalExpenditure": [
+        {
+          "dataId": 26005,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": -56000000.0,
+            "fmt": "-56.00M"
+          }
+        },
+        {
+          "dataId": 26005,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": -47000000.0,
+            "fmt": "-47.00M"
+          }
+        },
+        {
+          "dataId": 26005,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": -104000000.0,
+            "fmt": "-104.00M"
+          }
+        },
+        {
+          "dataId": 26005,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": -81000000.0,
+            "fmt": "-81.00M"
+          }
+        },
+        {
+          "dataId": 26005,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": -86000000.0,
+            "fmt": "-86.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyOperatingIncome"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyOperatingIncome": [
+        {
+          "dataId": 20109,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1065000000.0,
+            "fmt": "1.06B"
+          }
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 937000000.0,
+            "fmt": "937.00M"
+          },
+          "businessSegmentData": [
+            {
+              "dataValue": 8000000.0,
+              "segmentType": "Business",
+              "segmentName": "All Other Segments",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 105000000.0,
+              "segmentType": "Business",
+              "segmentName": "Communication",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 167000000.0,
+              "segmentType": "Business",
+              "segmentName": "Energy, Utilities, Resources and Services",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 362000000.0,
+              "segmentType": "Business",
+              "segmentName": "Financial Services",
+              "isPrimarySegment": 1
+            },
+            {
+              "dataValue": 86000000.0,
+              "segmentType": "Business",
+              "segmentName": "Hi-Tech",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 78000000.0,
+              "segmentType": "Business",
+              "segmentName": "Life Sciences",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 195000000.0,
+              "segmentType": "Business",
+              "segmentName": "Manufacturing",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": 209000000.0,
+              "segmentType": "Business",
+              "segmentName": "Retail",
+              "isPrimarySegment": 0
+            },
+            {
+              "dataValue": -273000000.0,
+              "segmentType": "Business",
+              "segmentName": "Unallocable expenses",
+              "isPrimarySegment": 0
+            }
+          ]
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1055000000.0,
+            "fmt": "1.05B"
+          }
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1072000000.0,
+            "fmt": "1.07B"
+          }
+        },
+        {
+          "dataId": 20109,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1079000000.0,
+            "fmt": "1.08B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyEBITDA"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyEBITDA": [
+        {
+          "dataId": 20190,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1312000000.0,
+            "fmt": "1.31B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1176000000.0,
+            "fmt": "1.18B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1334000000.0,
+            "fmt": "1.33B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1307000000.0,
+            "fmt": "1.31B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1168000000.0,
+            "fmt": "1.17B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualGrossProfit"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualGrossProfit": [
+        {
+          "dataId": 20046,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5503000000.0,
+            "fmt": "5.50B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5587000000.0,
+            "fmt": "5.59B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5872000000.0,
+            "fmt": "5.87B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6079000000.0,
+            "fmt": "6.08B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyCommonStockEquity"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyCommonStockEquity": [
+        {
+          "dataId": 23280,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 11634000000.0,
+            "fmt": "11.63B"
+          }
+        },
+        {
+          "dataId": 23280,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 9233000000.0,
+            "fmt": "9.23B"
+          }
+        },
+        {
+          "dataId": 23280,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 9786000000.0,
+            "fmt": "9.79B"
+          }
+        },
+        {
+          "dataId": 23280,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 9619000000.0,
+            "fmt": "9.62B"
+          }
+        },
+        {
+          "dataId": 23280,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 10333000000.0,
+            "fmt": "10.33B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyNetIncome"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyNetIncome": [
+        {
+          "dataId": 20091,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 839000000.0,
+            "fmt": "839.00M"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 747000000.0,
+            "fmt": "747.00M"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 919000000.0,
+            "fmt": "919.00M"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 819000000.0,
+            "fmt": "819.00M"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 817000000.0,
+            "fmt": "817.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyOperatingCashFlow"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyOperatingCashFlow": [
+        {
+          "dataId": 26014,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1157000000.0,
+            "fmt": "1.16B"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 962000000.0,
+            "fmt": "962.00M"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 937000000.0,
+            "fmt": "937.00M"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1036000000.0,
+            "fmt": "1.04B"
+          }
+        },
+        {
+          "dataId": 26014,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1014000000.0,
+            "fmt": "1.01B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyDilutedEPS"
+        ]
+      },
+      "timestamp": [
+        1751241600,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyDilutedEPS": [
+        {
+          "dataId": 29009,
+          "asOfDate": "2025-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.19,
+            "fmt": "0.19"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.18,
+            "fmt": "0.18"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.23,
+            "fmt": "0.23"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.2,
+            "fmt": "0.20"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.2,
+            "fmt": "0.20"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyTotalDebt"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyTotalDebt": [
+        {
+          "dataId": 23386,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 986000000.0,
+            "fmt": "986.00M"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 978000000.0,
+            "fmt": "978.00M"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 967000000.0,
+            "fmt": "967.00M"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 923000000.0,
+            "fmt": "923.00M"
+          }
+        },
+        {
+          "dataId": 23386,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 516000000.0,
+            "fmt": "516.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualBasicEPS"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualBasicEPS": [
+        {
+          "dataId": 29004,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.71,
+            "fmt": "0.71"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.77,
+            "fmt": "0.77"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.76,
+            "fmt": "0.76"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.81,
+            "fmt": "0.81"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyTotalLiabilitiesNetMinorityInterest"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyTotalLiabilitiesNetMinorityInterest": [
+        {
+          "dataId": 23259,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6377000000.0,
+            "fmt": "6.38B"
+          }
+        },
+        {
+          "dataId": 23259,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6666000000.0,
+            "fmt": "6.67B"
+          }
+        },
+        {
+          "dataId": 23259,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6606000000.0,
+            "fmt": "6.61B"
+          }
+        },
+        {
+          "dataId": 23259,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6685000000.0,
+            "fmt": "6.68B"
+          }
+        },
+        {
+          "dataId": 23259,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 6671000000.0,
+            "fmt": "6.67B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualEBITDA"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualEBITDA": [
+        {
+          "dataId": 20190,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4684000000.0,
+            "fmt": "4.68B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4967000000.0,
+            "fmt": "4.97B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5065000000.0,
+            "fmt": "5.07B"
+          }
+        },
+        {
+          "dataId": 20190,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 5105000000.0,
+            "fmt": "5.11B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualTotalAssets"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualTotalAssets": [
+        {
+          "dataId": 23220,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 15312000000.0,
+            "fmt": "15.31B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 16523000000.0,
+            "fmt": "16.52B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 17419000000.0,
+            "fmt": "17.42B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 16446000000.0,
+            "fmt": "16.45B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyBasicEPS"
+        ]
+      },
+      "timestamp": [
+        1751241600,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyBasicEPS": [
+        {
+          "dataId": 29004,
+          "asOfDate": "2025-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.2,
+            "fmt": "0.20"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.18,
+            "fmt": "0.18"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.23,
+            "fmt": "0.23"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.2,
+            "fmt": "0.20"
+          }
+        },
+        {
+          "dataId": 29004,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.2,
+            "fmt": "0.20"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualFreeCashFlow"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualFreeCashFlow": [
+        {
+          "dataId": 26185,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2534000000.0,
+            "fmt": "2.53B"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2882000000.0,
+            "fmt": "2.88B"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 4088000000.0,
+            "fmt": "4.09B"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3733000000.0,
+            "fmt": "3.73B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyFreeCashFlow"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyFreeCashFlow": [
+        {
+          "dataId": 26185,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1101000000.0,
+            "fmt": "1.10B"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 915000000.0,
+            "fmt": "915.00M"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 833000000.0,
+            "fmt": "833.00M"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 955000000.0,
+            "fmt": "955.00M"
+          }
+        },
+        {
+          "dataId": 26185,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 928000000.0,
+            "fmt": "928.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyTotalAssets"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyTotalAssets": [
+        {
+          "dataId": 23220,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 18064000000.0,
+            "fmt": "18.06B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 15953000000.0,
+            "fmt": "15.95B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 16446000000.0,
+            "fmt": "16.45B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 16359000000.0,
+            "fmt": "16.36B"
+          }
+        },
+        {
+          "dataId": 23220,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 17060000000.0,
+            "fmt": "17.06B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualDilutedEPS"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualDilutedEPS": [
+        {
+          "dataId": 29009,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.71,
+            "fmt": "0.71"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.76,
+            "fmt": "0.76"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.76,
+            "fmt": "0.76"
+          }
+        },
+        {
+          "dataId": 29009,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 0.8,
+            "fmt": "0.80"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyOperatingExpense"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyOperatingExpense": [
+        {
+          "dataId": 20108,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 495000000.0,
+            "fmt": "495.00M"
+          }
+        },
+        {
+          "dataId": 20108,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 502000000.0,
+            "fmt": "502.00M"
+          }
+        },
+        {
+          "dataId": 20108,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 500000000.0,
+            "fmt": "500.00M"
+          }
+        },
+        {
+          "dataId": 20108,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 528000000.0,
+            "fmt": "528.00M"
+          }
+        },
+        {
+          "dataId": 20108,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 519000000.0,
+            "fmt": "519.00M"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "quarterlyGrossProfit"
+        ]
+      },
+      "timestamp": [
+        1759190400,
+        1767139200,
+        1774915200,
+        1782777600,
+        1790726400
+      ],
+      "quarterlyGrossProfit": [
+        {
+          "dataId": 20046,
+          "asOfDate": "2025-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1560000000.0,
+            "fmt": "1.56B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2025-12-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1439000000.0,
+            "fmt": "1.44B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2026-03-31",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1555000000.0,
+            "fmt": "1.55B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2026-06-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1600000000.0,
+            "fmt": "1.60B"
+          }
+        },
+        {
+          "dataId": 20046,
+          "asOfDate": "2026-09-30",
+          "periodType": "3M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 1598000000.0,
+            "fmt": "1.60B"
+          }
+        }
+      ]
+    },
+    {
+      "meta": {
+        "symbol": [
+          "INFY.NS"
+        ],
+        "type": [
+          "annualNetIncome"
+        ]
+      },
+      "timestamp": [
+        1680220800,
+        1711843200,
+        1743379200,
+        1774915200
+      ],
+      "annualNetIncome": [
+        {
+          "dataId": 20091,
+          "asOfDate": "2023-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 2981000000.0,
+            "fmt": "2.98B"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2024-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3167000000.0,
+            "fmt": "3.17B"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2025-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3158000000.0,
+            "fmt": "3.16B"
+          }
+        },
+        {
+          "dataId": 20091,
+          "asOfDate": "2026-03-31",
+          "periodType": "12M",
+          "currencyCode": "USD",
+          "reportedValue": {
+            "raw": 3313000000.0,
+            "fmt": "3.31B"
+          }
+        }
+      ]
+    }
+  ]
+}
