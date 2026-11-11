@@ -25,9 +25,14 @@ for _d in (ALERTS_DIR, ENTRY_DIR, SCAN_DIR, TM_DIR, BROKER_DIR):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 
-import calendar_in  # noqa: E402
-import data_in  # noqa: E402
-import upstox_feed  # noqa: E402
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
+import _load  # noqa: E402,F401
+
+import calendar_in  # type: ignore  # noqa: E402
+import data_in  # type: ignore  # noqa: E402
+import upstox_feed  # type: ignore  # noqa: E402
 
 
 # ---------------------------------------------------------------- Protobuf Wire Test Encoder
@@ -983,9 +988,9 @@ class TestUpstoxProvider(unittest.TestCase):
     # 10. End-to-End Skill Integration (entry, timemachine, scan, ticket) -----
 
     def test_end_to_end_live_and_historical_provenance_with_upstox(self):
-        import entry as entry_mod  # noqa: E402
-        import ticket as ticket_mod  # noqa: E402
-        import timemachine as tm_mod  # noqa: E402
+        import entry as entry_mod  # type: ignore  # noqa: E402
+        import ticket as ticket_mod  # type: ignore  # noqa: E402
+        import timemachine as tm_mod  # type: ignore  # noqa: E402
 
         # Live open-session 5m ORB bars (opening range 09:15..09:30 < 1350, breakout at 09:30 close 1356)
         now_open = datetime.datetime(2026, 10, 19, 9, 36, 0, tzinfo=calendar_in.IST)

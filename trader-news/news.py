@@ -1076,7 +1076,7 @@ def main(argv=None):
     ap.add_argument("--user-agent", help="SEC User-Agent: \"Your Name you@example.com\"")
     ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--offline", metavar="DIR")
-    ap.add_argument("--now", help="ISO time, for reproducible runs")
+    ap.add_argument("--now", help="override the application clock (ISO time) for reproducible backtests/tests")
     ap.add_argument("--dry-run", action="store_true", help="do not update the state file")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian tickers (default: NSE)")

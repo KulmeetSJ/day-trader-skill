@@ -3,6 +3,18 @@
 import importlib.util
 import os
 
+# Isolate the unit-test suite from developer-local .env provider/token overrides
+# so default-Yahoo and unconfigured-auth tests are deterministic. Env-loading
+# behavior itself is tested explicitly in tests/test_env_and_clock.py.
+for _k in (
+    "INDIA_MARKET_DATA_PROVIDER",
+    "BHARAT_DATA_PROVIDER",
+    "UPSTOX_ANALYTICS_TOKEN",
+    "INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK",
+    "INDIA_MARKET_DATA_FALLBACK_PROVIDER",
+):
+    os.environ.setdefault(_k, "")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIX = os.path.join(ROOT, "tests", "fixtures")
 

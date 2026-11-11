@@ -1224,7 +1224,7 @@ def main(argv=None):
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--config", default="trader/config.json", help="optional trader config JSON")
         p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
-        p.add_argument("--now", help='pretend it is this market time ("2026-10-19 10:15", or ISO with Z)')
+        p.add_argument("--now", help='override the application clock to this market time for backtests/tests ("2026-10-19 10:15", or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)

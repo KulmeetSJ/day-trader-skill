@@ -177,7 +177,7 @@ class TestTicketSignalProvenance(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.d, ignore_errors=True)
 
-    def _run_show(self, order, today="2026-10-19", now_str="2026-10-19 11:00", cfg_override=None, doc_extra=None):
+    def _run_show(self, order, today="2026-10-19", now_str="2026-10-19 11:00", cfg_override=None, doc_extra=None, use_clock_mock=False):
         cfg = copy.deepcopy(_in_cfg())
         if cfg_override:
             cfg.update(cfg_override)
@@ -193,18 +193,23 @@ class TestTicketSignalProvenance(unittest.TestCase):
         with open(self.risk_path, "w", encoding="utf-8") as fh:
             json.dump(r, fh)
 
-        code_j, out_j, err_j = _run_cli(ticket_mod, [
+        base_args = [
             "show", "--orders", self.orders_path, "--config", self.cfg_path,
             "--risk", self.risk_path, "--state", self.state_path,
-            "--market", "IN", "--now", now_str, "--json",
-        ])
-        self.assertEqual(code_j, 0, out_j + err_j)
-        code_t, out_t, err_t = _run_cli(ticket_mod, [
-            "show", "--orders", self.orders_path, "--config", self.cfg_path,
-            "--risk", self.risk_path, "--state", self.state_path,
-            "--market", "IN", "--now", now_str,
-        ])
-        self.assertEqual(code_t, 0, out_t + err_t)
+            "--market", "IN",
+        ]
+        if use_clock_mock:
+            with patch.object(ticket_mod, "utc_now", return_value=now_utc), \
+                 patch.object(risk_mod, "utc_now", return_value=now_utc):
+                code_j, out_j, err_j = _run_cli(ticket_mod, base_args + ["--json"])
+                self.assertEqual(code_j, 0, out_j + err_j)
+                code_t, out_t, err_t = _run_cli(ticket_mod, base_args)
+                self.assertEqual(code_t, 0, out_t + err_t)
+        else:
+            code_j, out_j, err_j = _run_cli(ticket_mod, base_args + ["--now", now_str, "--json"])
+            self.assertEqual(code_j, 0, out_j + err_j)
+            code_t, out_t, err_t = _run_cli(ticket_mod, base_args + ["--now", now_str])
+            self.assertEqual(code_t, 0, out_t + err_t)
         return json.loads(out_j)[0], out_t
 
     def test_distinguishes_all_five_signal_classes(self):
@@ -293,7 +298,7 @@ class TestTicketSignalProvenance(unittest.TestCase):
         self.assertIn("WARNING: SIMULATED SIGNAL", txt)
         self.assertIn("signal [SIMULATED]: tier=SIMULATED, provider=simulated, live_signal=no", txt)
 
-        # 5. Genuinely live signal (verified real-time broker provider, open market, current session)
+        # 5. Genuinely live signal (verified real-time broker provider, open market, real app clock without --now)
         live_o = _sample_order(
             provider="zerodha",
             data_tier="CURRENT",
@@ -305,7 +310,7 @@ class TestTicketSignalProvenance(unittest.TestCase):
             last_data_timestamp="2026-10-19T10:59:00+05:30",
             signal_freshness="current",
         )
-        tj, txt = self._run_show(live_o, now_str="2026-10-19 11:00")
+        tj, txt = self._run_show(live_o, now_str="2026-10-19 11:00", use_clock_mock=True)
         self.assertEqual(tj["data_tier"], "CURRENT")
         self.assertIs(tj["is_historical_analysis"], False)
         self.assertIs(tj["is_live_signal"], True)
@@ -314,6 +319,16 @@ class TestTicketSignalProvenance(unittest.TestCase):
         self.assertIsNone(tj["signal_warning"])
         self.assertNotIn("WARNING:", txt)
         self.assertIn("signal [LIVE]: tier=CURRENT, provider=zerodha, live_signal=yes", txt)
+
+        # 6. Same order shown with --now clock override MUST NOT be labeled LIVE
+        tj_now, txt_now = self._run_show(live_o, now_str="2026-10-19 11:00", use_clock_mock=False)
+        self.assertEqual(tj_now["data_tier"], "HISTORICAL")
+        self.assertIs(tj_now["is_historical_analysis"], True)
+        self.assertIs(tj_now["is_live_signal"], False)
+        self.assertIs(tj_now["clock_override"], True)
+        self.assertEqual(tj_now["signal_classification"], "HISTORICAL")
+        self.assertIn("CLOCK OVERRIDDEN BY --now", tj_now["signal_warning"])
+        self.assertIn("WARNING: HISTORICAL SIGNAL (CLOCK OVERRIDDEN BY --now)", txt_now)
 
     def test_historical_yahoo_cannot_be_displayed_as_live(self):
         # Contradictory Yahoo + historical + forged CURRENT/is_live_signal=True -> forced HISTORICAL, not live

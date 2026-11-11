@@ -45,11 +45,19 @@ class Repo(unittest.TestCase):
 
     def test_root_matches_the_reel(self):
         # trader/ is the designated local runtime state directory defined in .gitignore.
-        # If present, ensure it is a valid runtime directory, then exclude from source folder comparison.
+        # .env is the optional local secret/config file kept untracked via .gitignore.
+        # If present, ensure it is valid/ignored, then exclude from source folder comparison.
+        gitignore_path = os.path.join(ROOT, ".gitignore")
+        with open(gitignore_path, "r", encoding="utf-8") as fh:
+            gitignore_lines = [line.strip() for line in fh]
+        self.assertIn(".env", gitignore_lines, ".env must remain in .gitignore")
         trader_path = os.path.join(ROOT, "trader")
         if os.path.exists(trader_path):
             self.assertTrue(os.path.isdir(trader_path), "trader at root must be a directory")
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in (".agents", "agents", "trader"))
+        root = sorted(
+            d for d in os.listdir(ROOT)
+            if not d.startswith(".git") and d not in (".agents", ".env", "agents", "trader")
+        )
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):

@@ -1270,7 +1270,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     day = local.date()
     curr = "\u20b9" if market == "IN" else "$"
     exchange = "NSE" if market == "IN" else "NYSE"
-    is_sim_run = bool(simulated or chart.get("simulated_at"))
+    is_clock_override = bool(simulated or chart.get("clock_override"))
+    is_sim_run = bool(simulated or chart.get("clock_override") or chart.get("simulated_at"))
     res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
@@ -1278,6 +1279,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "trading_style": trading_style,
            "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS if market == "US" else True,
            "market": market, "currency": "INR" if market == "IN" else "USD", "_bars": []}
+    if is_clock_override:
+        res["clock_override"] = True
     if is_sim_run:
         res["simulated_at"] = _market_iso(now_utc, market=market)
     now_ts = ts_of(now_utc)
@@ -1410,11 +1413,20 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         chart, market, day, eval_day, local, open_dt, close_dt, now_ts, dt,
         step, by_slot, ok, session_is_open, is_historical, replay_full_session, is_fixture
     )
+    if is_clock_override:
+        # --now overrides the application clock: historical/test-clock signals must never
+        # present as CURRENT live data or current actionable entry recommendations.
+        if data_tier == "CURRENT":
+            data_tier = "HISTORICAL"
+            data_status = "stale" if (day - eval_day).days >= 1 else "historical"
+        is_live_data = False
     res["date"] = eval_day.isoformat()
     res["is_market_open"] = bool(session_is_open)
     res["is_live_data"] = bool(is_live_data)
     res["is_live_signal"] = False
-    res["is_historical_analysis"] = bool(is_historical or is_fixture)
+    res["is_historical_analysis"] = bool(
+        is_historical or is_fixture or (is_clock_override and data_tier == "HISTORICAL")
+    )
     res["is_fixture"] = is_fixture
     res["data_tier"] = data_tier
     res["last_trading_session"] = last_td.isoformat()
@@ -1695,6 +1707,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             and is_live_data
             and data_tier == "CURRENT"
             and not is_fixture
+            and not is_clock_override
             and not bool(res.get("is_simulated"))
             and not is_historical
             and not replay_full_session
@@ -1840,6 +1853,8 @@ def entry_doc(res, now_utc):
         doc["candle_session"] = res["candle_session"]
     if res.get("simulated_at"):
         doc["simulated_at"] = res["simulated_at"]
+    if res.get("clock_override"):
+        doc["clock_override"] = True
     doc["last_data_timestamp"] = res.get("last_data_timestamp")
     if res.get("data_status"):
         doc["data_status"] = res["data_status"]
@@ -1894,20 +1909,27 @@ def describe(res):
     tz_label = "IST" if market == "IN" else "ET"
     is_hist = bool(res.get("is_historical_analysis"))
     is_fix = bool(res.get("is_fixture"))
+    is_clock_override = bool(res.get("clock_override"))
     closed_analysis = bool(res.get("_replay_full_session") or (is_hist and not res.get("_market_session_open") and res.get("phase") not in ("pre-open", "open", "forming")))
     tier = res.get("data_tier") or ("FIXTURE" if is_fix else ("HISTORICAL" if closed_analysis else "DELAYED"))
     sess_date = res.get("last_trading_session", res["date"])
     candle_sess = res.get("candle_session") or res["date"]
     prov_name = str(res.get("provider") or ("offline" if is_fix else "yahoo"))
     if closed_analysis:
-        head = "%s  %s %s %s  %s on %s bars [HISTORICAL ANALYSIS -- Market CLOSED, Session: %s%s]" % (
+        head = "%s  %s %s %s  %s on %s bars [HISTORICAL ANALYSIS -- Market CLOSED, Session: %s%s%s]" % (
             res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars,
-            sess_date, ", Fixture" if is_fix else "")
+            sess_date, ", Fixture" if is_fix else "", ", --now clock override" if is_clock_override else "")
     elif is_fix:
-        head = "%s  %s %s %s  %s on %s bars [OFFLINE FIXTURE -- historical replay, NOT live]" % (
-            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars)
+        head = "%s  %s %s %s  %s on %s bars [OFFLINE FIXTURE -- historical replay, NOT live]%s" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars,
+            " (--now clock override)" if is_clock_override else "")
     else:
-        if res.get("is_live_data") and tier == "CURRENT":
+        clock_suffix = " (application clock overridden via --now)" if is_clock_override else ""
+        if is_clock_override and prov_name.lower() == "yahoo":
+            prov_label = "Yahoo delayed provider, free, %s data%s - NOT live" % (tier, clock_suffix)
+        elif is_clock_override:
+            prov_label = "%s provider, %s data%s - NOT live" % (prov_name, tier, clock_suffix)
+        elif res.get("is_live_data") and tier == "CURRENT":
             prov_label = "%s live provider, CURRENT data" % prov_name
         elif prov_name.lower() == "yahoo":
             prov_label = "Yahoo delayed provider, free, %s data - NOT live" % tier
@@ -1951,15 +1973,19 @@ def describe(res):
             if res.get("data_note"):
                 out.append(res["data_note"] + ".")
             if is_fix:
-                out.append("Offline fixture replay (Data tier: %s) -- NOT a live market signal. Nothing was placed." % tier)
+                out.append("Offline fixture replay (Data tier: %s) -- NOT a live market signal. Nothing was placed.%s" % (
+                    tier, " (Application clock overridden via --now.)" if is_clock_override else ""))
             elif not res.get("is_live_signal", False):
                 d_stat = str(res.get("data_status", "delayed")).upper()
                 if res.get("is_simulated"):
-                    out.append("Simulated candidate evaluation (provider: %s, Data tier: %s, status: %s) -- NOT a live market signal. Nothing was placed." % (
-                        prov_name, tier, d_stat))
+                    out.append("Simulated candidate evaluation (provider: %s, Data tier: %s, status: %s%s) -- NOT a live market signal. Nothing was placed." % (
+                        prov_name, tier, d_stat, ", --now clock override" if is_clock_override else ""))
+                elif is_clock_override and tier != "DELAYED":
+                    out.append("HISTORICAL / TEST-CLOCK SIGNAL (--now %s, provider: %s, Data tier: %s, status: %s) -- NOT a current live entry signal. Nothing was placed." % (
+                        res.get("simulated_at") or res.get("now") or "", prov_name, tier, d_stat))
                 else:
-                    out.append("CANDIDATE DETECTED ON DELAYED DATA (provider: %s, Data tier: %s, status: %s) -- NOT a live market signal. Nothing was placed." % (
-                        prov_name, tier, d_stat))
+                    out.append("CANDIDATE DETECTED ON DELAYED DATA (provider: %s, Data tier: %s, status: %s%s) -- NOT a live market signal. Nothing was placed." % (
+                        prov_name, tier, d_stat, ", --now clock override" if is_clock_override else ""))
             elif res.get("minutes_since", 0) > step:
                 out.append("Current live signal (%s provider, Data tier: CURRENT). Nothing was placed." % prov_name)
             else:
@@ -2170,12 +2196,16 @@ def _load(a, sym, now, market="US", cfg=None, setup=None):
     setup = setup or getattr(a, "setup", "orb")
     daily = getattr(a, "daily", None)
     real_today = to_local(utc_now(), market=market).date()
-    if a.offline and now is None:
+    has_explicit_now = now is not None
+    if a.offline and not has_explicit_now:
         ch = get_chart(sym, a.interval, offline=a.offline, market=market, cfg=cfg, setup=setup, daily=daily)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
-                     market=market, cfg=cfg, now=now, setup=setup, daily=daily), now
+    ch = get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
+                   market=market, cfg=cfg, now=now, setup=setup, daily=daily)
+    if not has_explicit_now and not a.offline and isinstance(ch, dict):
+        ch.pop("simulated_at", None)
+    return ch, now
 
 
 def cmd_check(a):
@@ -2220,8 +2250,11 @@ def cmd_watch(a):
     daily = getattr(a, "daily", None)
 
     def provider(now):
-        return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
-                         market=market, cfg=cfg, now=now, setup=a.setup, daily=daily)
+        ch = get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
+                       market=market, cfg=cfg, now=now, setup=a.setup, daily=daily)
+        if not a.now and not a.offline and isinstance(ch, dict):
+            ch.pop("simulated_at", None)
+        return ch
 
     until = None
     if a.until:
@@ -2318,7 +2351,7 @@ def main(argv=None):
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
-        p.add_argument("--now", help='pretend it is this market time, e.g. "2026-10-19 10:15"')
+        p.add_argument("--now", help='override the application clock to this market time for backtests/tests, e.g. "2026-10-19 10:15" (marks signals non-live)')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
         p.add_argument("--daily", metavar="PATH", help="saved 1d daily history JSON (.json/.json.gz) or folder (--setup breakout_20d)")
         p.add_argument("--config", default="trader/config.json")

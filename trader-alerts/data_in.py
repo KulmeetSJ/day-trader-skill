@@ -25,6 +25,14 @@ _alerts_dir = os.path.dirname(os.path.abspath(__file__))
 if _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
 
+import env_loader
+env_loader.load_project_dotenv()
+
+parse_dotenv = env_loader.parse_dotenv
+load_dotenv_file = env_loader.load_dotenv_file
+load_project_dotenv = env_loader.load_project_dotenv
+resolve_project_root = env_loader.resolve_project_root
+
 import symbols_in
 import calendar_in
 import instruments
@@ -748,6 +756,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                     code, body = self._http_get(url)
                     if code == 200:
                         return body
+                    raise urllib.error.HTTPError(url, int(code), "HTTP %s" % code, {}, None)
                 except urllib.error.HTTPError as e:
                     code = e.code
                     try:
@@ -786,6 +795,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                     code, body = self._http_get(url)
                     if code == 200:
                         return body
+                    raise urllib.error.HTTPError(url, int(code), "HTTP %s" % code, {}, None)
                 except urllib.error.HTTPError as e:
                     code = e.code
                     try:
@@ -1379,8 +1389,35 @@ class OfflineMarketDataProvider(MarketDataProvider):
         CAPABILITY_MARKET_STATUS: True,
     }
 
-    def __init__(self, base_path, tier=DataTier.HISTORICAL):
-        self.base_path = base_path
+    def __init__(self, base_path=None, tier=DataTier.HISTORICAL, config=None, env=None):
+        cfg = config if isinstance(config, dict) else {}
+        env_map = env if env is not None else os.environ
+        resolved = base_path
+        if resolved is None:
+            for cand in (
+                env_map.get("INDIA_OFFLINE_DIR"),
+                cfg.get("offline_dir"),
+                cfg.get("offline_path"),
+                cfg.get("base_path"),
+            ):
+                if cand:
+                    resolved = cand
+                    break
+        if resolved is None:
+            repo_fixtures = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "tests",
+                "fixtures",
+                "bharat",
+            )
+            if os.path.isdir(repo_fixtures):
+                resolved = repo_fixtures
+        if not resolved or not os.path.exists(str(resolved)):
+            raise ProviderConfigError(
+                "Offline market data provider requires an existing base_path, offline_dir, "
+                "or INDIA_OFFLINE_DIR directory; got %r" % (resolved,)
+            )
+        self.base_path = str(resolved)
         self.tier = tier
         self.parser = YahooMarketDataProvider()
 
@@ -2275,8 +2312,9 @@ class UpstoxMarketDataProvider(MarketDataProvider):
     @classmethod
     def resolve_credentials(cls, config=None, env=None, analytics_token=None):
         """Resolve non-empty Upstox Analytics Token from explicit arg, config, or env."""
-        if analytics_token is not None and str(analytics_token).strip():
-            return str(analytics_token).strip()
+        if analytics_token is not None:
+            cleaned = str(analytics_token).strip()
+            return cleaned if cleaned else None
         cfg = _load_config_dict(config) if config is not None else {}
         creds_map = cfg.get("provider_credentials") or {}
         prov_creds = creds_map.get("upstox") if isinstance(creds_map, dict) else {}
@@ -2627,6 +2665,13 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                     info = None
             except Exception:
                 info = None
+        elif self._http_get_fn is None and exch == "NSE" and hasattr(instruments, "resolve_instrument"):
+            try:
+                cand_info = instruments.resolve_instrument(canon, require_intraday=False)
+                if isinstance(cand_info, dict) and str(cand_info.get("exchange") or "NSE").upper() == "NSE":
+                    info = cand_info
+            except Exception:
+                info = None
         if isinstance(info, dict):
             if info.get("upstox_key"):
                 ikey = str(info["upstox_key"]).strip()
@@ -2921,11 +2966,38 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         }.get(req_mode, "/v3/market-quote/quotes")
 
         resolved_entries = []
-        for s in (symbols or []):
-            ikey, canon, exch = self.resolve_instrument_key(s, exchange=exchange)
-            resolved_entries.append((ikey, canon, exch))
-
         out = {}
+        for s in (symbols or []):
+            try:
+                raw_s = str(s or "").strip()
+                ikey, canon, exch = self.resolve_instrument_key(raw_s, exchange=exchange)
+                resolved_entries.append((ikey, canon, exch))
+            except AuthenticationConfigError:
+                raise
+            except DataError as e:
+                err_sym = str(s or "").strip().upper()
+                try:
+                    if "|" not in err_sym:
+                        err_sym = symbols_in.normalize_symbol(err_sym)
+                except Exception:
+                    pass
+                out[err_sym] = _standardize_payload(
+                    {
+                        "symbol": err_sym,
+                        "exchange": _normalize_exchange(exchange),
+                        "error": str(e),
+                    },
+                    provider_name=self.provider_name,
+                    symbol=err_sym,
+                    exchange=_normalize_exchange(exchange),
+                    data_status=DataStatus.UNAVAILABLE,
+                    tier=DataTier.UNAVAILABLE,
+                    timestamp=None,
+                    is_live=False,
+                    is_simulated=False,
+                    now=now,
+                )
+
         batch_size = 500
         for idx in range(0, len(resolved_entries), batch_size):
             batch = resolved_entries[idx:idx + batch_size]
@@ -2941,9 +3013,27 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                 raise
             data_map = (resp or {}).get("data") or {}
             for ikey, canon, exch in batch:
-                item = self._extract_quote_item(data_map, ikey, canon, exch)
-                if item is not None:
-                    out[canon] = self._normalize_quote_item(item, ikey, canon, exch, now=now, mode=req_mode)
+                try:
+                    item = self._extract_quote_item(data_map, ikey, canon, exch)
+                    if item is not None:
+                        out[canon] = self._normalize_quote_item(item, ikey, canon, exch, now=now, mode=req_mode)
+                except DataError as e:
+                    out[canon] = _standardize_payload(
+                        {
+                            "symbol": canon,
+                            "exchange": exch,
+                            "error": str(e),
+                        },
+                        provider_name=self.provider_name,
+                        symbol=canon,
+                        exchange=exch,
+                        data_status=DataStatus.UNAVAILABLE,
+                        tier=DataTier.UNAVAILABLE,
+                        timestamp=None,
+                        is_live=False,
+                        is_simulated=False,
+                        now=now,
+                    )
         return out
 
     def _parse_upstox_candles(self, raw_candles, unit):
@@ -3054,6 +3144,25 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                         by_ts[bar["ts"]] = bar
                 except SymbolNotFoundError:
                     pass
+            elif is_daily and str(interval or "1d").lower() in ("1d", "d", "daily"):
+                check_dt = cutoff_dt if cutoff_dt is not None else now_dt
+                today_str = today_ist.isoformat()
+                if (
+                    start_date <= today_ist <= end_date
+                    and not any(b.get("date") == today_str for b in by_ts.values())
+                    and _is_daily_session_complete(today_ist, check_dt, exchange=exch)
+                ):
+                    intra_daily_path = "/v3/historical-candle/intraday/%s/days/1" % encoded_key
+                    try:
+                        resp_intra_d = self._request_json(intra_daily_path)
+                        candles_intra_d = ((resp_intra_d or {}).get("data") or {}).get("candles") or []
+                        for bar in self._parse_upstox_candles(candles_intra_d, "days"):
+                            if bar.get("date") == today_str:
+                                by_ts[bar["ts"]] = bar
+                    except AuthenticationConfigError:
+                        raise
+                    except DataError:
+                        pass
         except AuthenticationConfigError:
             if self._allow_yahoo_fallback:
                 if is_daily:
@@ -3066,6 +3175,7 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             raise
 
         bars = sorted(by_ts.values(), key=lambda b: b["ts"])
+        check_dt = cutoff_dt if cutoff_dt is not None else now_dt
         if cutoff_ts is not None:
             filtered = []
             for b in bars:
@@ -3080,6 +3190,14 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                         continue
                 filtered.append(b)
             bars = filtered
+        elif is_daily:
+            bars = [
+                b for b in bars
+                if not (
+                    b.get("date") == check_dt.date().isoformat()
+                    and not _is_daily_session_complete(check_dt.date(), check_dt, exchange=exch)
+                )
+            ]
 
         if not bars:
             raise MissingDataError(
@@ -3253,22 +3371,37 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                     self._meta_by_key[ikey] = item
                     if tsym:
                         self._symbol_by_key[ikey] = tsym
-                        sym_norm = symbols_in.normalize_symbol(tsym) if not symbols_in.is_derivative_symbol(tsym) else tsym.upper()
+                        if symbols_in.is_derivative_symbol(tsym):
+                            sym_norm = tsym.upper()
+                        else:
+                            try:
+                                sym_norm = symbols_in.normalize_symbol(tsym)
+                            except Exception:
+                                sym_norm = tsym.upper()
                         # Prefer EQ / INDEX segments for canonical equity symbol resolution
                         if item["segment"] in ("NSE_EQ", "BSE_EQ", "NSE_INDEX", "BSE_INDEX") or (ex, sym_norm) not in self._key_by_symbol:
                             self._key_by_symbol[(ex, sym_norm)] = ikey
+                        exch_tok = str(rec.get("exchange_token") or "").strip()
+                        if ex == "BSE" and exch_tok.isdigit() and item["segment"] in ("BSE_EQ", "BSE_INDEX"):
+                            if (ex, exch_tok) not in self._key_by_symbol:
+                                self._key_by_symbol[(ex, exch_tok)] = ikey
             self._instruments_by_exch[url_key] = records
 
         filtered = records
         if url_key != "complete":
             filtered = [r for r in filtered if (r.get("exchange") or norm_exch).upper() == norm_exch]
         if symbol:
-            target = symbols_in.normalize_symbol(symbol) if "|" not in str(symbol) else str(symbol).strip().upper()
+            raw_sym = str(symbol).strip().upper()
+            try:
+                target = symbols_in.normalize_symbol(symbol) if "|" not in str(symbol) else raw_sym
+            except Exception:
+                target = raw_sym
             filtered = [
                 r for r in filtered
                 if (r.get("trading_symbol") or "").upper() == target
                 or (r.get("symbol") or "").upper() == target
-                or (r.get("instrument_key") or "").upper() == str(symbol).strip().upper()
+                or str(r.get("instrument_token") or "").strip().upper() == raw_sym
+                or (r.get("instrument_key") or "").upper() == raw_sym
             ]
         return _standardize_payload(
             {

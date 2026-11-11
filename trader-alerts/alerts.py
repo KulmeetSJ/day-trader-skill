@@ -864,6 +864,10 @@ def cmd_readiness(a):
             if provider_caps.get("live_quotes"):
                 quote_desc = "%s (LIVE/CURRENT)" % provider_name
                 data_state = "OK"
+            elif provider_name == "offline":
+                quote_desc = "%s (FIXTURE/HISTORICAL)" % provider_name
+            elif provider_name == "simulated":
+                quote_desc = "%s (SIMULATED)" % provider_name
             else:
                 quote_desc = "%s (DELAYED 15m)" % provider_name
             opt_desc = provider_name if provider_caps.get("option_chains") else "SIMULATED (Black-Scholes)"
@@ -1666,7 +1670,7 @@ def main(argv=None):
         p.add_argument("--source", default=None, help="quote provider override (US: yahoo/stooq; IN: INDIA_MARKET_DATA_PROVIDER/config or yahoo)")
         p.add_argument("--config", default="trader/config.json", help="optional trader config JSON")
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
-        p.add_argument("--now", help="pretend it is this time (no offset = New York time for US, IST for IN)")
+        p.add_argument("--now", help="override the application clock to this time for backtests/tests (no offset = New York time for US, IST for IN; signals marked non-live)")
         p.add_argument("--json", action="store_true")
         p.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
 
@@ -1732,7 +1736,7 @@ def main(argv=None):
     p.add_argument("--config", default="trader/config.json", help="path to config JSON")
     p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
     p.add_argument("--portfolio", default="trader/portfolio.json", help="path to portfolio JSON")
-    p.add_argument("--now", help="pretend market time (e.g. \"2026-10-19 09:00\")")
+    p.add_argument("--now", help="override the application clock to this market time for backtests/tests (e.g. \"2026-10-19 09:00\")")
     p.add_argument("--json", action="store_true", help="output JSON")
     a = ap.parse_args(argv)
     if not a.cmd:

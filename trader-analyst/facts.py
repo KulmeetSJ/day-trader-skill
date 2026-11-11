@@ -57,6 +57,11 @@ except ImportError:
         _alerts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-alerts")
         if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
             sys.path.insert(0, _alerts_dir)
+        try:
+            import env_loader  # type: ignore
+            env_loader.load_project_dotenv()
+        except ImportError:
+            pass
         import symbols_in  # type: ignore
     except ImportError:
         symbols_in = None

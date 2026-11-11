@@ -16,10 +16,15 @@ for mod_dir in ("trader-entry", "trader-exit", "trader-scanner", "trader-alerts"
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import data_in  # noqa: E402
-import entry  # noqa: E402
-import exit as exit_mod  # noqa: E402
-import scan  # noqa: E402
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
+import _load  # noqa: E402,F401
+
+import data_in  # type: ignore  # noqa: E402
+import entry  # type: ignore  # noqa: E402
+import exit as exit_mod  # type: ignore  # noqa: E402
+import scan  # type: ignore  # noqa: E402
 
 
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)

@@ -39,7 +39,7 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit i
 Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
 saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
 `<TICKER>.json`), `--daily PATH` (saved `1d` daily history JSON or folder
-containing `<TICKER>-daily.json` for `--setup breakout_20d`), `--now "2026-10-19 10:15"` (market local time) to replay a day,
+containing `<TICKER>-daily.json` for `--setup breakout_20d`), `--now "2026-10-19 10:15"` (market local time) to override the application clock for replay/backtests (clock-overridden runs are always marked non-live),
 and `--market US|IN`. `watch` with `--now` or `--offline` runs on a simulated
 clock and replays the day bar by bar without waiting.
 

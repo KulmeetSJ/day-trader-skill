@@ -43,7 +43,7 @@ python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
 
 `ticket.py` never talks to a broker. It renders tickets, checks that a reply
 is a real yes for that order, builds the flatten ticket, and keeps the log in
-`trader/state/broker.json`. `--now "2026-10-19 10:15"` pins the clock (market local time).
+`trader/state/broker.json`. `--now "2026-10-19 10:15"` overrides the application clock (market local time) for backtesting and deterministic tests; clock-overridden tickets are always marked non-live (`HISTORICAL`) with a warning.
 
 ## What it reads and writes
 

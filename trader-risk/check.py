@@ -71,6 +71,14 @@ _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
 
+try:
+    import env_loader  # type: ignore
+    env_loader.load_project_dotenv()
+except ImportError:
+    env_loader = None
+if _ALERT_DIR not in sys.path:
+    sys.path.insert(0, _ALERT_DIR)
+
 # Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
     import symbols_in  # type: ignore
@@ -227,10 +235,14 @@ def local_to_utc(local, market="US"):
     return eastern_to_utc(local)
 
 
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+
+
 def parse_now(text, market="US"):
     """ISO time -> naive UTC. A time without an offset is taken as market local time."""
     if not text:
-        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+        return utc_now()
     t = text.strip()
     if t.upper().endswith(" IST"):
         t = t[:-4].strip()
@@ -1009,7 +1021,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             else:
                 order_win_reasons = win_reasons
             is_paper = bool(c.get("paper", True))
-            is_off_hours_allowed = is_paper and (bool(c.get("allow_off_hours")) or bool(o.get("is_historical_analysis")) or bool(plan.get("is_historical_analysis")))
+            o_clock_override = bool(
+                simulated
+                or o.get("clock_override")
+                or plan.get("clock_override")
+                or (isinstance(source_doc, dict) and source_doc.get("clock_override"))
+            )
+            if not is_paper and o_clock_override:
+                later.append("clock: live mode (paper=false) cannot evaluate an order with overridden clock (--now)")
+            hist_flag = o["is_historical_analysis"] if ("is_historical_analysis" in o and o["is_historical_analysis"] is not None) else plan.get("is_historical_analysis")
+            is_off_hours_allowed = is_paper and (bool(c.get("allow_off_hours")) or bool(hist_flag))
             if is_off_hours_allowed and order_win_reasons:
                 tz_label = "IST" if market == "IN" else "New York"
                 stamp = now_local.strftime("%a %Y-%m-%d %H:%M")
@@ -1088,11 +1109,18 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         for pk in ("provider", "data_tier", "data_status", "is_historical_analysis", "is_live_signal",
                    "is_live_data", "is_fixture", "is_simulated", "is_market_open",
                    "last_trading_session", "last_data_timestamp", "signal_freshness",
-                   "simulated_at", "candle_session"):
+                   "simulated_at", "clock_override", "candle_session"):
             if pk in o and o[pk] is not None:
                 res_item[pk] = o[pk]
             elif isinstance(plan, dict) and pk in plan and plan[pk] is not None:
                 res_item[pk] = plan[pk]
+        if simulated or o.get("clock_override") or plan.get("clock_override") or (isinstance(source_doc, dict) and source_doc.get("clock_override")):
+            res_item["clock_override"] = True
+            res_item["is_live_signal"] = False
+            res_item["is_live_data"] = False
+            if str(res_item.get("data_tier") or "").upper() == "CURRENT":
+                res_item["data_tier"] = "HISTORICAL"
+                res_item["is_historical_analysis"] = True
         results.append(res_item)
 
     res = {
@@ -1113,6 +1141,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         res["now_ist"] = now_local.strftime("%Y-%m-%d %H:%M")
     if is_sim_run:
         res["simulated_at"] = _market_iso(now_utc, market=market)
+    if simulated or any(r.get("clock_override") for r in results):
+        res["clock_override"] = True
     if permitted_data_times:
         res["last_data_timestamp"] = _market_iso(max(permitted_data_times), market=market)
     return res
@@ -1199,7 +1229,7 @@ def main(argv=None):
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
     ap.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
     ap.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
-    ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--now", help="override the application clock to this market time for backtests/tests, e.g. \"2026-10-19 10:15\" (marks signals non-live)")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in market local time)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")

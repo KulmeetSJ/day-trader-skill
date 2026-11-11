@@ -1453,7 +1453,7 @@ def _to_ist_aware(now_utc):
 def _fetch_in_provider_series(provider, symbols, rng, interval, pause, exchange="NSE", now=None):
     """Fetch batch daily/intraday series through the abstract MarketDataProvider interface."""
     try:
-        return provider.get_batch_series(
+        res = provider.get_batch_series(
             symbols,
             range_str=rng,
             interval=interval,
@@ -1461,6 +1461,21 @@ def _fetch_in_provider_series(provider, symbols, rng, interval, pause, exchange=
             now=_to_ist_aware(now),
             pause=pause,
         )
+        if isinstance(res, tuple) and len(res) == 2:
+            return res
+        if isinstance(res, dict):
+            failed = {}
+            for sym in (symbols or []):
+                canon = str(sym or "").strip().upper()
+                if "|" not in canon and data_in is not None:
+                    try:
+                        canon = data_in.symbols_in.normalize_symbol(canon)
+                    except Exception:
+                        pass
+                if canon not in res:
+                    failed[canon] = "unavailable"
+            return res, failed
+        return res
     except Exception as e:
         raise ScanError("Provider '%s' error: %s" % (getattr(provider, "provider_name", "unknown"), e))
 
@@ -1677,6 +1692,7 @@ def cmd_daily(a):
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, market=market, strategy_cfg=strategy_cfg)
     if getattr(a, "strategy", None):
         hits = [h for h in hits if a.strategy in h.get("setups", [])]
+        counts["hits"] = len(hits)
     nfailed = len(symbols) - counts["fetched"]
     if not a.offline and counts["fetched"] == 0 and len(symbols) > 0:
         data_status = "UNAVAILABLE"
@@ -1936,7 +1952,7 @@ def main(argv=None):
         p.add_argument("--min-price", type=float, default=min_price)
         p.add_argument("--min-volume", type=int, default=min_volume)
         p.add_argument("--offline", metavar="PATH", help="fixture folder or file instead of the network")
-        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" local, or ...Z)')
+        p.add_argument("--now", help='override the application clock to this time for backtests/tests ("2026-10-19 10:15" local, or ...Z; marks results historical)')
         p.add_argument("--out", default="trader/watchlist.json")
         p.add_argument("--no-write", action="store_true")
         p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)

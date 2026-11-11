@@ -402,31 +402,54 @@ class TestIntradayStrategyHistoricalCandleAnalysis(unittest.TestCase):
         try:
             os.environ["INDIA_MARKET_DATA_PROVIDER"] = "mock_live"
 
-            # 1. Triggered breakout on genuinely current live data during open market
+            # 1. Triggered breakout on genuinely current live data during open market (application clock mocked, no --now)
             LiveCurrentMockProvider.mode = "current"
-            code, out_txt, _ = run_cli(entry_mod, [
-                "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN"
-            ])
-            self.assertEqual(code, 0)
-            self.assertIn("mock_live live provider, CURRENT data", out_txt)
-            self.assertIn("This is the moment to get in", out_txt)
+            now_1035 = entry_mod.parse_now("2026-10-19 10:35", market="IN")
+            with patch.object(entry_mod, "utc_now", return_value=now_1035):
+                code, out_txt, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--market", "IN"
+                ])
+                self.assertEqual(code, 0)
+                self.assertIn("mock_live live provider, CURRENT data", out_txt)
+                self.assertIn("This is the moment to get in", out_txt)
 
-            code_j, out_j, _ = run_cli(entry_mod, [
-                "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN", "--json"
-            ])
+                code_j, out_j, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--market", "IN", "--json"
+                ])
             self.assertEqual(code_j, 0)
             doc_live = json.loads(out_j)
             self.assertEqual(doc_live["provider"], "mock_live")
             self.assertTrue(doc_live["is_market_open"])
             self.assertTrue(doc_live["is_live_data"])
             self.assertTrue(doc_live["is_live_signal"])
+            self.assertFalse(doc_live.get("clock_override", False))
             self.assertEqual(doc_live["data_tier"], "CURRENT")
             self.assertEqual(doc_live["data_status"], "current")
 
+            # 1b. Same live provider with --now clock override: never currently actionable or live
+            with patch.object(entry_mod, "utc_now", return_value=now_1035):
+                code_now, out_now_txt, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN"
+                ])
+                _, out_now_j, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN", "--json"
+                ])
+            self.assertEqual(code_now, 0)
+            self.assertNotIn("This is the moment to get in", out_now_txt)
+            self.assertIn("NOT a current live entry signal", out_now_txt)
+            doc_now = json.loads(out_now_j)
+            self.assertTrue(doc_now["clock_override"])
+            self.assertFalse(doc_now["is_live_data"])
+            self.assertFalse(doc_now["is_live_signal"])
+            self.assertTrue(doc_now["is_historical_analysis"])
+            self.assertEqual(doc_now["data_tier"], "HISTORICAL")
+
             # 2. Watching (no breakout yet at 09:40 IST) on live data: is_live_data=True, is_live_signal=False
-            code_w, out_w, _ = run_cli(entry_mod, [
-                "check", "RELIANCE", "--now", "2026-10-19 09:40", "--market", "IN", "--json"
-            ])
+            now_0940 = entry_mod.parse_now("2026-10-19 09:40", market="IN")
+            with patch.object(entry_mod, "utc_now", return_value=now_0940):
+                code_w, out_w, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--market", "IN", "--json"
+                ])
             self.assertEqual(code_w, 1)
             doc_wait = json.loads(out_w)
             self.assertEqual(doc_wait["status"], "waiting")
@@ -436,9 +459,11 @@ class TestIntradayStrategyHistoricalCandleAnalysis(unittest.TestCase):
             self.assertEqual(doc_wait["data_tier"], "CURRENT")
 
             # 3. Same live provider outside market hours (after close): never live
-            code_c, out_c, _ = run_cli(entry_mod, [
-                "check", "RELIANCE", "--now", "2026-10-19 16:05", "--market", "IN", "--json"
-            ])
+            now_1605 = entry_mod.parse_now("2026-10-19 16:05", market="IN")
+            with patch.object(entry_mod, "utc_now", return_value=now_1605):
+                code_c, out_c, _ = run_cli(entry_mod, [
+                    "check", "RELIANCE", "--market", "IN", "--json"
+                ])
             self.assertEqual(code_c, 0)
             doc_closed = json.loads(out_c)
             self.assertFalse(doc_closed["is_market_open"])
@@ -455,9 +480,10 @@ class TestIntradayStrategyHistoricalCandleAnalysis(unittest.TestCase):
                 ("stale_bars", "waiting", "stale", "DELAYED"),
             ):
                 LiveCurrentMockProvider.mode = bad_mode
-                _, out_b, _ = run_cli(entry_mod, [
-                    "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN", "--json"
-                ])
+                with patch.object(entry_mod, "utc_now", return_value=now_1035):
+                    _, out_b, _ = run_cli(entry_mod, [
+                        "check", "RELIANCE", "--market", "IN", "--json"
+                    ])
                 doc_bad = json.loads(out_b)
                 self.assertEqual(doc_bad["status"], expected_status, bad_mode)
                 self.assertTrue(doc_bad["is_market_open"], bad_mode)

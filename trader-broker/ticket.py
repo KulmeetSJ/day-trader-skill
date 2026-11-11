@@ -48,6 +48,12 @@ if _ALERT_DIR not in sys.path:
 
 # Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
+    import env_loader  # type: ignore
+    env_loader.load_project_dotenv()
+except ImportError:
+    env_loader = None
+
+try:
     import symbols_in  # type: ignore
     import calendar_in  # type: ignore
 except ImportError:
@@ -140,10 +146,14 @@ def local_to_utc(local, market="US"):
     return eastern_to_utc(local)
 
 
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+
+
 def parse_now(text, market="US"):
     """ISO time -> naive UTC. A time without an offset is taken as market local time."""
     if not text:
-        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+        return utc_now()
     t = text.strip()
     if t.upper().endswith(" IST"):
         t = t[:-4].strip()
@@ -717,8 +727,26 @@ SIGNAL_PROVENANCE_KEYS = (
     "provider", "data_tier", "data_status", "is_historical_analysis",
     "is_live_signal", "is_live_data", "is_fixture", "is_simulated",
     "is_market_open", "last_trading_session", "last_data_timestamp",
-    "signal_freshness", "candle_session", "simulated_at",
+    "signal_freshness", "candle_session", "simulated_at", "clock_override",
 )
+
+
+def _is_market_open_at(now_utc, market="US"):
+    """Return True if market continuous trading session is open at now_utc."""
+    if now_utc is None:
+        return True
+    if str(market).upper() == "IN":
+        local_ist = to_local(now_utc, market="IN")
+        if calendar_in is not None:
+            dt_ist = local_ist.replace(tzinfo=calendar_in.IST)
+            return bool(calendar_in.is_market_hours_in(dt_ist, exchange="NSE"))
+        if local_ist.weekday() >= 5:
+            return False
+        return datetime.time(9, 15) <= local_ist.time() < datetime.time(15, 30)
+    local_et = to_eastern(now_utc)
+    if local_et.weekday() >= 5:
+        return False
+    return datetime.time(9, 30) <= local_et.time() < datetime.time(16, 0)
 
 
 def _meta_sources(order, doc=None, risk=None, rv=None):
@@ -740,10 +768,12 @@ def _first_meta(key, sources):
     return None
 
 
-def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated_at=None, last_data_timestamp=None):
+def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated_at=None,
+                      last_data_timestamp=None, clock_override=None, now=None, market=None):
     """Extract and safely classify signal provenance (historical, delayed, fixture, simulated, live, or unverified).
 
-    Delayed/Yahoo, historical, fixture, simulated, and missing/incomplete metadata are NEVER marked as live.
+    Delayed/Yahoo, historical, fixture, simulated, clock-overridden (--now), closed/stale,
+    and missing/incomplete metadata are NEVER marked as live.
     """
     sources = _meta_sources(order, doc=doc, risk=risk, rv=rv)
     provider = _first_meta("provider", sources)
@@ -773,6 +803,7 @@ def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated
     candle_session = _first_meta("candle_session", sources)
     sim_val = simulated_at or _first_meta("simulated_at", sources)
     lts_val = last_data_timestamp or _first_meta("last_data_timestamp", sources)
+    raw_clock_override = _first_meta("clock_override", sources)
 
     fresh_l = str(freshness or "").strip().lower()
     is_yahoo = (prov_l == "yahoo")
@@ -783,9 +814,17 @@ def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated
     order_sim = isinstance(order, dict) and str(order.get("tier") or "").strip().upper() == "SIMULATED"
     is_simulated = bool(raw_sim) or (tier_u == "SIMULATED") or (prov_l == "simulated") or opt_sim or order_sim
     is_historical = bool(raw_hist) or (tier_u == "HISTORICAL") or (status_l == "historical") or (fresh_l == "historical")
+    explicit_clock_override = bool(clock_override) or bool(raw_clock_override)
+    is_clock_override = explicit_clock_override or bool(sim_val)
 
     session_date = str(candle_session or last_session or (str(lts_val)[:10] if lts_val else "") or "").strip()
     is_prior_session = bool(today and re.match(r"^\d{4}-\d{2}-\d{2}$", session_date) and session_date < today)
+    closed_now = bool(now is not None and not _is_market_open_at(now, market=market or "US"))
+    lts_utc = _parse_utc(lts_val) if (now is not None and lts_val) else None
+    stale_now = bool(
+        now is not None and lts_utc is not None
+        and ((now - lts_utc).total_seconds() > 1800 or (now - lts_utc).total_seconds() < -5)
+    )
 
     is_live_data_out = bool(raw_live_data) if raw_live_data is not None else None
     is_fixture_out = True if is_fixture else (bool(raw_fixture) if raw_fixture is not None else None)
@@ -807,13 +846,24 @@ def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated
         if is_live_data_out is not None or raw_live_data:
             is_live_data_out = False
         warning = "SIMULATED SIGNAL -- SYNTHETIC / ANALYTICAL DATA ONLY, NOT A CURRENT ENTRY RECOMMENDATION"
-    elif is_historical or (is_prior_session and (tier_u == "CURRENT" or raw_live_sig is True)):
+    elif (
+        is_historical
+        or (is_prior_session and (tier_u == "CURRENT" or raw_live_sig is True))
+        or (
+            (tier_u == "CURRENT" or raw_live_sig is True)
+            and prov_l not in ("", "unknown", "none", "yahoo", "offline", "simulated", "fixture")
+            and (is_clock_override or closed_now or stale_now)
+        )
+    ):
         classification = "HISTORICAL"
         data_tier = "HISTORICAL"
         is_hist_out = True
         is_live_sig = False
         is_live_data_out = False
-        warning = "HISTORICAL SIGNAL -- NOT A CURRENT ENTRY RECOMMENDATION"
+        if is_clock_override and not is_historical and not is_prior_session:
+            warning = "HISTORICAL SIGNAL (CLOCK OVERRIDDEN BY --now) -- NOT A CURRENT ENTRY RECOMMENDATION"
+        else:
+            warning = "HISTORICAL SIGNAL -- NOT A CURRENT ENTRY RECOMMENDATION"
     elif is_yahoo or tier_u == "DELAYED" or status_l == "delayed":
         classification = "DELAYED"
         data_tier = "DELAYED"
@@ -828,6 +878,9 @@ def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated
         and raw_live_data is not False
         and raw_market_open is not False
         and not is_prior_session
+        and not is_clock_override
+        and not closed_now
+        and not stale_now
     ):
         classification = "LIVE"
         data_tier = "CURRENT"
@@ -859,6 +912,7 @@ def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated
         "signal_freshness": freshness,
         "candle_session": candle_session,
         "simulated_at": sim_val,
+        "clock_override": True if explicit_clock_override else None,
         "last_data_timestamp": lts_val,
         "signal_classification": classification,
         "signal_warning": warning,
@@ -879,15 +933,19 @@ def _signal_summary_line(prov):
         details.append("last_data=%s" % prov["last_data_timestamp"])
     if prov.get("simulated_at"):
         details.append("simulated_at=%s" % prov["simulated_at"])
+    if prov.get("clock_override"):
+        details.append("clock_override=--now")
     return "  signal [%s]: %s" % (prov["signal_classification"], ", ".join(details))
 
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today, market="US", doc=None, simulated_at=None, last_data_timestamp=None):
+def render(order, idx, total, cfg, risk, state, today, market="US", doc=None,
+           simulated_at=None, last_data_timestamp=None, clock_override=None, now=None):
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
-                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp)
+                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp,
+                             clock_override=clock_override, now=now, market=market)
     default_broker = "paper" if market == "IN" else "alpaca"
     broker = str(cfg.get("broker", default_broker)).lower()
     paper = cfg.get("paper", True)
@@ -935,10 +993,12 @@ def render(order, idx, total, cfg, risk, state, today, market="US", doc=None, si
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None, simulated_at=None, last_data_timestamp=None):
+def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None,
+                simulated_at=None, last_data_timestamp=None, clock_override=None, now=None):
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
-                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp)
+                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp,
+                             clock_override=clock_override, now=now, market=market)
     loss, stop = max_loss(order)
     default_broker = "paper" if market == "IN" else "alpaca"
     res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
@@ -970,7 +1030,8 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None, simu
     if order.get("transaction_costs"):
         res["transaction_costs"] = order["transaction_costs"]
     for pk in ("is_live_data", "is_fixture", "is_simulated", "is_market_open",
-               "data_status", "last_trading_session", "signal_freshness", "candle_session"):
+               "data_status", "last_trading_session", "signal_freshness", "candle_session",
+               "clock_override"):
         if prov.get(pk) is not None:
             res[pk] = prov[pk]
     if prov.get("simulated_at"):
@@ -1143,17 +1204,21 @@ def cmd_show(a):
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
     if a.json:
         out = []
+        explicit_now = bool(getattr(a, "now", None))
         for i, o in picks:
-            sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
+            sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=explicit_now)
             out.append(ticket_json(o, i, cfg, risk, state, today, market=market, doc=doc,
-                                   simulated_at=sim_at, last_data_timestamp=lts))
+                                   simulated_at=sim_at, last_data_timestamp=lts,
+                                   clock_override=explicit_now, now=now))
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
+    explicit_now = bool(getattr(a, "now", None))
     for i, o in picks:
-        sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
+        sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=explicit_now)
         text, ready = render(o, i, len(orders), cfg, risk, state, today, market=market, doc=doc,
-                             simulated_at=sim_at, last_data_timestamp=lts)
+                             simulated_at=sim_at, last_data_timestamp=lts,
+                             clock_override=explicit_now, now=now)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -1175,8 +1240,10 @@ def cmd_approve(a):
         print("Not recorded: %s. Ask the user again with the ticket for order %d." % (why, a.index))
         return 1
     loss, stop = max_loss(order)
+    explicit_now = bool(getattr(a, "now", None))
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
-                             simulated_at=sim_at, last_data_timestamp=lts)
+                             simulated_at=sim_at, last_data_timestamp=lts,
+                             clock_override=explicit_now, now=now, market=market)
     default_broker = "paper" if market == "IN" else "alpaca"
     rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fingerprint(order),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
@@ -1420,7 +1487,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def clock(p):
-        p.add_argument("--now", help="pretend it is this market local time, e.g. \"2026-10-19 10:15\"")
+        p.add_argument("--now", help="override the application clock to this market local time for backtests/tests, e.g. \"2026-10-19 10:15\" (marks signals non-live)")
         p.add_argument("--today", help="YYYY-MM-DD (default: today in market local)")
         p.add_argument("--market", choices=["US", "IN"], help="Market (US or IN)")
 

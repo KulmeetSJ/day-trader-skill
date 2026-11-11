@@ -312,16 +312,42 @@ Set `INDIA_MARKET_DATA_PROVIDER` (or `india_market_data_provider` in config, or 
 - `upstox` (optional): Read-only live market data via an Upstox Analytics Token (`UPSTOX_ANALYTICS_TOKEN`). Supports V3 quotes (`quotes`, `ltp`, `ohlc`), V3 historical/intraday candles with automatic lookback chunking, live option chains with Open Interest and Greeks, exchange instrument masters, market status, and V3 WebSocket streaming (`trader-alerts/upstox_feed.py`). No OAuth login flow or live order placement is enabled.
 - `offline`: Local JSON or JSON.GZ bar and quote files for offline analysis and deterministic backtesting.
 
-#### Using Optional Upstox Analytics Token
+#### Option 1: Yahoo-Only Setup (Default, No Credentials Needed)
 
-For users who already have an Upstox read-only Analytics Token (no Upstox account needed otherwise):
+Works immediately after cloning with no `.env` file or API keys:
 
 ```bash
-export INDIA_MARKET_DATA_PROVIDER=upstox
-export UPSTOX_ANALYTICS_TOKEN="<your-readonly-analytics-token>"
+cp trader-budget/config.in.example.json trader/config.json
 python3 trader-alerts/alerts.py readiness --market IN
+python3 trader-alerts/alerts.py quote RELIANCE --market IN
 ```
 
+#### Option 2: Optional Upstox Setup Using `.env`
+
+If you already have an Upstox read-only Analytics Token, create an untracked `.env` file in the project root (`.env` is listed in `.gitignore`):
+
+```dotenv
+INDIA_MARKET_DATA_PROVIDER=upstox
+UPSTOX_ANALYTICS_TOKEN="<your-readonly-analytics-token>"
+```
+
+How `.env` loading works:
+- Tools automatically load `.env` from the project root (never from arbitrary working directories) using Python's standard library only.
+- Supports `KEY=value`, `'single-quoted'`, and `"double-quoted"` values. Does not run shell commands or expand variables, and never prints or logs secret values.
+- Existing process environment variables always override values in `.env`.
+
+Verify Upstox readiness and quotes:
+
+```bash
+python3 trader-alerts/alerts.py readiness --market IN
+python3 trader-alerts/alerts.py quote RELIANCE --market IN
+```
+
+Switch back to free Yahoo data at any time without editing code:
+- Override in your shell for one command (`INDIA_MARKET_DATA_PROVIDER=yahoo python3 trader-alerts/alerts.py readiness --market IN`), or
+- Change `INDIA_MARKET_DATA_PROVIDER=yahoo` (or remove/comment out that line) in `.env`.
+
+Notes on Upstox error handling:
 - Never commit or paste `UPSTOX_ANALYTICS_TOKEN` into tracked files or logs. Credentials are never printed in CLI output or error messages.
 - If `INDIA_MARKET_DATA_PROVIDER=upstox` is selected without a valid token, tools fail explicitly with `AuthenticationConfigError` and never fabricate data or silently fall back to Yahoo.
 - To opt into explicit fallback on auth failure, set `"allow_yahoo_fallback": true` and `"fallback_provider": "yahoo"` in config (or `INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK=1`). Fallback payloads remain strictly tagged `provider: "yahoo"`, `is_live: false`, and `DELAYED`.
@@ -337,13 +363,21 @@ python3 trader-alerts/alerts.py readiness --market IN
 | `BHARAT_DATA_PROVIDER` | Legacy alias for `INDIA_MARKET_DATA_PROVIDER` | `yahoo` |
 | `BHARAT_INSTRUMENTS_CACHE` | Path to local instrument metadata cache | `trader/state/instruments.json` |
 
+### Application Clock Override (`--now`)
+
+Most CLI tools accept `--now "YYYY-MM-DD HH:MM"` (market local time: New York ET for US, IST for `--market IN`; or ISO with `Z`):
+- **Purpose**: `--now` overrides the application clock for historical session replay, lookahead-free backtesting, and deterministic tests.
+- **Safety distinction**: Any run using `--now` marks the evaluation as clock-overridden (`clock_override: true`, `is_live_signal: false`). Even when paired with a live-capable provider, clock-overridden signals are downgraded from `CURRENT` to `HISTORICAL` and are never presented as currently actionable live entry recommendations (`ticket.py show` displays a historical/clock-override warning rather than `LIVE`).
+- **Paper workflows preserved**: Offline fixtures, `DELAYED` Yahoo research, and historical `--now` paper pipelines continue to run end-to-end through `exit.py`, `size.py`, `check.py` (with `paper: true`), and `ticket.py`.
+
 ### Data Quality Tiers
 
 All market data is classified into explicit quality tiers:
 - `DELAYED`: Delayed by 15 minutes (Yahoo Finance). Never treated or presented as real-time.
-- `HISTORICAL`: Completed historical bars from closed trading sessions.
-- `SIMULATED`: Generated or replayed backtest data.
-- `REAL_TIME`: Real-time un-delayed feeds (reserved for authenticated broker connections).
+- `HISTORICAL`: Completed historical bars from closed trading sessions, or clock-overridden `--now` replays.
+- `FIXTURE`: Local offline snapshot files (`--offline`).
+- `SIMULATED`: Generated or synthetic backtest/derivatives data.
+- `CURRENT` / `REAL_TIME`: Live un-delayed feeds (only on live-capable providers during an active session without `--now`).
 
 ### Usage Examples
 

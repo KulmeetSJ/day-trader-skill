@@ -953,15 +953,23 @@ def build_plan(a, now_utc=None):
     for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
               "is_fixture", "data_tier", "last_trading_session", "last_data_timestamp",
               "data_status", "is_simulated", "provider", "signal_freshness",
-              "simulated_at", "candle_session"):
+              "simulated_at", "clock_override", "candle_session"):
         if k in d:
             plan[k] = d[k]
     if chart_last_ts_iso is not None and not plan.get("last_data_timestamp"):
         plan["last_data_timestamp"] = chart_last_ts_iso
+    if explicit_now or d.get("clock_override"):
+        plan["clock_override"] = True
     if simulated:
         plan["simulated_at"] = _market_iso(now_utc, market=market)
     if chart_provider and "provider" not in plan:
         plan["provider"] = chart_provider
+    if plan.get("clock_override"):
+        plan["is_live_signal"] = False
+        plan["is_live_data"] = False
+        if str(plan.get("data_tier") or "").upper() == "CURRENT":
+            plan["data_tier"] = "HISTORICAL"
+            plan["is_historical_analysis"] = True
     if str(plan.get("provider") or "").lower() == "yahoo":
         plan["is_live_signal"] = False
         plan["is_live_data"] = False
@@ -990,8 +998,15 @@ def build_plan(a, now_utc=None):
 
 def describe(plan):
     day = datetime.date.fromisoformat(plan["date"])
-    setup = {"orb": "opening-range breakout", "level": "close above a level",
-             "breakout_20d": "20-day breakout"}.get(plan["setup"], plan["setup"])
+    setup = {
+        "orb": "opening-range breakout",
+        "level": "close above a level",
+        "breakout_20d": "20-day breakout",
+        "ma_crossover": "moving-average crossover",
+        "trend": "trend continuation",
+        "rsi_momentum": "RSI momentum",
+        "options_orb": "options opening-range breakout",
+    }.get(plan["setup"], plan["setup"])
     market = plan.get("market", "US")
     tz_label = "IST" if market == "IN" else "ET"
     e = D(plan["entry"])
@@ -1082,7 +1097,10 @@ def main(argv=None):
     p.add_argument("--or-high", type=float)
     p.add_argument("--or-low", type=float)
     p.add_argument("--or-minutes", type=int, default=15)
-    p.add_argument("--setup", choices=["orb", "level", "breakout_20d"])
+    p.add_argument(
+        "--setup",
+        choices=["orb", "level", "breakout_20d", "ma_crossover", "trend", "rsi_momentum", "options_orb"],
+    )
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")
     p.add_argument("--entry-bar", type=int)
@@ -1097,7 +1115,7 @@ def main(argv=None):
     p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
-    p.add_argument("--now", help='pretend it is this market time, e.g. "2026-10-19 10:15"')
+    p.add_argument("--now", help='override the application clock to this market time for backtests/tests, e.g. "2026-10-19 10:15" (marks signals non-live)')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")
     p.add_argument("--json", action="store_true")

@@ -67,6 +67,12 @@ if _ALERT_DIR not in sys.path:
 
 # Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
+    import env_loader  # type: ignore
+    env_loader.load_project_dotenv()
+except ImportError:
+    env_loader = None
+
+try:
     import symbols_in  # type: ignore
     import calendar_in  # type: ignore
     import instruments  # type: ignore
@@ -107,7 +113,7 @@ PROVENANCE_KEYS = (
     "is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
     "is_fixture", "data_tier", "last_trading_session", "last_data_timestamp",
     "data_status", "is_simulated", "provider", "signal_freshness",
-    "simulated_at", "candle_session",
+    "simulated_at", "clock_override", "candle_session",
 )
 
 
@@ -1648,6 +1654,14 @@ def run_plan(a, cfg):
     sim_iso = _market_iso(now, market=market) if simulated else None
     if sim_iso is not None:
         s["simulated_at"] = sim_iso
+    has_clock_override = bool(explicit_now or (isinstance(plan, dict) and plan.get("clock_override")))
+    if has_clock_override:
+        s["clock_override"] = True
+        s["is_live_signal"] = False
+        s["is_live_data"] = False
+        if str(s.get("data_tier") or "").upper() == "CURRENT":
+            s["data_tier"] = "HISTORICAL"
+            s["is_historical_analysis"] = True
 
     order = build_order(s, cfg=cfg)
     if order and a.write:
@@ -1657,6 +1671,8 @@ def run_plan(a, cfg):
         out_doc = {"sizing": s, "orders": [order] if order else [], "notes": notes}
         if sim_iso is not None:
             out_doc["simulated_at"] = sim_iso
+        if has_clock_override:
+            out_doc["clock_override"] = True
         if s.get("last_data_timestamp") is not None:
             out_doc["last_data_timestamp"] = s.get("last_data_timestamp")
         print(json.dumps(out_doc, indent=2))
@@ -1731,7 +1747,7 @@ def main(argv=None):
     ap.add_argument("--trading-style", choices=["intraday", "positional"],
                     help="override trading style (intraday bracket/day vs positional CNC/NRML GTT OCO)")
     ap.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
-    ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--now", help="override the application clock to this market time for backtests/tests, e.g. \"2026-10-19 10:15\" (marks signals non-live)")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",
                     help="write the proposed order (default trader/orders.json)")
     ap.add_argument("--json", action="store_true", help="print JSON instead of the report")
