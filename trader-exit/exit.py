@@ -10,7 +10,7 @@ It never places an order.
     python3 exit.py plan --symbol NVDA --entry 190.25 --setup level --stop pct:1
     python3 exit.py show                                    # the current trader/plan.json
 
-Stops (a long's stop rounds DOWN to the cent, away from the entry):
+Stops (a long's stop rounds DOWN to the tick: cent/0.01 in US, 0.05 rupee/paise on NSE/BSE, away from the entry):
   or-mid     the opening-range midpoint (the default for an orb entry)
   or-low     the opening-range low
   price:X    your price
@@ -20,7 +20,7 @@ Stops (a long's stop rounds DOWN to the cent, away from the entry):
              bars by then it averages all of them and says so.
   A level setup has no opening-range default: give a stop.
 
-Targets (round half up to the cent):
+Targets (round half up to the tick):
   2R (default), 1R, 1.5R ...   entry + R x risk, where risk = entry - stop
   price:X                      your price
 
@@ -29,10 +29,10 @@ it, a risk under 0.05% of the price (too tight to survive the spread), an
 entry.json that has not triggered (unless you give --entry), a short (v2
 plans longs only).
 
-flat_by (default 15:55, or "flat_by" in trader/config.json): out by then, win
-or lose. On a 1:00 p.m. early close it moves up with the close (12:55).
-"min_reward_risk" in the config (default 1.0) only warns here; trader-risk
-enforces it.
+flat_by (default 15:55 ET for US / 15:20 IST for IN, or "flat_by" in
+trader/config.json): out by then, win or lose. On a 1:00 p.m. NYSE early close
+it moves up with the close (12:55). "min_reward_risk" in the config (default
+1.0) only warns here; trader-risk enforces it.
 
 A stop is a plan, not a guarantee: a gap or a fast market can fill past it.
 Exit codes: plan 0 = a plan, 1 = refused or an error. show 0 = a plan exists.
@@ -177,6 +177,51 @@ def to_local(utc, market="US"):
     if market == "IN":
         return utc.replace(tzinfo=None) + IST_OFFSET
     return to_eastern(utc)
+
+
+def _market_iso(utc_dt, market="US"):
+    if utc_dt is None:
+        return None
+    local = to_local(utc_dt, market=market)
+    if market == "IN":
+        return local.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    off = eastern_offset(utc_dt)
+    sign = "-" if off < 0 else "+"
+    return "%s%s%02d:00" % (local.strftime("%Y-%m-%dT%H:%M:%S"), sign, abs(off))
+
+
+def _to_ist_aware(utc_dt):
+    if utc_dt is None:
+        return None
+    ist_tz = calendar_in.IST if calendar_in is not None else datetime.timezone(IST_OFFSET, "IST")
+    if getattr(utc_dt, "tzinfo", None) is None:
+        return utc_dt.replace(tzinfo=datetime.timezone.utc).astimezone(ist_tz)
+    return utc_dt.astimezone(ist_tz)
+
+
+def _parse_ts_utc(val, market="US"):
+    """Parse an ISO, '... IST', or epoch timestamp into naive UTC datetime."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return utc_of(int(val))
+    t = str(val).strip()
+    is_ist = False
+    if t.upper().endswith(" IST"):
+        t = t[:-4].strip()
+        is_ist = True
+    elif t.upper().endswith(" ET"):
+        t = t[:-3].strip()
+    t = t.replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
+    if is_ist or market == "IN":
+        return dt - IST_OFFSET
+    return eastern_to_utc(dt)
 
 
 def local_to_utc(local, market="US"):
@@ -337,7 +382,7 @@ def parse_stop(text):
         return "or_mid", None
     if t in ("or-low", "or_low", "low"):
         return "or_low", None
-    m = re.match(r"^(price|pct|atr):\s*\$?([0-9][0-9,]*\.?[0-9]*)$", t)
+    m = re.match(r"^(price|pct|atr):\s*(?:\$|\u20b9|rs\.?\s*)?([0-9][0-9,]*\.?[0-9]*)$", t)
     if not m:
         raise PlanError("--stop is or-mid, or-low, price:X, pct:X or atr:K (got %r)" % text)
     kind, val = m.group(1), D(m.group(2), "--stop")
@@ -356,7 +401,7 @@ def parse_target(text):
         if r <= 0:
             raise PlanError("--target needs an R multiple above 0, like 1R or 2R")
         return "r", r
-    m = re.match(r"^price:\s*\$?([0-9][0-9,]*\.?[0-9]*)$", t.lower())
+    m = re.match(r"^price:\s*(?:\$|\u20b9|rs\.?\s*)?([0-9][0-9,]*\.?[0-9]*)$", t.lower())
     if m:
         return "price", D(m.group(1), "--target")
     raise PlanError("--target is 2R, 1R, 1.5R ... or price:X (got %r)" % text)
@@ -495,7 +540,7 @@ def read_text(path):
 _ORIG_YAHOO_GET = yahoo_get
 
 
-def load_chart(sym, interval, day, offline=None, market="US", cfg=None):
+def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=None):
     ysym = (symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else sym.upper().replace(".", "-"))
     if offline:
         path = offline
@@ -524,7 +569,8 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None):
         except Exception as e:
             raise PlanError("Market data provider error: %s" % e)
         use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
-        back = (to_local(utc_now(), market=market).date() - day).days
+        ref_utc = now_utc or utc_now()
+        back = (to_local(ref_utc, market=market).date() - day).days
         rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
         if prov.provider_name == "yahoo" and interval == "1m" and back > 6:
             raise PlanError("Yahoo keeps 1-minute bars for about a week")
@@ -533,12 +579,19 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None):
         else:
             exch = (cfg or {}).get("exchange") or "NSE"
             try:
-                payload = prov.get_intraday_data(sym, interval=interval, range_str=rng, exchange=exch)
+                payload = prov.get_intraday_data(
+                    sym,
+                    interval=interval,
+                    range_str=rng,
+                    exchange=exch,
+                    now=_to_ist_aware(now_utc) if now_utc is not None else None,
+                )
             except Exception as e:
                 raise PlanError(str(e))
             return data_in.to_exit_chart(payload)
     else:
-        back = (to_local(utc_now(), market=market).date() - day).days
+        ref_utc = now_utc or utc_now()
+        back = (to_local(ref_utc, market=market).date() - day).days
         rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
         if interval == "1m" and back > 6:
             raise PlanError("Yahoo keeps 1-minute bars for about a week")
@@ -578,7 +631,17 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None):
         h, lo = at("high", i), at("low", i)
         bars.append({"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo),
                      "c": float(c)})
-    return {"bars": bars, "data_time": meta.get("regularMarketTime")}
+    dt_raw = meta.get("regularMarketTime")
+    if now_utc is not None and market == "IN":
+        step = INTERVALS.get(interval, 300)
+        cutoff_ts = int((now_utc.replace(tzinfo=None) - EPOCH).total_seconds())
+        bars = [b for b in bars if b["t"] + step <= cutoff_ts]
+        if bars:
+            latest_close = min(cutoff_ts, max(b["t"] + step for b in bars))
+            dt_raw = latest_close if (dt_raw is None or int(dt_raw) > cutoff_ts) else int(dt_raw)
+        elif dt_raw is not None and int(dt_raw) > cutoff_ts:
+            dt_raw = None
+    return {"bars": bars, "data_time": dt_raw, "provider": "offline" if offline else "yahoo"}
 
 
 def session_bars(chart, day, interval, upto_slot=None, now_utc=None, market="US"):
@@ -719,10 +782,14 @@ def gather(a):
     return info
 
 
-def build_plan(a, now_utc):
+def build_plan(a, now_utc=None):
     info = gather(a)
     cfg = read_config(a.config)
     market = get_market_profile(a, sym=info["symbol"], doc=info.get("doc"), cfg=cfg)
+    explicit_now = bool(getattr(a, "now", None))
+    if now_utc is None:
+        now_utc = parse_now(getattr(a, "now", None), market=market)
+    simulated = bool(explicit_now or (info.get("doc") or {}).get("simulated_at"))
     if market == "IN" and symbols_in:
         try:
             info["symbol"] = symbols_in.normalize_symbol(info["symbol"])
@@ -792,19 +859,51 @@ def build_plan(a, now_utc):
     else:
         day = to_local(now_utc, market=market).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
+    sim_local = to_local(now_utc, market=market)
+    if explicit_now:
+        if day > sim_local.date():
+            raise PlanError(
+                "Plan date %s is after simulated time %s (look-ahead blocked)"
+                % (day.isoformat(), sim_local.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+        doc_in = info.get("doc") or {}
+        if doc_in.get("last_data_timestamp"):
+            doc_lts_utc = _parse_ts_utc(doc_in.get("last_data_timestamp"), market=market)
+            if doc_lts_utc is not None and doc_lts_utc > now_utc:
+                raise PlanError(
+                    "Entry data timestamp %s is after simulated time %s (look-ahead blocked)"
+                    % (doc_in.get("last_data_timestamp"), _market_iso(now_utc, market=market))
+                )
+    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg_market, entry_time, market=market, trading_style=trading_style)
+    if explicit_now and day == sim_local.date() and entry_time is not None:
+        entry_utc = local_to_utc(datetime.datetime.combine(day, entry_time), market=market)
+        if entry_utc > now_utc:
+            raise PlanError(
+                "Entry time %s on %s is after simulated time %s (look-ahead blocked)"
+                % (ampm(entry_time), day.isoformat(), sim_local.strftime("%Y-%m-%d %H:%M:%S"))
+            )
     atr = atr_n = None
     chart_provider = None
+    chart_last_ts_iso = None
     if stop_rule == "atr":
-        chart = load_chart(info["symbol"], info["interval"], day, a.offline, market=market, cfg=cfg_market)
+        atr_now = now_utc if explicit_now else None
+        chart = load_chart(info["symbol"], info["interval"], day, a.offline, market=market, cfg=cfg_market, now_utc=atr_now)
         chart_provider = chart.get("provider")
-        bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now, market=market) if a.now else None, market=market)
+        bars = session_bars(chart, day, info["interval"], info["entry_bar"], atr_now, market=market)
         if len(bars) < 3:
-            raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
-                            % (info["interval"], info["symbol"], day, len(bars)))
+            raise PlanError(
+                "an atr stop needs at least 3 closed %s bars of %s on %s%s; found %d"
+                % (info["interval"], info["symbol"], day,
+                   " by the cutoff (%s)" % sim_local.strftime("%Y-%m-%d %H:%M:%S") if explicit_now else " by the entry",
+                   len(bars))
+            )
         atr, atr_n = atr_of(bars)
+        last_bar_end = utc_of(bars[-1]["t"] + INTERVALS[info["interval"]])
+        if atr_now is not None and last_bar_end > atr_now:
+            last_bar_end = atr_now
+        chart_last_ts_iso = chart.get("last_data_timestamp") or _market_iso(last_bar_end, market=market)
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n, market=market, tick_size=tick_size)
-    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg_market, entry_time, market=market, trading_style=trading_style)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(round_tick(info["or_high"], tick=c["tick_size"])),
@@ -840,6 +939,10 @@ def build_plan(a, now_utc):
               "data_tier", "last_trading_session", "last_data_timestamp", "data_status", "is_simulated", "provider"):
         if k in d:
             plan[k] = d[k]
+    if chart_last_ts_iso is not None and not plan.get("last_data_timestamp"):
+        plan["last_data_timestamp"] = chart_last_ts_iso
+    if simulated:
+        plan["simulated_at"] = _market_iso(now_utc, market=market)
     if chart_provider and "provider" not in plan:
         plan["provider"] = chart_provider
     warnings = []
@@ -898,8 +1001,7 @@ def describe(plan):
 
 
 def cmd_plan(a):
-    now = parse_now(a.now)
-    plan, warnings = build_plan(a, now)
+    plan, warnings = build_plan(a, None)
     if a.write:
         d = os.path.dirname(a.write)
         if d:

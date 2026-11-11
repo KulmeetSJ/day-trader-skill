@@ -140,7 +140,14 @@ def parse_now(text, market="US"):
     """ISO time -> naive UTC. A time without an offset is taken as market local time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
-    t = text.strip().replace("Z", "+00:00")
+    t = text.strip()
+    if t.upper().endswith(" IST"):
+        t = t[:-4].strip()
+        market = "IN"
+    elif t.upper().endswith(" ET"):
+        t = t[:-3].strip()
+        market = "US"
+    t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
@@ -149,6 +156,92 @@ def parse_now(text, market="US"):
     if dt.tzinfo is None:
         return local_to_utc(dt, market=market)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
+
+
+def _parse_utc(text):
+    if text is None or text == "":
+        return None
+    if isinstance(text, (int, float)):
+        return datetime.datetime.fromtimestamp(int(text), tz=datetime.timezone.utc).replace(tzinfo=None)
+    s = str(text).strip()
+    offset = None
+    upper = s.upper()
+    if upper.endswith(" IST"):
+        s = s[:-4].strip()
+        offset = IST_OFFSET
+    elif upper.endswith(" ET"):
+        s = s[:-3].strip()
+        try:
+            return eastern_to_utc(datetime.datetime.fromisoformat(s))
+        except ValueError:
+            return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
+    elif offset is not None:
+        dt = dt - offset
+    return dt
+
+
+def _parse_clock_time(text):
+    if not text:
+        return None
+    t = str(text).strip().upper()
+    for suffix in (" IST", " ET"):
+        if t.endswith(suffix):
+            t = t[:-len(suffix)].strip()
+    for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.datetime.strptime(t, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _check_no_lookahead(items, now_utc, today, market, strict=False):
+    """Validate that no plan/order/risk timestamp is after now_utc when strict (--now); return latest permitted ISO."""
+    latest_utc = None
+    latest_raw = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("last_data_timestamp",):
+            raw = item.get(key)
+            if raw:
+                dt_utc = _parse_utc(raw)
+                if dt_utc is not None:
+                    if strict and dt_utc > now_utc:
+                        raise TicketError(
+                            "look-ahead blocked: %s %s is after simulated time %s"
+                            % (key, raw, ny_iso(now_utc, market=market))
+                        )
+                    if dt_utc <= now_utc and (latest_utc is None or dt_utc > latest_utc):
+                        latest_utc = dt_utc
+                        latest_raw = raw
+        plan = item.get("plan") if isinstance(item.get("plan"), dict) else item
+        if isinstance(plan, dict) and strict:
+            pdate = str(plan.get("date") or "")
+            if pdate:
+                if pdate > today:
+                    raise TicketError(
+                        "look-ahead blocked: plan date %s is after simulated date %s" % (pdate, today)
+                    )
+                if pdate == today and plan.get("entry_time"):
+                    et_t = _parse_clock_time(plan.get("entry_time"))
+                    if et_t is not None:
+                        et_utc = local_to_utc(
+                            datetime.datetime.combine(datetime.date.fromisoformat(pdate), et_t),
+                            market=market,
+                        )
+                        if et_utc > now_utc:
+                            raise TicketError(
+                                "look-ahead blocked: entry time %s on %s is after simulated time %s"
+                                % (plan.get("entry_time"), pdate, ny_iso(now_utc, market=market))
+                            )
+    return ny_iso(latest_utc, market=market) if latest_utc is not None else latest_raw
 
 
 def get_market_profile(a=None, orders=None, cfg=None, risk=None):
@@ -276,7 +369,7 @@ def is_bracket(order):
 
 
 def max_loss(order):
-    """(dollars, stop) lost if the stop fills exactly at the stop, or (None, stop)."""
+    """(amount lost, stop) if the stop fills exactly at the stop, or (None, stop)."""
     stop = _f(order.get("stop_loss_stop_price")) or _f((order.get("plan") or {}).get("stop"))
     q = _f(order.get("qty"))
     if not stop or not q:
@@ -585,8 +678,11 @@ def render(order, idx, total, cfg, risk, state, today, market="US"):
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
         if is_bracket(order):
-            lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
-            lines.append("  that cancel each other: when one fills, the other is canceled.")
+            if market == "IN":
+                lines.append("  Paper broker records the entry, stop-loss and take-profit as linked bracket legs (paper mode).")
+            else:
+                lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
+                lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
         if broker != "ibkr":
@@ -594,7 +690,7 @@ def render(order, idx, total, cfg, risk, state, today, market="US"):
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today, market="US"):
+def ticket_json(order, idx, cfg, risk, state, today, market="US", simulated_at=None, last_data_timestamp=None):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
     res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
@@ -602,6 +698,9 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US"):
            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
            "tool_input": tool_input(order), "why": order.get("why", ""),
            "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    if market == "IN":
+        res["market"] = "IN"
+        res["currency"] = "INR"
     if order.get("asset_type"):
         res["asset_type"] = order["asset_type"]
     if order.get("contracts"):
@@ -610,6 +709,14 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US"):
         res["lot_size"] = order["lot_size"]
     if order.get("transaction_costs"):
         res["transaction_costs"] = order["transaction_costs"]
+    sim_val = simulated_at or order.get("simulated_at")
+    if sim_val:
+        res["simulated_at"] = sim_val
+    lts_val = last_data_timestamp or order.get("last_data_timestamp") or (
+        order.get("plan").get("last_data_timestamp") if isinstance(order.get("plan"), dict) else None
+    )
+    if lts_val:
+        res["last_data_timestamp"] = lts_val
     return res
 
 
@@ -688,13 +795,30 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None)
     return pf
 
 
-def log_fill(state_path, now, today, symbol, side, qty, price, market="US"):
+def _apply_state_meta(state, sim_at=None, lts=None):
+    if sim_at:
+        state["simulated_at"] = sim_at
+    if lts:
+        state["last_data_timestamp"] = lts
+
+
+def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simulated_at=None, last_data_timestamp=None):
     """A fill in the log, so trader-risk can count day trades (a buy and a sell the same day)."""
     state = load_state(state_path)
-    state.setdefault("orders", []).append({
+    entry = {
         "at": ny_iso(now, market=market), "date": today, "status": "filled", "symbol": symbol.upper(), "side": side,
         "qty": _str_num(float(qty)), "price": float(price),
-        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price))})
+        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price)),
+    }
+    if market == "IN":
+        entry["market"] = "IN"
+        entry["currency"] = "INR"
+    if simulated_at:
+        entry["simulated_at"] = simulated_at
+    if last_data_timestamp:
+        entry["last_data_timestamp"] = last_data_timestamp
+    _apply_state_meta(state, simulated_at, last_data_timestamp)
+    state.setdefault("orders", []).append(entry)
     write_json(state_path, state)
 
 
@@ -708,6 +832,21 @@ def _clock(a, market="US"):
     return now, today
 
 
+def _meta_context(doc, orders, order, risk, now, market, explicit_now=False):
+    items = [doc] if isinstance(doc, dict) else []
+    if isinstance(risk, dict):
+        items.append(risk)
+    if isinstance(order, dict):
+        items.append(order)
+        if isinstance(order.get("plan"), dict):
+            items.append(order["plan"])
+    today = to_local(now, market=market).date().isoformat()
+    lts = _check_no_lookahead(items, now, today, market=market, strict=explicit_now)
+    is_sim = explicit_now or any(isinstance(x, dict) and x.get("simulated_at") for x in items)
+    sim_at = ny_iso(now, market=market) if is_sim else None
+    return sim_at, lts
+
+
 def _load(a):
     doc = read_json(a.orders, "orders file (run trader-budget, or ticket.py flatten, first)")
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
@@ -718,6 +857,15 @@ def _load(a):
     state = load_state(a.state)
     market = get_market_profile(a, orders=orders, cfg=cfg, risk=risk)
     now, today = _clock(a, market=market)
+    items = [doc] if isinstance(doc, dict) else []
+    if isinstance(risk, dict):
+        items.append(risk)
+    for o in orders:
+        if isinstance(o, dict):
+            items.append(o)
+            if isinstance(o.get("plan"), dict):
+                items.append(o["plan"])
+    _check_no_lookahead(items, now, today, market=market, strict=bool(getattr(a, "now", None)))
     return orders, cfg, risk, state, today, now, market
 
 
@@ -731,9 +879,13 @@ def _pick(orders, index):
 
 def cmd_show(a):
     orders, cfg, risk, state, today, now, market = _load(a)
+    doc = read_json(a.orders, "orders file", required=False)
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
     if a.json:
-        out = [ticket_json(o, i, cfg, risk, state, today, market=market) for i, o in picks]
+        out = []
+        for i, o in picks:
+            sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
+            out.append(ticket_json(o, i, cfg, risk, state, today, market=market, simulated_at=sim_at, last_data_timestamp=lts))
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
@@ -750,6 +902,8 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    doc = read_json(a.orders, "orders file", required=False)
+    sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
     ready, label, rv = status_of(order, risk, state, today)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
@@ -763,6 +917,14 @@ def cmd_approve(a):
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order, market=market), "status": "approved", "reply": a.reply,
            "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+    if market == "IN":
+        rec["market"] = "IN"
+        rec["currency"] = "INR"
+    if sim_at:
+        rec["simulated_at"] = sim_at
+    if lts:
+        rec["last_data_timestamp"] = lts
+    _apply_state_meta(state, sim_at, lts)
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order, market=market)))
@@ -779,9 +941,16 @@ def cmd_approve(a):
 def cmd_decline(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    doc = read_json(a.orders, "orders file", required=False)
+    sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
     rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fingerprint(order),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "plain": plain(order, market=market), "status": "declined", "reply": a.reply or "no"}
+    if sim_at:
+        rec["simulated_at"] = sim_at
+    if lts:
+        rec["last_data_timestamp"] = lts
+    _apply_state_meta(state, sim_at, lts)
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded: you said no to order %d (%s). Nothing was sent." % (a.index, plain(order, market=market)))
@@ -791,6 +960,8 @@ def cmd_decline(a):
 def cmd_result(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    doc = read_json(a.orders, "orders file", required=False)
+    sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
     fp = fingerprint(order)
     rec = latest(state, fp, today)
     if not rec or rec.get("status") != "approved":
@@ -811,21 +982,30 @@ def cmd_result(a):
             raise TicketError("filled qty %s exceeds approved order qty %s" % (_str_num(fq), _str_num(max_qty)))
     new = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fp, "symbol": rec["symbol"],
            "side": rec["side"], "plain": rec["plain"], "status": a.status}
-    for k in ("qty", "kind", "max_loss", "stop"):
+    for k in ("qty", "kind", "max_loss", "stop", "market", "currency", "simulated_at", "last_data_timestamp"):
         if rec.get(k) is not None:
             new[k] = rec[k]
+    if sim_at and "simulated_at" not in new:
+        new["simulated_at"] = sim_at
+    if lts and "last_data_timestamp" not in new:
+        new["last_data_timestamp"] = lts
     if a.broker_id:
         new["broker_order_id"] = a.broker_id
     if a.note:
         new["note"] = a.note
     if a.status == "placed" and has_fq:
         apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today, market=market)
+        _apply_state_meta(state, new.get("simulated_at"), new.get("last_data_timestamp"))
         state["orders"].append(new)
         write_json(a.state, state)
-        log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, market=market)
+        log_fill(
+            a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price,
+            market=market, simulated_at=new.get("simulated_at"), last_data_timestamp=new.get("last_data_timestamp"),
+        )
         print("Recorded order %d as %s." % (a.index, a.status))
         print("Added the fill to %s." % a.portfolio)
     else:
+        _apply_state_meta(state, new.get("simulated_at"), new.get("last_data_timestamp"))
         state["orders"].append(new)
         write_json(a.state, state)
         print("Recorded order %d as %s." % (a.index, a.status))
@@ -845,7 +1025,8 @@ def cmd_fill(a):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         raise TicketError("--date wants a date like 2026-10-19")
     pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date, market=market)
-    log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price, market=market)
+    sim_at = ny_iso(now, market=market) if getattr(a, "now", None) else None
+    log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price, market=market, simulated_at=sim_at)
     msg = ("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
                                                                   _money(a.price, market=market), date, a.portfolio,
                                                                   _money(pf["cash"], market=market)))
@@ -869,6 +1050,9 @@ def cmd_flatten(a):
     if market == "US" and (sym.endswith((".NS", ".BO", "-EQ")) or plan.get("market") == "IN"):
         market = "IN"
     now, today = _clock(a, market=market)
+    plan_for_sym = plan if (isinstance(plan, dict) and str(plan.get("symbol", "")).upper() == sym) else {}
+    lts = _check_no_lookahead([plan_for_sym] if plan_for_sym else [], now, today, market=market, strict=bool(getattr(a, "now", None)))
+    sim_at = ny_iso(now, market=market) if (getattr(a, "now", None) or (plan_for_sym and plan_for_sym.get("simulated_at"))) else None
     source = "the broker, get_open_position"
     if a.qty is not None:
         qty = _f(a.qty)
@@ -892,6 +1076,10 @@ def cmd_flatten(a):
     if market == "IN":
         order["market"] = "IN"
         order["currency"] = "INR"
+    if sim_at:
+        order["simulated_at"] = sim_at
+    if lts:
+        order["last_data_timestamp"] = lts
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -900,6 +1088,10 @@ def cmd_flatten(a):
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     if market == "IN":
         doc["market"] = "IN"
+    if sim_at:
+        doc["simulated_at"] = sim_at
+    if lts:
+        doc["last_data_timestamp"] = lts
     write_json(a.orders, doc)
     print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order, market=market), flat_by, time_label))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
@@ -926,7 +1118,7 @@ def cmd_log(a):
         print("No decisions recorded%s." % ("" if a.all else " today"))
         return 1
     for r in rows:
-        r_market = "IN" if r.get("market") == "IN" or "₹" in str(r.get("plain", "")) else market
+        r_market = "IN" if r.get("market") == "IN" or r.get("currency") == "INR" or "\u20b9" in str(r.get("plain", "")) else market
         extra = (" id " + r["broker_order_id"]) if r.get("broker_order_id") else ""
         reply = (' reply "%s"' % r["reply"]) if r.get("reply") and r["status"] in ("approved", "declined") else ""
         loss = (" max loss %s" % _money(r["max_loss"], market=r_market)) if r.get("max_loss") is not None and r["status"] == "placed" else ""

@@ -12,7 +12,7 @@ description: >-
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
   a plan.
-argument-hint: "[budget in dollars]"
+argument-hint: "[budget in USD or INR]"
 ---
 
 # trader-budget
@@ -34,32 +34,32 @@ python3 "${CLAUDE_SKILL_DIR}/size.py" --limit 364.00 --json  # a limit order at 
 python3 "${CLAUDE_SKILL_DIR}/size.py" --weights AAPL=40,KO=60 --config split.json   # weights mode, below
 ```
 
-`--now "2026-10-19 10:15"` pins the clock (New York time). A plan for
-another day is refused: make a new one with trader-exit.
+`--now "2026-10-19 10:15"` pins the clock (market time: New York ET for US, IST for
+`--market IN`). A plan for another day is refused: make a new one with trader-exit.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/config.json` | the rules (start from `config.example.json` in this folder) |
+| `trader/config.json` | the rules (`config.example.json` for US, `config.in.example.json` for India) |
 | `trader/plan.json` | the trade: entry, stop, target, setup, flat-by time (trader-exit writes it) |
 | `trader/prices.json` | optional: a fresh price above the plan's entry means a bigger risk (trader-alerts writes it) |
 | `trader/portfolio.json` | optional: its cash caps the size (trader-broker keeps it) |
-| `trader/orders.json` | the one proposed bracket order it writes with `--write` |
+| `trader/orders.json` | the one proposed bracket order it writes with `--write` (uses INR and neutral keys in India mode) |
 
 ## Step 1: set the rules once
 
-If `trader/config.json` does not exist, copy `config.example.json` into
-`trader/config.json` and ask the user for each value in plain words:
+If `trader/config.json` does not exist, copy `config.example.json` (US) or
+`config.in.example.json` (India) into `trader/config.json` and ask the user for
+each value in plain words:
 
 - **budget**: how much money this is for. Only money they can afford to lose.
 - **cash_buffer_pct**: how much always stays in cash (default 10).
-- **max_loss_per_trade_usd**: the most one trade may lose if the stop fills at the stop (default 50).
-- **max_position_pct**, **max_order_usd**, **min_order_usd**: the biggest position (75% of the
-  budget), the biggest order ($4,000) and the smallest order ($5).
-- The day limits trader-risk enforces: **max_daily_loss_usd** (150), **max_trades_per_day** (3),
+- **max_loss_per_trade_inr** / **max_loss_per_trade_usd** (or neutral **max_loss_per_trade**): the most one trade may lose if the stop fills at the stop (default 50 USD / 2000 INR).
+- **max_position_pct**, **max_order_inr** / **max_order_usd**, **min_order_inr** / **min_order_usd**: the biggest position (75% of the budget), biggest order and smallest order.
+- The day limits trader-risk enforces: **max_daily_loss_inr** / **max_daily_loss_usd**, **max_trades_per_day** (3),
   **min_reward_risk** (1.0), **require_stop** (true), **no_entries_before** / **no_entries_after**
-  ("09:45" / "15:30") and **flat_by** ("15:55"), all New York time.
+  ("09:45" / "15:30" ET for US; "09:30" / "15:00" IST for India) and **flat_by** ("15:55" ET for US; "15:20" IST for India).
 - **blocked**: tickers they never want to trade.
 - Keep **paper** true until they have watched it work on a paper account.
 
@@ -74,9 +74,9 @@ the smallest of four limits:
 
 | limit | shares |
 | --- | --- |
-| max loss | `max_loss_per_trade_usd` / risk a share (entry minus stop) |
+| max loss | `max_loss_per_trade` (`_inr` or `_usd`) / risk a share (entry minus stop) |
 | position cap | budget x `max_position_pct` / entry |
-| max order | `max_order_usd` / entry |
+| max order | `max_order` (`_inr` or `_usd`) / entry |
 | cash | (budget minus the cash buffer) / entry, never more than the cash in `trader/portfolio.json` |
 
 The entry it sizes at: the limit price with `--limit`. For a market order, the
@@ -92,10 +92,10 @@ the reason to the user in one line.
 
 ## Step 3: show the user
 
-Show the four limits, which one decided the size, the shares, the dollars
-and the max loss at the stop. Say plainly that a stop is an order, not a
-promise: in a fast market it can fill below the stop. Then hand over to
-`/trader-risk`.
+Show the four limits, which one decided the size, the shares, the order
+amount (in USD `$` or INR `₹` depending on market) and the max loss at the
+stop. Say plainly that a stop is an order, not a promise: in a fast market it
+can fill below the stop. Then hand over to `/trader-risk`.
 
 ## Example: the reel
 
@@ -132,7 +132,7 @@ the same plan sizes to 6 shares at 8.16 a share, and reward:risk falls to
 here) splits a budget across a list by weight: the cash buffer comes off the
 top, weights are renormalised to 100, any stock over `max_position_pct` is
 pinned at the cap and its excess shared out, slices under the minimum order
-are dropped, and amounts round to whole dollars so nothing is left idle by
+are dropped, and amounts round to whole currency units (dollars or rupees) so nothing is left idle by
 accident. With `"max_position_pct": 25` and `"fractional": true`, the example
 file gives AAPL $1,250 (capped), AXP $1,119, GOOGL $823, KO $708, BAC $600.
 With `"fractional": false` (the example config) it buys whole shares and

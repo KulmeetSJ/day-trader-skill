@@ -529,7 +529,14 @@ def parse_now(text, market="US"):
     """ISO time -> naive UTC. A time without an offset is taken as local market time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
-    t = text.strip().replace("Z", "+00:00")
+    t = text.strip()
+    if t.upper().endswith(" IST"):
+        t = t[:-4].strip()
+        market = "IN"
+    elif t.upper().endswith(" ET"):
+        t = t[:-3].strip()
+        market = "US"
+    t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
@@ -538,6 +545,17 @@ def parse_now(text, market="US"):
     if dt.tzinfo is None:
         return local_to_utc(dt, market=market)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
+
+
+def _market_iso(utc_dt, market="US"):
+    if utc_dt is None:
+        return None
+    local = to_local(utc_dt, market=market)
+    if market == "IN":
+        return local.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    off = eastern_offset(utc_dt)
+    sign = "-" if off < 0 else "+"
+    return "%s%s%02d:00" % (local.strftime("%Y-%m-%dT%H:%M:%S"), sign, abs(off))
 
 
 def parse_hhmm(text, flag="--at", market="US"):
@@ -1151,6 +1169,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strat
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
+    now_ts = int((now_utc.replace(tzinfo=None) - datetime.datetime(1970, 1, 1)).total_seconds())
     for sym in symbols:
         s = data.get(sym)
         if not s:
@@ -1158,10 +1177,30 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strat
         counts["fetched"] += 1
         bars = daily_closes(s, now_utc, market=market)
         meta = s.get("meta") or {}
-        price = meta.get("regularMarketPrice")
-        if price is None and bars:
-            price = bars[-1][1]
-        vol = meta.get("regularMarketVolume")
+        rmt = meta.get("regularMarketTime")
+        meta_is_future = False
+        if market == "IN" and rmt is not None:
+            try:
+                meta_is_future = int(rmt) > now_ts
+            except (TypeError, ValueError):
+                meta_is_future = False
+        if meta_is_future:
+            price = bars[-1][1] if bars else None
+            vols = s.get("v")
+            vol = None
+            if bars and vols:
+                d_last_bar = bars[-1][0]
+                matched_v = [
+                    int(v_i or 0) for ts_i, c_i, v_i in zip(s.get("t") or [], s.get("c") or [], vols)
+                    if ts_i is not None and c_i is not None and ts_to_local(ts_i, market=market).date() == d_last_bar
+                ]
+                if matched_v:
+                    vol = matched_v[-1]
+        else:
+            price = meta.get("regularMarketPrice")
+            if price is None and bars:
+                price = bars[-1][1]
+            vol = meta.get("regularMarketVolume")
         if price is None or price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
             counts["illiquid"] += 1
             continue
@@ -1177,7 +1216,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strat
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
                          "volume": int(vol) if vol is not None else None})
-    hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most dollars traded first
+    hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most traded value first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
     return hits, counts, last_date
@@ -1305,6 +1344,8 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
               "candidates": 0, "confirmed": 0, "unconfirmed": 0}
     hits, failed, cands = [], {}, []
+    cutoff_utc = local_to_utc(cutoff, market=market)
+    cutoff_ts = int((cutoff_utc.replace(tzinfo=None) - datetime.datetime(1970, 1, 1)).total_seconds())
     for sym in symbols:
         s = stage1.get(sym)
         if not s:
@@ -1314,7 +1355,15 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
         if not usable(bars, day, cutoff, n_range, market=market):
             counts["unusable"] += 1
             continue
-        vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
+        if s.get("v"):
+            vol = sum(b["v"] for b in bars)
+        else:
+            meta = s.get("meta") or {}
+            rmt = meta.get("regularMarketTime")
+            if market == "IN" and rmt is not None and int(rmt) > cutoff_ts:
+                vol = 0
+            else:
+                vol = meta.get("regularMarketVolume") or 0
         if bars[-1]["c"] < min_price or vol < min_volume:
             counts["illiquid"] += 1
             continue
@@ -1635,13 +1684,37 @@ def cmd_daily(a):
         first_s = next(iter(data.values()), {})
         data_status = first_s.get("data_status") or "HISTORICAL"
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
+    now_local = to_local(now, market=market)
+    today_local = now_local.date()
+    sess = session(today_local, market=market)
+    today_done = sess is None or now_local.time() >= sess[1]
+    latest_daily_ts = None
+    for s in (data or {}).values():
+        if not isinstance(s, dict):
+            continue
+        for ts_i, c_i in zip(s.get("t") or [], s.get("c") or []):
+            if ts_i is None or c_i is None:
+                continue
+            d_i = ts_to_local(ts_i, market=market).date()
+            if d_i > today_local or (d_i == today_local and not today_done):
+                continue
+            ts_int = int(ts_i)
+            if latest_daily_ts is None or ts_int > latest_daily_ts:
+                latest_daily_ts = ts_int
+    latest_daily_utc = (
+        datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=latest_daily_ts)
+        if latest_daily_ts is not None else None
+    )
     doc_source = "yahoo" if (a.offline or market != "IN") else provider_name
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "market": market, "provider": provider_name, "data_status": data_status,
            "is_live": any(bool(s.get("is_live")) for s in data.values()),
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": doc_source, "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "last_data_timestamp": _market_iso(latest_daily_utc, market=market) if latest_daily_utc else None,
            "note": NOTE, "hits": hits}
+    if a.now:
+        doc["simulated_at"] = _market_iso(now, market=market)
     if failed:
         doc["failed_count"] = len(failed)
     if data_status == "UNAVAILABLE":
@@ -1769,6 +1842,16 @@ def cmd_orb(a):
     )
     tz_label = "IST" if market == "IN" else "ET"
     as_of = "%s %s %s" % (day.isoformat(), cutoff.strftime("%H:%M"), tz_label)
+    cutoff_utc = local_to_utc(cutoff, market=market)
+    latest_bar_utc = None
+    for s in (data or {}).values():
+        if not isinstance(s, dict):
+            continue
+        sb = session_bars(s, day, cutoff, market=market)
+        if sb:
+            bar_end_utc = local_to_utc(sb[-1]["start"] + datetime.timedelta(minutes=BAR_MIN), market=market)
+            if bar_end_utc <= cutoff_utc and (latest_bar_utc is None or bar_end_utc > latest_bar_utc):
+                latest_bar_utc = bar_end_utc
     doc_source = "yahoo" if (a.offline or market != "IN") else provider_name
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
            "market": market, "provider": provider_name, "data_status": data_status,
@@ -1776,7 +1859,11 @@ def cmd_orb(a):
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "unconfirmed": counts["unconfirmed"], "source": doc_source, "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
-           "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
+           "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "last_data_timestamp": _market_iso(latest_bar_utc, market=market) if latest_bar_utc else None,
+           "note": NOTE, "hits": hits}
+    if a.now:
+        doc["simulated_at"] = _market_iso(now, market=market)
     if failed:
         doc["failed_count"] = len(failed)
     if data_status == "UNAVAILABLE":

@@ -41,7 +41,7 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan 
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-10-19 10:15"` (New York time) to pin the clock.
+`--now "2026-10-19 10:15"` (market time: New York ET for US, IST for `--market IN`) to pin the clock.
 
 ## What it reads and writes
 
@@ -54,9 +54,10 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 ## How it works
 
 1. **The pool.** It keeps only FULL sessions before the plan's date: all 78
-   five-minute bars, 9:30 to 4:00 New York time. Half days, gaps and today
-   are left out. Every bar becomes four ratios to the bar before it:
-   open, high, low and close over the previous close.
+   five-minute bars (9:30 to 4:00 ET) for US, or all 75 five-minute bars
+   (9:15 to 15:30 IST) for India. Half days, gaps and today are left out.
+   Every bar becomes four ratios to the bar before it: open, high, low and
+   close over the previous close.
 2. **One replay.** Start at the entry price. For each bar left in the day,
    pick a past bar from the same time of day (plus or minus 2 bars) at
    random, and scale it to the current price. Bar by bar, it checks the stop

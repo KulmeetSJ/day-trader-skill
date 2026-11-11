@@ -37,16 +37,16 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit i
 
 Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
 saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
-`<TICKER>.json`), `--now "2026-10-19 10:15"` (New York time) to replay a day.
-`watch` with `--now` or `--offline` runs on a simulated clock and replays the
-day bar by bar without waiting.
+`<TICKER>.json`), `--now "2026-10-19 10:15"` (market local time) to replay a day,
+and `--market US|IN`. `watch` with `--now` or `--offline` runs on a simulated
+clock and replays the day bar by bar without waiting.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
 | `trader/watchlist.json` | the scanner's hits (`hits[].symbol`), for `watchlist` |
-| `trader/config.json` | `no_entries_before` (09:45) and `no_entries_after` (15:30), New York time. Optional |
+| `trader/config.json` | `no_entries_before` / `no_entries_after` (`09:45`/`15:30` ET for US; `09:30`/`15:00` IST for India). Optional |
 | Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
 | `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range |
 
@@ -60,7 +60,7 @@ day bar by bar without waiting.
   above the level. A wick above is not a trigger. A close exactly at the
   level is not above it.
 - **The time** is that bar's close time (the 10:10 bar closes at 10:15 AM).
-  The price is its close, to the cent.
+  The price is its close, to 0.01 (cent or paise).
 - **Only closed bars count.** A bar is closed when the clock passes its start
   plus 5 (or 1) minutes and Yahoo has caught up to that moment (it waits a
   minute at most). Yahoo's live tick, like 10:49:45, is never a bar.

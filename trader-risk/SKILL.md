@@ -32,7 +32,7 @@ keep each loss and each day's losses small. They do not make a trade win.
 python3 "${CLAUDE_SKILL_DIR}/check.py"                           # trader/ files; writes trader/state/risk.json
 python3 "${CLAUDE_SKILL_DIR}/check.py" --json
 python3 "${CLAUDE_SKILL_DIR}/check.py" --no-write                # look without recording
-python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-10-19 10:15"  # pin the clock (New York time)
+python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-10-19 10:15"  # pin the clock (market time)
 ```
 
 ## What it reads and writes
@@ -40,7 +40,7 @@ python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-10-19 10:15"  # pin the clock
 | file | what |
 | --- | --- |
 | `trader/orders.json` | the proposed orders (trader-budget, or trader-broker's flatten) |
-| `trader/config.json` | the limits (trader-budget ships `config.example.json`) |
+| `trader/config.json` | the limits (trader-budget ships `config.example.json` for US, `config.in.example.json` for India) |
 | `trader/portfolio.json` | cash and holdings; if missing, a fresh account funded with the budget |
 | `trader/prices.json` | a fresh price raises the entry it measures risk from; also values holdings |
 | `trader/state/broker.json` | what was placed today: duplicates, trades per day, daily loss, day trades |
@@ -62,16 +62,16 @@ batch that is fine order by order but breaks a limit together is caught.
 | check | blocks when |
 | --- | --- |
 | format | no symbol, side not buy or sell, both or neither of qty and notional, a notional order that is not market + day (Alpaca's rule), a limit order with no limit price; a bracket that is not whole shares, not `day` or `gtc`, or misses its stop-loss or take-profit |
-| asset | an option symbol while `allow_options` is false; crypto or anything that is not a US stock or ETF ticker |
+| asset | an option symbol while `allow_options` is false; crypto or anything that is not a US/Indian stock, ETF, or allowed derivative |
 | short | a sell of more than you hold (`allow_short` false) |
 | blocked | (entries) the ticker is on the `blocked` list |
-| size | (entries) under `min_order_usd` or over `max_order_usd` |
+| size | (entries) under `min_order` or over `max_order` (`_inr` / `_usd` / neutral) |
 | position | (entries) the stock would be over `max_position_pct` of the account |
 | cash | (entries) the buy would leave less than the cash buffer, or need margin |
 | stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry |
-| loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_usd` |
+| loss | (entries) qty x (entry minus stop) over `max_loss_per_trade` (`_inr` / `_usd` / neutral) |
 | reward:risk | (entries) (target minus entry) / (entry minus stop) under `min_reward_risk` |
-| daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_usd` |
+| daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss` (`_inr` / `_usd` / neutral) |
 | trades | (entries) `max_trades_per_day` entries already placed today |
 | window | (entries) before `no_entries_before` or after `no_entries_after`, or the market is closed |
 | pdt | (entries, only with `pdt_guard` true) 3 day trades already in the last 5 business days |
@@ -86,11 +86,14 @@ How the numbers work:
   understate the risk at 10:55 after the price ran up. An older price is not
   used, and it says so.
 - **Daily loss** counts the full max loss of every entry placed today, win or
-  lose, as trader-broker logged it. Three full-size trades use up a $150 day.
-- **The window** is New York time, worked out in the tool (daylight saving
-  included), never from the computer's clock zone. Weekends and NYSE holidays
-  are closed. On a 1:00 p.m. early close the window ends 3 hours earlier too.
+  lose, as trader-broker logged it. Three full-size trades use up a $150 (US) or ₹5,000 (IN) daily cap.
+- **The window** is market local time, worked out in the tool (New York ET
+  for US with daylight saving; IST for `--market IN`), never from the
+  computer's clock zone. Weekends and exchange holidays (NYSE / NSE) are
+  closed. On a 1:00 p.m. NYSE early close the window ends 3 hours earlier too.
   Set both `no_entries_*` to null to switch the window off.
+- **Currency and JSON keys**: India mode outputs `currency: "INR"`, neutral
+  `value`, and ₹ symbols, and never labels INR amounts as `value_usd`.
 - **pdt_guard** (off by default) counts a day trade as a symbol bought and
   sold on the same day in the log, plus any entry placed today (it is meant
   to be flat by the close). FINRA removed the $25,000 pattern-day-trader

@@ -669,7 +669,7 @@ def parse_chart(data, ticker):
         raise NewsError("chart for %s has no price" % ticker)
     when = meta.get("regularMarketTime")
     tz = meta.get("exchangeTimezoneName") or meta.get("timezone") or ""
-    curr = meta.get("currency") or "USD"
+    curr = meta.get("currency") or ("INR" if is_indian_ticker(ticker) else "USD")
     return {"ticker": ticker, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
             "pct": round((float(price) / float(prev) - 1) * 100, 2),
             "time": _dt.datetime.fromtimestamp(when, _dt.timezone.utc) if when else None,

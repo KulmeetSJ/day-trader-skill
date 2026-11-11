@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Time Machine for trader-timemachine. Standard library only.
 
-Replays a planned day trade before you risk a dollar: 10,000 simulated runs of
-the rest of the session from your entry, plus the same rule on every past
-session in the data.
+Replays a planned day trade before you put capital at risk: 10,000 simulated
+runs of the rest of the session from your entry, plus the same rule on every
+past session in the data.
 
     python3 timemachine.py run                          # trader/plan.json, 10,000 replays, seed 19
     python3 timemachine.py run --write                  # also save trader/timemachine.json
@@ -15,19 +15,19 @@ session in the data.
     python3 timemachine.py chart --from trader/timemachine.json
 
 How the replays work (the reel's sim.py, same algorithm, same random draws):
-  1. Fetch 60 days of 5-minute bars (Yahoo v8 chart, range=60d interval=5m;
-     one request). Keep only FULL sessions before the plan's date: 78 bars,
-     9:30 to 4:00 New York time. Half days, gaps and today are left out.
-  2. The pool: for every bar slot 1..77 of the day, each past session's bar as
+  1. Fetch 60 days of 5-minute bars (range=60d interval=5m). Keep only FULL
+     sessions before the plan's date (78 bars 9:30-16:00 ET for US; 75 bars
+     9:15-15:30 IST for India). Half days, gaps and today are left out.
+  2. The pool: for every bar slot 1..N-1 of the day, each past session's bar as
      ratios to the previous bar's close: (open, high, low, close) / prev close.
   3. One replay starts at the entry price and walks the rest of the session.
      For each bar i it picks a slot j = i + randint(-window, window), kept in
-     1..77, then one past bar from pool[j] (random.choice), and scales it to
+     1..N-1, then one past bar from pool[j] (random.choice), and scales it to
      the current price. The stop is checked before the target in every bar,
      so a bar that touches both counts as the stop (the conservative call).
   4. Outcomes: "target" or "stop" (whichever was touched first), or "neither"
-     when the trade is still open at --until (default 16:00, the close, or
-     13:00 on an NYSE early-close day).
+     when the trade is still open at --until (default market close: 16:00 ET
+     or 13:00 on an NYSE early-close day; 15:30 IST for NSE/BSE).
      "green" = target first, or above the entry at --until (below for a sell).
      R = the target's R at the target, -1 at the stop, otherwise
      (price at --until - entry) / risk. A gap through the stop still counts
@@ -190,11 +190,35 @@ def local_to_utc(local, market="US"):
     return eastern_to_utc(local)
 
 
+def _market_iso(utc, market="US"):
+    if utc is None:
+        return None
+    if market == "IN":
+        return to_local(utc, market="IN").strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    dt = to_eastern(utc)
+    hours = int(round((utc - dt).total_seconds() / 3600))
+    return "%s-%02d:00" % (dt.strftime("%Y-%m-%dT%H:%M:%S"), hours)
+
+
 def parse_now(text, market="US"):
     """ISO time -> naive UTC. A time without an offset is taken as market local time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
-    t = text.strip().replace("Z", "+00:00")
+    raw = text.strip()
+    upper = raw.upper()
+    if upper.endswith(" IST"):
+        t = raw[:-4].strip() + "+05:30"
+    elif upper.endswith(" ET"):
+        t = raw[:-3].strip()
+        try:
+            dt = datetime.datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                return eastern_to_utc(dt)
+            return (dt - dt.utcoffset()).replace(tzinfo=None)
+        except ValueError:
+            raise TMError('--now wants a time like "2026-10-19 10:15" (New York) or ...Z (UTC)')
+    else:
+        t = raw.replace("Z", "+00:00").replace("z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
@@ -203,6 +227,22 @@ def parse_now(text, market="US"):
     if dt.tzinfo is None:
         return local_to_utc(dt, market=market)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
+
+
+def _parse_utc(text, market="US"):
+    if not text:
+        return None
+    try:
+        return parse_now(str(text), market=market)
+    except TMError:
+        return None
+
+
+def _bar_end_utc(bar, market="US"):
+    d = datetime.date.fromisoformat(bar["date"])
+    hh, mm = [int(x) for x in bar["start"].split(":")]
+    end_local = datetime.datetime(d.year, d.month, d.day, hh, mm) + datetime.timedelta(minutes=5)
+    return local_to_utc(end_local, market=market)
 
 
 def utc_of(ts):
@@ -489,9 +529,12 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
 # ---------------------------------------------------------------- stop rules and the history replay
 
 def cents_away(x, long):
-    """Round a stop to the cent, away from the entry: down for a buy, up for a sell."""
+    """Round a stop to 0.01 sub-units (cent or paise), away from the entry: down for a buy, up for a sell."""
     c = round(x * 100, 4)
     return (math.floor(c) if long else math.ceil(c)) / 100.0
+
+
+round_stop_away = cents_away
 
 
 def opening_range(D, n):
@@ -564,14 +607,14 @@ def _num(v, what):
     return x
 
 
-def load_plan(a, now_utc):
+def load_plan(a, now_utc, default_market=None):
     """The plan from --plan (trader/plan.json) or from the flags, checked and normalized."""
     market = getattr(a, "market", None)
     if not market and getattr(a, "symbol", None):
         sym = a.symbol.upper()
         if sym.endswith((".NS", ".BO", "-EQ")) or ("-" in sym or "&" in sym):
             market = "IN"
-    market = market or "US"
+    market = market or default_market or "US"
     if a.symbol:
         missing = [f for f in ("entry", "stop", "target", "entry_time") if getattr(a, f) is None]
         if missing:
@@ -669,6 +712,10 @@ def normalize_plan(raw, src="flags", market=None):
     }
     if market == "IN":
         res_plan["market"] = "IN"
+    if raw.get("last_data_timestamp"):
+        res_plan["last_data_timestamp"] = raw["last_data_timestamp"]
+    if raw.get("simulated_at"):
+        res_plan["simulated_at"] = raw["simulated_at"]
     return res_plan
 
 
@@ -800,7 +847,7 @@ def _bars_from_provider_payload(payload, sym, now_utc, market="IN"):
     return meta, [bars[t] for t in sorted(bars)], dropped
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", simulated=False):
     """Chart JSON text (or normalized data_in payload) + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
@@ -827,6 +874,8 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     gran = meta.get("dataGranularity")
     if gran and gran != "5m":
         raise TMError("the data has %s bars; the time machine needs 5-minute bars" % gran)
+    if bars and (simulated or market == "IN") and now_utc is not None:
+        bars = [b for b in bars if _bar_end_utc(b, market=market) <= now_utc]
     if not bars:
         raise TMError("no complete 5-minute bars for %s in the data" % sym)
     k = plan["entry_bar"]
@@ -871,13 +920,19 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
                            "this plan's setup is %r" % plan["setup"]}
     last_bar = bars[-1]
+    last_ts_utc = _bar_end_utc(last_bar, market=market)
+    if now_utc is not None and last_ts_utc > now_utc:
+        last_ts_utc = now_utc
+    last_data_iso = _market_iso(last_ts_utc, market=market)
     out = {
         "created_by": "trader-timemachine",
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
         "provider": source,
+        "last_data_timestamp": last_data_iso,
         "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
                  "last_bar": "%s %s %s" % (last_bar["date"], last_bar["start"], tz_label),
+                 "last_data_timestamp": last_data_iso,
                  "dropped": dropped, "short_sessions_left_out": short},
         "plan": plan_out,
         "mc": mc,
@@ -888,6 +943,11 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
     }
+    if market == "IN":
+        out["market"] = "IN"
+        out["currency"] = "INR"
+    if simulated or plan.get("simulated_at"):
+        out["simulated_at"] = _market_iso(now_utc, market=market) if simulated else plan.get("simulated_at")
     if provider_status:
         out["data_status"] = provider_status
     return out
@@ -1029,20 +1089,61 @@ def _read_cfg_dict(path):
         return {}
 
 
+def _peek_plan_market(a):
+    if not getattr(a, "symbol", None) and getattr(a, "plan", None) and os.path.exists(a.plan):
+        try:
+            with open(a.plan, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                if raw.get("market") in ("US", "IN"):
+                    return raw["market"]
+                if raw.get("exchange") in ("NSE", "BSE"):
+                    return "IN"
+                sym = str(raw.get("symbol") or "").upper()
+                if sym.endswith((".NS", ".BO", "-EQ")) or ("-" in sym or "&" in sym):
+                    return "IN"
+        except (OSError, ValueError, TypeError):
+            pass
+    return None
+
+
 def compute(a):
+    cfg = _read_cfg_dict(getattr(a, "config", "trader/config.json"))
     market = getattr(a, "market", None)
     if not market and getattr(a, "symbol", None):
         sym = a.symbol.upper()
         if sym.endswith((".NS", ".BO", "-EQ")) or ("-" in sym or "&" in sym):
             market = "IN"
+    if not market:
+        market = _peek_plan_market(a) or cfg.get("market")
     market = market or "US"
     now = parse_now(a.now, market=market)
-    plan = load_plan(a, now)
+    plan = load_plan(a, now, default_market=market)
     plan_market = plan.get("market") or market
+    if getattr(a, "now", None) and plan_market != market:
+        now = parse_now(a.now, market=plan_market)
+    if getattr(a, "now", None):
+        if plan.get("last_data_timestamp"):
+            p_ts = _parse_utc(plan["last_data_timestamp"], market=plan_market)
+            if p_ts is not None and p_ts > now:
+                raise TMError("look-ahead blocked: plan %s uses data from %s, after --now %s"
+                              % (plan.get("from", "plan"), plan["last_data_timestamp"],
+                                 _market_iso(now, market=plan_market)))
+        p_date = datetime.date.fromisoformat(plan["date"])
+        now_local = to_local(now, market=plan_market)
+        if p_date > now_local.date():
+            raise TMError("look-ahead blocked: plan date %s is after --now %s"
+                          % (plan["date"], _market_iso(now, market=plan_market)))
+        if plan.get("entry_time"):
+            cmin = parse_clock(plan["entry_time"], "entry_time", market=plan_market)
+            entry_utc = local_to_utc(datetime.datetime(p_date.year, p_date.month, p_date.day, cmin // 60, cmin % 60),
+                                     market=plan_market)
+            if entry_utc > now:
+                raise TMError("look-ahead blocked: plan entry %s %s is after --now %s"
+                              % (plan["date"], plan["entry_time"], _market_iso(now, market=plan_market)))
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     elif plan_market == "IN" and data_in is not None:
-        cfg = _read_cfg_dict(getattr(a, "config", "trader/config.json"))
         try:
             prov = data_in.get_provider(config=cfg)
         except Exception as e:
@@ -1064,7 +1165,8 @@ def compute(a):
             source = prov.provider_name
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source,
+                        simulated=bool(getattr(a, "now", None)))
 
 
 def cmd_run(a):
@@ -1107,7 +1209,7 @@ def main(argv=None):
         p.add_argument("--plan", default="trader/plan.json", help="the plan from trader-exit")
         p.add_argument("--symbol", help="or give the plan as flags: ticker")
         p.add_argument("--side", default="buy", choices=["buy", "sell"])
-        p.add_argument("--date", help="the plan's day, YYYY-MM-DD (default today, New York)")
+        p.add_argument("--date", help="the plan's day, YYYY-MM-DD (default today, market time)")
         p.add_argument("--entry", type=float)
         p.add_argument("--stop", type=float)
         p.add_argument("--target", type=float)
@@ -1118,11 +1220,11 @@ def main(argv=None):
         p.add_argument("--replays", type=int, default=10000)
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
-        p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--until", help="end each replay at this time (default market close: 16:00 ET or 15:30 IST)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--config", default="trader/config.json", help="optional trader config JSON")
         p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
-        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
+        p.add_argument("--now", help='pretend it is this market time ("2026-10-19 10:15", or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)

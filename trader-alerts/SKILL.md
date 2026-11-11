@@ -41,8 +41,8 @@ python3 "${CLAUDE_SKILL_DIR}/alerts.py" list
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset tsla-plan-stop
 ```
 
-`--now "2026-10-19 15:55"` pins the clock (New York time); `--offline DIR`
-reads saved quote files instead of the network.
+`--now "2026-10-19 15:55"` pins the clock (market time: New York ET for US,
+IST for `--market IN`); `--offline DIR` reads saved quote files instead of the network.
 
 ## What it reads and writes
 
@@ -61,12 +61,12 @@ reads saved quote files instead of the network.
 | `above` / `target` | price at or above `price` | after `reset`, or on its own if `"rearm": true` and the price fell back |
 | `below` / `stop` | price at or below `price` | same |
 | `pct_move` | moved `pct` percent from the previous close (or `ref`), optional `direction` up or down | once per day at most |
-| `time` | the New York clock passed `at` ("15:55") on a trading day | once per trading day |
-| `opening_bell` | the NYSE is open | once per trading day |
+| `time` | the market clock passed `at` on a trading day (New York ET for US, IST for IN) | once per trading day |
+| `opening_bell` | the NYSE (or NSE/BSE with `--market IN`) is open | once per trading day |
 
-A rule with `"date"` is watched on that New York date only; `--from-plan`
+A rule with `"date"` is watched on that market date only; `--from-plan`
 rules carry the plan's date, so yesterday's stop never rings today. A `time`
-rule with `"before_close": true` moves 3 hours earlier on a 1:00 p.m. early
+rule with `"before_close": true` moves 3 hours earlier on a 1:00 p.m. NYSE early
 close, so "flat by close" at 15:55 rings at 12:55 on those days.
 
 ## Quotes

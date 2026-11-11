@@ -8,6 +8,7 @@ Python 3.8 compatible without third-party dependencies.
 
 import datetime
 import gzip
+import inspect
 import json
 import math
 import os
@@ -157,6 +158,156 @@ def _format_ist(ts):
         return ""
 
 
+def _format_ist_iso(ts):
+    if ts is None:
+        return None
+    try:
+        dt_ist = datetime.datetime.fromtimestamp(int(ts), tz=calendar_in.IST)
+        return dt_ist.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    except Exception:
+        return None
+
+
+def _parse_cutoff_ts(now):
+    """Parse an optional cutoff (datetime/date/str/epoch) into (dt_ist, epoch_ts)."""
+    if now is None:
+        return None, None
+    if isinstance(now, (int, float)):
+        dt_ist = datetime.datetime.fromtimestamp(int(now), tz=calendar_in.IST)
+        return dt_ist, int(dt_ist.timestamp())
+    if isinstance(now, datetime.date) and not isinstance(now, datetime.datetime):
+        # Interpret a plain date cutoff as end-of-day IST
+        dt_ist = datetime.datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=calendar_in.IST)
+        return dt_ist, int(dt_ist.timestamp())
+    dt_ist = calendar_in.parse_ist(now)
+    return dt_ist, int(dt_ist.timestamp())
+
+
+def _interval_to_seconds(interval):
+    m = re.match(r"^(\d+)([smhd])$", str(interval or "5m").strip())
+    if not m:
+        return None
+    val, unit = int(m.group(1)), m.group(2)
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def _is_daily_session_complete(session_date, cutoff_dt_ist, exchange="NSE"):
+    """Return True if a daily bar for session_date is complete by cutoff_dt_ist."""
+    if cutoff_dt_ist is None:
+        return True
+    cutoff_date = cutoff_dt_ist.date()
+    if session_date < cutoff_date:
+        return True
+    if session_date > cutoff_date:
+        return False
+    hrs = calendar_in.get_segment_session_hours(
+        calendar_in.MarketSegment.CASH_EQUITY, session_date, exchange=exchange
+    )
+    close_str = hrs.get("cas_close") or hrs.get("continuous_close") or "15:30"
+    close_dt = calendar_in.parse_ist(
+        "%s %s:00" % (session_date.strftime("%Y-%m-%d"), str(close_str)[:5])
+    )
+    return cutoff_dt_ist >= close_dt
+
+
+def _sanitize_meta_as_of(meta, bars, cutoff_ts, interval_secs=None, daily=False):
+    """Strip or clamp Yahoo meta quote fields so nothing after cutoff_ts leaks through."""
+    m = dict(meta or {})
+    if cutoff_ts is None:
+        return m
+    cutoff_ts = int(cutoff_ts)
+    if not bars:
+        for k in (
+            "regularMarketPrice",
+            "regularMarketTime",
+            "regularMarketDayHigh",
+            "regularMarketDayLow",
+            "regularMarketVolume",
+            "regularMarketOpen",
+            "postMarketPrice",
+            "preMarketPrice",
+        ):
+            m.pop(k, None)
+        return m
+
+    last = bars[-1]
+    last_ts = last.get("ts") if last.get("ts") is not None else last.get("t")
+    if last_ts is not None:
+        last_ts = int(last_ts)
+        last_close_ts = last_ts if daily else min(cutoff_ts, last_ts + int(interval_secs or 0))
+    else:
+        last_close_ts = None
+
+    rmt = m.get("regularMarketTime")
+    needs_sanitize = rmt is None
+    if rmt is not None:
+        try:
+            needs_sanitize = int(rmt) > cutoff_ts
+        except (TypeError, ValueError):
+            needs_sanitize = True
+
+    if needs_sanitize:
+        m.pop("postMarketPrice", None)
+        m.pop("preMarketPrice", None)
+        if daily:
+            m["regularMarketPrice"] = last.get("c")
+            m["regularMarketOpen"] = last.get("o")
+            m["regularMarketDayHigh"] = last.get("h")
+            m["regularMarketDayLow"] = last.get("l")
+            m["regularMarketVolume"] = last.get("v")
+        else:
+            last_date = last.get("date")
+            day_bars = [b for b in bars if b.get("date") == last_date] if last_date else [last]
+            if not day_bars:
+                day_bars = [last]
+            m["regularMarketOpen"] = day_bars[0].get("o")
+            m["regularMarketDayHigh"] = max(b.get("h") for b in day_bars if b.get("h") is not None)
+            m["regularMarketDayLow"] = min(b.get("l") for b in day_bars if b.get("l") is not None)
+            m["regularMarketPrice"] = day_bars[-1].get("c")
+            m["regularMarketVolume"] = sum(int(b.get("v") or 0) for b in day_bars)
+        if last_close_ts is not None:
+            m["regularMarketTime"] = last_close_ts
+    return m
+
+
+def _call_with_optional_now(fn, *args, now=None, **kwargs):
+    """Invoke provider methods supporting optional `now` while remaining backward compatible."""
+    if now is None:
+        return fn(*args, **kwargs)
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        accepts_now = "now" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_now = False
+    if accepts_now:
+        return fn(*args, now=now, **kwargs)
+    return fn(*args, **kwargs)
+
+
+def _validate_quote_as_of(q, now, symbol=None):
+    """Ensure a quote/LTP/OHLC payload is not timestamped after `now`."""
+    if now is None or not isinstance(q, dict):
+        return q
+    if q.get("error") and q.get("data_status") == DataStatus.UNAVAILABLE:
+        return q
+    _, cutoff_ts = _parse_cutoff_ts(now)
+    q_ts = q.get("timestamp")
+    if q_ts is not None:
+        try:
+            q_ts_int = int(q_ts)
+        except (TypeError, ValueError):
+            q_ts_int = None
+        if q_ts_int is not None and cutoff_ts is not None and q_ts_int > cutoff_ts:
+            raise MissingDataError(
+                "Quote timestamp %s is after simulated cutoff %s for %s"
+                % (_format_ist(q_ts_int), _format_ist(cutoff_ts), symbol or q.get("symbol", ""))
+            )
+    return q
+
+
 def _compute_freshness(timestamp, data_status, now=None):
     """Compute standardized freshness metadata from epoch timestamp and data_status."""
     now_dt = calendar_in.parse_ist(now) if now else calendar_in.now_ist()
@@ -218,6 +369,13 @@ def _standardize_payload(payload, provider_name, symbol=None, exchange="NSE",
     out["is_live"] = bool(is_live)
     out["is_simulated"] = bool(is_simulated)
     out["is_real_time"] = bool(is_live)
+    out["last_data_timestamp"] = out.get("last_data_timestamp") or (
+        _format_ist_iso(ts) if ts is not None else None
+    )
+    if now is not None:
+        _, cutoff_ts = _parse_cutoff_ts(now)
+        if cutoff_ts is not None:
+            out["simulated_at"] = _format_ist_iso(cutoff_ts)
     return out
 
 
@@ -283,13 +441,17 @@ class MarketDataProvider:
             "is_simulated": False,
         }
 
-    def get_quote(self, symbol, exchange="NSE"):
+    def get_quote(self, symbol, exchange="NSE", now=None):
         """Fetch current or delayed quote for a single symbol."""
         raise NotImplementedError
 
-    def get_ltp(self, symbol, exchange="NSE"):
+    def get_ltp(self, symbol, exchange="NSE", now=None):
         """Fetch standardized Last Traded Price payload for a single symbol."""
-        q = self.get_quote(symbol, exchange=exchange)
+        q = _validate_quote_as_of(
+            _call_with_optional_now(self.get_quote, symbol, exchange=exchange, now=now),
+            now,
+            symbol=symbol,
+        )
         ltp = q.get("ltp") if q.get("ltp") is not None else q.get("price")
         if ltp is None:
             raise MissingDataError("No LTP available for %s" % symbol)
@@ -316,11 +478,16 @@ class MarketDataProvider:
             timestamp=q.get("timestamp"),
             is_live=q.get("is_live", False),
             is_simulated=q.get("is_simulated", False),
+            now=now,
         )
 
-    def get_ohlc(self, symbol, exchange="NSE", interval="1d"):
+    def get_ohlc(self, symbol, exchange="NSE", interval="1d", now=None):
         """Fetch standardized OHLC snapshot for a symbol."""
-        q = self.get_quote(symbol, exchange=exchange)
+        q = _validate_quote_as_of(
+            _call_with_optional_now(self.get_quote, symbol, exchange=exchange, now=now),
+            now,
+            symbol=symbol,
+        )
         close_px = q.get("close") if q.get("close") is not None else q.get("price")
         canon = q.get("symbol") or symbols_in.normalize_symbol(symbol)
         exch = q.get("exchange") or _normalize_exchange(exchange)
@@ -350,15 +517,20 @@ class MarketDataProvider:
             timestamp=q.get("timestamp"),
             is_live=q.get("is_live", False),
             is_simulated=q.get("is_simulated", False),
+            now=now,
         )
 
-    def get_quotes(self, symbols, exchange="NSE"):
+    def get_quotes(self, symbols, exchange="NSE", now=None):
         """Fetch quotes for a collection of symbols with per-ticker error isolation."""
         quotes = {}
         for s in symbols:
             canon = symbols_in.normalize_symbol(s)
             try:
-                quotes[canon] = self.get_quote(s, exchange=exchange)
+                quotes[canon] = _validate_quote_as_of(
+                    _call_with_optional_now(self.get_quote, s, exchange=exchange, now=now),
+                    now,
+                    symbol=canon,
+                )
             except DataError as e:
                 quotes[canon] = _standardize_payload(
                     {
@@ -374,6 +546,7 @@ class MarketDataProvider:
                     timestamp=None,
                     is_live=False,
                     is_simulated=False,
+                    now=now,
                 )
         return quotes
 
@@ -396,6 +569,13 @@ class MarketDataProvider:
                 filtered.append(b)
             res = dict(res)
             res["bars"] = filtered
+            if filtered:
+                last_ts = filtered[-1].get("ts")
+                res["timestamp"] = last_ts
+                res["last_data_timestamp"] = _format_ist_iso(last_ts)
+            else:
+                res["timestamp"] = None
+                res["last_data_timestamp"] = None
         return res
 
     def get_intraday_data(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
@@ -666,6 +846,9 @@ class YahooMarketDataProvider(MarketDataProvider):
                             norm = self.normalize_intraday_bars(single_text, canon, exchange=exch, interval=interval, now=now)
                         got[canon] = to_scanner_series(norm)
                     else:
+                        now_dt_spark, cutoff_ts_spark = _parse_cutoff_ts(now)
+                        is_daily_spark = interval in ("1d", "d", "daily")
+                        iv_secs_spark = None if is_daily_spark else (_interval_to_seconds(interval) or 300)
                         stamps = resp[0].get("timestamp") or []
                         closes_raw = q_ind.get("close") if isinstance(q_ind.get("close"), list) else []
                         vols_raw = q_ind.get("volume") if isinstance(q_ind.get("volume"), list) else None
@@ -674,16 +857,49 @@ class YahooMarketDataProvider(MarketDataProvider):
                         for idx, raw_ts in enumerate(stamps):
                             if raw_ts is None:
                                 continue
+                            ts_int = int(raw_ts)
+                            if now_dt_spark is not None:
+                                if is_daily_spark:
+                                    d_bar = datetime.datetime.fromtimestamp(ts_int, tz=calendar_in.IST).date()
+                                    if not _is_daily_session_complete(d_bar, now_dt_spark, exchange=exch):
+                                        continue
+                                elif cutoff_ts_spark is not None and ts_int + iv_secs_spark > cutoff_ts_spark:
+                                    continue
                             raw_c = closes_raw[idx] if idx < len(closes_raw) else None
-                            t_out.append(int(raw_ts))
+                            t_out.append(ts_int)
                             c_out.append(float(raw_c) if raw_c is not None else None)
                             if v_out is not None:
                                 raw_v = vols_raw[idx] if idx < len(vols_raw) else None
                                 v_out.append(int(raw_v) if raw_v is not None else None)
                         meta = dict(resp[0].get("meta") or {})
                         non_null_c = [c for c in c_out if c is not None]
-                        if non_null_c and meta.get("regularMarketPrice") is None:
+                        synth_bars = [
+                            {
+                                "ts": t_out[i],
+                                "c": c_out[i],
+                                "o": c_out[i],
+                                "h": c_out[i],
+                                "l": c_out[i],
+                                "v": (v_out[i] if v_out is not None and v_out[i] is not None else 0),
+                            }
+                            for i in range(len(t_out))
+                            if c_out[i] is not None
+                        ]
+                        if cutoff_ts_spark is not None:
+                            meta = _sanitize_meta_as_of(
+                                meta, synth_bars, cutoff_ts_spark,
+                                interval_secs=iv_secs_spark, daily=is_daily_spark,
+                            )
+                        elif non_null_c and meta.get("regularMarketPrice") is None:
                             meta["regularMarketPrice"] = non_null_c[-1]
+                        last_ts_spark = None
+                        if synth_bars:
+                            if is_daily_spark:
+                                last_ts_spark = synth_bars[-1]["ts"]
+                            elif cutoff_ts_spark is not None:
+                                last_ts_spark = min(cutoff_ts_spark, synth_bars[-1]["ts"] + iv_secs_spark)
+                            else:
+                                last_ts_spark = synth_bars[-1]["ts"]
                         got[canon] = {
                             "t": t_out,
                             "c": c_out,
@@ -696,7 +912,10 @@ class YahooMarketDataProvider(MarketDataProvider):
                             "data_status": DataStatus.HISTORICAL,
                             "is_live": False,
                             "is_simulated": False,
+                            "last_data_timestamp": _format_ist_iso(last_ts_spark),
                         }
+                        if cutoff_ts_spark is not None:
+                            got[canon]["simulated_at"] = _format_ist_iso(cutoff_ts_spark)
                 err = sp.get("error")
                 if err and not got:
                     raise DataError("Yahoo spark error: %s" % (err.get("description") or err.get("code") or err))
@@ -711,22 +930,22 @@ class YahooMarketDataProvider(MarketDataProvider):
                     failed[canon] = "no data from Yahoo"
         return data, failed
 
-    def get_quote(self, symbol, exchange="NSE"):
+    def get_quote(self, symbol, exchange="NSE", now=None):
         canonical = symbols_in.normalize_symbol(symbol)
         provider_sym = symbols_in.to_yahoo_symbol(canonical, exchange=exchange)
 
         params = {"range": "1d", "interval": "1d"}
         text = self._fetch_chart_url(provider_sym, params)
-        return self.normalize_quote(text, canonical, exchange=exchange, raw_symbol=provider_sym)
+        return self.normalize_quote(text, canonical, exchange=exchange, raw_symbol=provider_sym, now=now)
 
-    def get_quotes(self, symbols, exchange="NSE"):
+    def get_quotes(self, symbols, exchange="NSE", now=None):
         quotes = {}
         for i, s in enumerate(symbols):
             if i > 0 and self.pause:
                 time.sleep(self.pause)
             canon = symbols_in.normalize_symbol(s)
             try:
-                quotes[canon] = self.get_quote(s, exchange=exchange)
+                quotes[canon] = self.get_quote(s, exchange=exchange, now=now)
             except DataError as e:
                 # Retain partial quotes while reporting errors per ticker
                 quotes[canon] = _standardize_payload(
@@ -743,6 +962,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                     timestamp=None,
                     is_live=False,
                     is_simulated=False,
+                    now=now,
                 )
         return quotes
 
@@ -763,7 +983,7 @@ class YahooMarketDataProvider(MarketDataProvider):
         text = self._fetch_chart_url(provider_sym, params)
         return self.normalize_daily_bars(text, canonical, exchange=exchange, now=now)
 
-    def normalize_quote(self, text, symbol, exchange="NSE", raw_symbol=None):
+    def normalize_quote(self, text, symbol, exchange="NSE", raw_symbol=None, now=None):
         try:
             doc = json.loads(text)
         except ValueError as e:
@@ -779,13 +999,91 @@ class YahooMarketDataProvider(MarketDataProvider):
             raise MissingDataError("Empty result payload for %s" % symbol)
 
         res = results[0]
-        meta = res.get("meta") or {}
+        meta = dict(res.get("meta") or {})
+        stamps = res.get("timestamp") or []
+        q_ind = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
 
-        price = meta.get("regularMarketPrice")
+        now_dt, cutoff_ts = _parse_cutoff_ts(now)
+        rmt = meta.get("regularMarketTime")
+        rmt_int = int(rmt) if rmt is not None else None
+        exch = _normalize_exchange(exchange)
+
+        price = None
+        open_px = meta.get("regularMarketOpen")
+        high_px = meta.get("regularMarketDayHigh")
+        low_px = meta.get("regularMarketDayLow")
+        vol_val = meta.get("regularMarketVolume")
+
+        if cutoff_ts is not None:
+            data_gran = meta.get("dataGranularity")
+            iv_secs = _interval_to_seconds(data_gran) if data_gran else None
+            if iv_secs is not None and iv_secs < 86400 and stamps:
+                cols = [q_ind.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
+                valid_bars = []
+                for idx, ts in enumerate(stamps):
+                    if ts is None:
+                        continue
+                    ts_int = int(ts)
+                    if ts_int + iv_secs > cutoff_ts:
+                        continue
+                    o, h, l, c, v = [col[idx] if idx < len(col) else None for col in cols]
+                    if None in (o, h, l, c):
+                        continue
+                    dt_bar = datetime.datetime.fromtimestamp(ts_int, tz=calendar_in.IST)
+                    valid_bars.append({
+                        "date": dt_bar.strftime("%Y-%m-%d"),
+                        "o": float(o),
+                        "h": float(h),
+                        "l": float(l),
+                        "c": float(c),
+                        "v": int(v or 0),
+                        "ts": ts_int,
+                    })
+                if not valid_bars:
+                    raise MissingDataError(
+                        "Insufficient quote data before simulated cutoff %s for %s"
+                        % (_format_ist(cutoff_ts), symbol)
+                    )
+                if rmt_int is None or rmt_int > cutoff_ts:
+                    last_date = valid_bars[-1]["date"]
+                    day_bars = [b for b in valid_bars if b["date"] == last_date] or [valid_bars[-1]]
+                    price = day_bars[-1]["c"]
+                    open_px = day_bars[0]["o"]
+                    high_px = max(b["h"] for b in day_bars)
+                    low_px = min(b["l"] for b in day_bars)
+                    vol_val = sum(b["v"] for b in day_bars)
+                    rmt_int = min(cutoff_ts, valid_bars[-1]["ts"] + iv_secs)
+            else:
+                if rmt_int is not None:
+                    if rmt_int > cutoff_ts:
+                        raise MissingDataError(
+                            "Quote timestamp %s is after simulated cutoff %s for %s"
+                            % (_format_ist(rmt_int), _format_ist(cutoff_ts), symbol)
+                        )
+                elif stamps:
+                    valid_ts = [int(t) for t in stamps if t is not None]
+                    if not valid_ts or max(valid_ts) > cutoff_ts:
+                        raise MissingDataError(
+                            "Quote timestamp is after simulated cutoff %s for %s"
+                            % (_format_ist(cutoff_ts), symbol)
+                        )
+                    last_d = datetime.datetime.fromtimestamp(valid_ts[-1], tz=calendar_in.IST).date()
+                    if not _is_daily_session_complete(last_d, now_dt, exchange=exch):
+                        raise MissingDataError(
+                            "Daily quote session %s is incomplete at simulated cutoff %s for %s"
+                            % (last_d.isoformat(), _format_ist(cutoff_ts), symbol)
+                        )
+                else:
+                    raise MissingDataError(
+                        "Quote has no timestamp before simulated cutoff %s for %s"
+                        % (_format_ist(cutoff_ts), symbol)
+                    )
+
+        if price is None:
+            price = meta.get("regularMarketPrice")
         if price is None:
             # Fallback to last close in indicators
-            q = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
-            closes = [c for c in (q.get("close") or []) if c is not None]
+            closes = [c for c in (q_ind.get("close") or []) if c is not None]
             if closes:
                 price = closes[-1]
 
@@ -799,10 +1097,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             change = round(price - prev_close, 2)
             change_pct = round((price / prev_close - 1) * 100.0, 3)
 
-        rmt = meta.get("regularMarketTime")
-        time_str = _format_ist(rmt) if rmt else ""
-        exch = _normalize_exchange(exchange)
-        open_px = meta.get("regularMarketOpen")
+        time_str = _format_ist(rmt_int) if rmt_int else ""
         payload = {
             "symbol": symbol,
             "raw_symbol": raw_symbol or symbol,
@@ -815,10 +1110,10 @@ class YahooMarketDataProvider(MarketDataProvider):
             "change": change,
             "change_pct": change_pct,
             "open": float(open_px) if open_px is not None else None,
-            "high": float(meta["regularMarketDayHigh"]) if "regularMarketDayHigh" in meta else None,
-            "low": float(meta["regularMarketDayLow"]) if "regularMarketDayLow" in meta else None,
-            "volume": int(meta["regularMarketVolume"]) if meta.get("regularMarketVolume") is not None else None,
-            "timestamp": int(rmt) if rmt else None,
+            "high": float(high_px) if high_px is not None else None,
+            "low": float(low_px) if low_px is not None else None,
+            "volume": int(vol_val) if vol_val is not None else None,
+            "timestamp": rmt_int,
             "time": time_str,
             "source": "yahoo",
             "tier": DataTier.DELAYED,
@@ -830,9 +1125,10 @@ class YahooMarketDataProvider(MarketDataProvider):
             exchange=exch,
             data_status=DataStatus.DELAYED,
             tier=DataTier.DELAYED,
-            timestamp=int(rmt) if rmt else None,
+            timestamp=rmt_int,
             is_live=False,
             is_simulated=False,
+            now=now,
         )
 
     def normalize_intraday_bars(self, text, symbol, exchange="NSE", interval="5m", now=None, is_cas_eligible=False):
@@ -920,7 +1216,15 @@ class YahooMarketDataProvider(MarketDataProvider):
 
         exch = _normalize_exchange(exchange)
         prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-        last_ts = bars[-1]["ts"] if bars else meta.get("regularMarketTime")
+        cutoff_param = now_ts if now is not None else None
+        meta = _sanitize_meta_as_of(
+            meta, bars, cutoff_param if cutoff_param is not None else now_ts,
+            interval_secs=interval_secs, daily=False,
+        )
+        if bars:
+            last_ts = min(now_ts, bars[-1]["ts"] + interval_secs)
+        else:
+            last_ts = None
         payload = {
             "symbol": symbol,
             "exchange": exch,
@@ -942,7 +1246,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             timestamp=int(last_ts) if last_ts else None,
             is_live=False,
             is_simulated=False,
-            now=now_dt,
+            now=now,
         )
 
     def normalize_daily_bars(self, text, symbol, exchange="NSE", now=None):
@@ -966,8 +1270,10 @@ class YahooMarketDataProvider(MarketDataProvider):
         q = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
         cols = [q.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
 
-        now_dt = calendar_in.parse_ist(now) if now else calendar_in.now_ist()
-        today = now_dt.date()
+        now_dt, now_ts = _parse_cutoff_ts(now) if now is not None else (
+            calendar_in.now_ist(), int(calendar_in.now_ist().timestamp())
+        )
+        exch = _normalize_exchange(exchange)
 
         bars_by_date = {}
         for i, ts in enumerate(stamps):
@@ -979,7 +1285,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                 continue
             dt_ist = datetime.datetime.fromtimestamp(ts, tz=calendar_in.IST)
             d = dt_ist.date()
-            if d > today:
+            if not _is_daily_session_complete(d, now_dt, exchange=exch):
                 continue
             # Store completed daily bar
             bars_by_date[d] = {
@@ -994,8 +1300,8 @@ class YahooMarketDataProvider(MarketDataProvider):
             }
 
         sorted_bars = [bars_by_date[k] for k in sorted(bars_by_date.keys())]
-        exch = _normalize_exchange(exchange)
-        last_ts = sorted_bars[-1]["ts"] if sorted_bars else meta.get("regularMarketTime")
+        meta = _sanitize_meta_as_of(meta, sorted_bars, now_ts, daily=True)
+        last_ts = min(now_ts, sorted_bars[-1]["ts"]) if sorted_bars else None
         payload = {
             "symbol": symbol,
             "exchange": exch,
@@ -1015,7 +1321,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             timestamp=int(last_ts) if last_ts else None,
             is_live=False,
             is_simulated=False,
-            now=now_dt,
+            now=now,
         )
 
     def get_instruments(self, exchange="NSE", symbol=None):
@@ -1097,12 +1403,12 @@ class OfflineMarketDataProvider(MarketDataProvider):
                 return p
         raise SymbolNotFoundError("No offline chart file found for %s in %s" % (symbol, self.base_path))
 
-    def get_quote(self, symbol, exchange="NSE"):
+    def get_quote(self, symbol, exchange="NSE", now=None):
         canonical = symbols_in.normalize_symbol(symbol)
         exch = _normalize_exchange(exchange)
         path = self._locate_file(canonical, "quote")
         text = self._read_file(path)
-        res = self.parser.normalize_quote(text, canonical, exchange=exch)
+        res = self.parser.normalize_quote(text, canonical, exchange=exch, now=now)
         res["source"] = "offline"
         res["tier"] = self.tier
         return _standardize_payload(
@@ -1115,15 +1421,16 @@ class OfflineMarketDataProvider(MarketDataProvider):
             timestamp=res.get("timestamp"),
             is_live=False,
             is_simulated=False,
+            now=now,
         )
 
-    def get_quotes(self, symbols, exchange="NSE"):
+    def get_quotes(self, symbols, exchange="NSE", now=None):
         exch = _normalize_exchange(exchange)
         quotes = {}
         for s in symbols:
             canon = symbols_in.normalize_symbol(s)
             try:
-                quotes[canon] = self.get_quote(s, exchange=exch)
+                quotes[canon] = self.get_quote(s, exchange=exch, now=now)
             except DataError as e:
                 quotes[canon] = _standardize_payload(
                     {
@@ -1139,6 +1446,7 @@ class OfflineMarketDataProvider(MarketDataProvider):
                     timestamp=None,
                     is_live=False,
                     is_simulated=False,
+                    now=now,
                 )
         return quotes
 
@@ -1535,18 +1843,25 @@ class SimulatedMarketDataProvider(MarketDataProvider):
             return self.base_provider.supports(capability)
         return bool(self.CAPABILITIES.get(capability, False))
 
-    def get_quote(self, symbol, exchange="NSE"):
+    def get_quote(self, symbol, exchange="NSE", now=None):
         # If symbol is a derivative contract, resolve price using Black-Scholes
         if symbols_in.is_derivative_symbol(symbol):
             parsed = symbols_in.parse_derivative_symbol(symbol)
             underlying = parsed["underlying"]
             try:
-                und_q = self.base_provider.get_quote(underlying, exchange=exchange)
+                und_q = _validate_quote_as_of(
+                    _call_with_optional_now(self.base_provider.get_quote, underlying, exchange=exchange, now=now),
+                    now,
+                    symbol=underlying,
+                )
                 spot = und_q["price"]
             except Exception:
                 spot = 24000.0 if underlying in ("NIFTY", "^NSEI") else 2800.0
 
-            now_ts = int(calendar_in.now_ist().timestamp())
+            now_dt, cutoff_ts = _parse_cutoff_ts(now) if now is not None else (
+                calendar_in.now_ist(), int(calendar_in.now_ist().timestamp())
+            )
+            now_ts = cutoff_ts
             if parsed["asset_type"] == "FUTURES":
                 price = round(spot * (1.0 + self.rate * (15.0 / 365.0)), 2)
                 return _standardize_payload(
@@ -1570,12 +1885,15 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     timestamp=now_ts,
                     is_live=False,
                     is_simulated=True,
+                    now=now,
                 )
             else:
                 strike = parsed["strike"]
                 opt_type = parsed["option_type"]
-                exp_dt = calendar_in.get_next_expiry(underlying=underlying, exchange=exchange)
-                days = max(1, calendar_in.days_to_expiry(exp_dt))
+                exp_dt = calendar_in.get_next_expiry(
+                    as_of_date=now_dt, underlying=underlying, exchange=exchange
+                )
+                days = max(1, calendar_in.days_to_expiry(exp_dt, as_of_date=now_dt, exchange=exchange))
                 t_years = days / 365.0
                 bs = black_scholes(spot, strike, t_years, rate=self.rate, vol=self.default_iv, option_type=opt_type)
                 return _standardize_payload(
@@ -1599,12 +1917,17 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     timestamp=now_ts,
                     is_live=False,
                     is_simulated=True,
+                    now=now,
                 )
 
-        return self.base_provider.get_quote(symbol, exchange=exchange)
+        return _validate_quote_as_of(
+            _call_with_optional_now(self.base_provider.get_quote, symbol, exchange=exchange, now=now),
+            now,
+            symbol=symbol,
+        )
 
-    def get_quotes(self, symbols, exchange="NSE"):
-        return {symbols_in.normalize_symbol(s): self.get_quote(s, exchange=exchange) for s in symbols}
+    def get_quotes(self, symbols, exchange="NSE", now=None):
+        return {symbols_in.normalize_symbol(s): self.get_quote(s, exchange=exchange, now=now) for s in symbols}
 
     def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
         return self.base_provider.get_intraday_bars(symbol, interval=interval, range_str=range_str,
@@ -1806,7 +2129,7 @@ def to_scanner_series(daily_bars_payload):
         vol_fallback = volumes[-1] if is_daily else sum(v or 0 for v in volumes)
         meta.setdefault("regularMarketVolume", vol_fallback)
         meta.setdefault("regularMarketTime", timestamps[-1])
-    return {
+    out = {
         "t": timestamps,
         "c": closes,
         "o": opens,
@@ -1818,7 +2141,13 @@ def to_scanner_series(daily_bars_payload):
         "data_status": daily_bars_payload.get("data_status", DataStatus.HISTORICAL),
         "is_live": bool(daily_bars_payload.get("is_live", False)),
         "is_simulated": bool(daily_bars_payload.get("is_simulated", False)),
+        "last_data_timestamp": daily_bars_payload.get("last_data_timestamp") or (
+            _format_ist_iso(timestamps[-1]) if timestamps else None
+        ),
     }
+    if daily_bars_payload.get("simulated_at") is not None:
+        out["simulated_at"] = daily_bars_payload.get("simulated_at")
+    return out
 
 
 def to_entry_chart(intraday_payload):
@@ -1840,18 +2169,21 @@ def to_entry_chart(intraday_payload):
     prev_close = intraday_payload.get("prev_close")
     if prev_close is None:
         prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-    data_time = intraday_payload.get("timestamp") or meta.get("regularMarketTime")
+    data_time = intraday_payload.get("timestamp")
     if data_time is None and bars_out:
-        data_time = bars_out[-1]["t"]
+        iv = _interval_to_seconds(intraday_payload.get("interval") or "5m") or 0
+        data_time = bars_out[-1]["t"] + iv
     if prev_close is not None:
         meta.setdefault("previousClose", prev_close)
     if data_time is not None:
-        meta.setdefault("regularMarketTime", data_time)
+        meta["regularMarketTime"] = data_time
+    else:
+        meta.pop("regularMarketTime", None)
     provider = intraday_payload.get("provider") or intraday_payload.get("source") or "yahoo"
     tier = intraday_payload.get("tier") or (
         DataTier.DELAYED if provider == "yahoo" else DataTier.HISTORICAL
     )
-    return {
+    out = {
         "symbol": intraday_payload.get("symbol", ""),
         "meta": meta,
         "bars": bars_out,
@@ -1865,7 +2197,13 @@ def to_entry_chart(intraday_payload):
         "is_live": bool(intraday_payload.get("is_live", False)),
         "is_simulated": bool(intraday_payload.get("is_simulated", False)),
         "freshness_seconds": intraday_payload.get("freshness_seconds"),
+        "last_data_timestamp": intraday_payload.get("last_data_timestamp") or (
+            _format_ist_iso(data_time) if data_time is not None else None
+        ),
     }
+    if intraday_payload.get("simulated_at") is not None:
+        out["simulated_at"] = intraday_payload.get("simulated_at")
+    return out
 
 
 def to_exit_chart(bars_payload):
@@ -1881,18 +2219,24 @@ def to_exit_chart(bars_payload):
             "l": float(b["l"]),
             "c": float(b["c"]),
         })
-    meta = bars_payload.get("meta") or {}
-    data_time = bars_payload.get("timestamp") or meta.get("regularMarketTime")
+    data_time = bars_payload.get("timestamp")
     if data_time is None and bars_out:
-        data_time = bars_out[-1]["t"]
-    return {
+        iv = _interval_to_seconds(bars_payload.get("interval") or "") or 0
+        data_time = bars_out[-1]["t"] + (iv if iv < 86400 else 0)
+    out = {
         "bars": bars_out,
         "data_time": data_time,
         "provider": bars_payload.get("provider") or bars_payload.get("source") or "yahoo",
         "data_status": bars_payload.get("data_status", DataStatus.HISTORICAL),
         "is_live": bool(bars_payload.get("is_live", False)),
         "is_simulated": bool(bars_payload.get("is_simulated", False)),
+        "last_data_timestamp": bars_payload.get("last_data_timestamp") or (
+            _format_ist_iso(data_time) if data_time is not None else None
+        ),
     }
+    if bars_payload.get("simulated_at") is not None:
+        out["simulated_at"] = bars_payload.get("simulated_at")
+    return out
 
 
 def to_timemachine_bars(intraday_payload):
@@ -1989,24 +2333,47 @@ def detect_setups(daily_bars):
 
 # ---------------------------------------------------------------- Module-level convenience functions
 
-def fetch_quote(symbol, exchange="NSE", provider=None):
+def fetch_quote(symbol, exchange="NSE", provider=None, now=None):
     prov = provider or get_provider()
-    return prov.get_quote(symbol, exchange=exchange)
+    q = _call_with_optional_now(prov.get_quote, symbol, exchange=exchange, now=now)
+    return _validate_quote_as_of(q, now, symbol=symbol)
 
 
-def fetch_ltp(symbol, exchange="NSE", provider=None):
+def fetch_ltp(symbol, exchange="NSE", provider=None, now=None):
     prov = provider or get_provider()
-    return prov.get_ltp(symbol, exchange=exchange)
+    q = _call_with_optional_now(prov.get_ltp, symbol, exchange=exchange, now=now)
+    return _validate_quote_as_of(q, now, symbol=symbol)
 
 
-def fetch_ohlc(symbol, exchange="NSE", interval="1d", provider=None):
+def fetch_ohlc(symbol, exchange="NSE", interval="1d", provider=None, now=None):
     prov = provider or get_provider()
-    return prov.get_ohlc(symbol, exchange=exchange, interval=interval)
+    q = _call_with_optional_now(prov.get_ohlc, symbol, exchange=exchange, interval=interval, now=now)
+    return _validate_quote_as_of(q, now, symbol=symbol)
 
 
-def fetch_quotes(symbols, exchange="NSE", provider=None):
+def fetch_quotes(symbols, exchange="NSE", provider=None, now=None):
     prov = provider or get_provider()
-    return prov.get_quotes(symbols, exchange=exchange)
+    quotes = _call_with_optional_now(prov.get_quotes, symbols, exchange=exchange, now=now)
+    if now is not None and isinstance(quotes, dict):
+        out = {}
+        for k, v in quotes.items():
+            try:
+                out[k] = _validate_quote_as_of(v, now, symbol=k)
+            except DataError as e:
+                out[k] = _standardize_payload(
+                    {"symbol": k, "exchange": exchange, "error": str(e)},
+                    provider_name=getattr(prov, "provider_name", "unknown"),
+                    symbol=k,
+                    exchange=exchange,
+                    data_status=DataStatus.UNAVAILABLE,
+                    tier=DataTier.UNAVAILABLE,
+                    timestamp=None,
+                    is_live=False,
+                    is_simulated=False,
+                    now=now,
+                )
+        return out
+    return quotes
 
 
 def fetch_historical_data(symbol, start=None, end=None, range_str="1y", interval="1d", exchange="NSE", now=None, provider=None):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Price alerts and the NYSE clock for trader-alerts. Standard library only.
+"""Price alerts and the market clock for trader-alerts. Standard library only.
 
-    python3 alerts.py clock                          # is the NYSE open? next open / close
+    python3 alerts.py clock                          # is NYSE (or NSE/BSE with --market IN) open?
     python3 alerts.py quote TSLA --write             # quotes -> trader/prices.json
     python3 alerts.py quote --holdings --write       # every ticker in your portfolio and plan
     python3 alerts.py add --from-plan                # stop, target and flat-by-close from trader/plan.json
@@ -20,16 +20,16 @@ Rule types:
   below / stop    the price is at or below "price"
   pct_move        the price moved "pct" percent or more from the previous close
                   (or from "ref" if you give one); "direction": "up" or "down"
-  opening_bell    the NYSE opened today (rings once per trading day)
-  time            the New York clock passed "at" (HH:MM) on a trading day
+  opening_bell    the market opened today (rings once per trading day)
+  time            the market clock passed "at" (HH:MM) on a trading day
                   (rings once per trading day); "before_close": true moves it
-                  3 hours earlier on a 1:00 p.m. early close, so a 15:55
+                  3 hours earlier on a 1:00 p.m. NYSE early close, so a 15:55
                   "flat by close" rings at 12:55 on those days
 
-A rule with "date" is only watched on that New York date (rules from a plan
-are for the plan's day only). An above / below alert rings ONCE and then stays
-quiet until you reset it, unless the rule has "rearm": true (it re-arms when
-the price crosses back). A pct_move alert rings at most once per day.
+A rule with "date" is only watched on that market date (rules from a plan are for
+the plan's day only). An above / below alert rings ONCE and then stays quiet
+until you reset it, unless the rule has "rearm": true (it re-arms when the price
+crosses back). A pct_move alert rings at most once per day.
 
 Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
   yahoo   https://query2.finance.yahoo.com/v8/finance/chart/TSLA (falls back to
@@ -87,6 +87,7 @@ PAUSE = 0.5    # seconds between requests: be polite to free endpoints
 BACKOFF = 2.0  # seconds to wait before the one retry after a 429
 YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+EPOCH = datetime.datetime(1970, 1, 1)
 
 NYSE_HOLIDAYS = {
     "2026-01-01": "New Year's Day",
@@ -353,7 +354,25 @@ def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
     return quotes, errors
 
 
-def write_prices(path, quotes, now_utc, source):
+def _to_naive_utc(dt):
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _format_ist_iso(ts):
+    if ts is None or not calendar_in:
+        return None
+    try:
+        dt_ist = datetime.datetime.fromtimestamp(int(ts), tz=calendar_in.IST)
+        return dt_ist.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+    except Exception:
+        return None
+
+
+def write_prices(path, quotes, now_utc, source, simulated_at=None, last_data_timestamp=None):
     old = {}
     if os.path.exists(path):
         try:
@@ -363,21 +382,43 @@ def write_prices(path, quotes, now_utc, source):
             old = {}
     prices = dict(old.get("prices", {}))
     detail = dict(old.get("detail", {}))
-    stamp = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    utc_dt = _to_naive_utc(now_utc)
+    stamp = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    max_ts = None
     for s, q in quotes.items():
         if "price" not in q:
             continue
         prices[s] = q["price"]
+        q_ts = q.get("timestamp")
+        if q_ts is not None:
+            try:
+                q_ts_int = int(q_ts)
+                if max_ts is None or q_ts_int > max_ts:
+                    max_ts = q_ts_int
+            except (TypeError, ValueError):
+                pass
         d_entry = {"prev_close": q.get("prev_close"), "time": q.get("time"),
                    "source": q.get("source") or q.get("provider"), "fetched": stamp}
-        for k in ("provider", "data_status", "is_live", "is_simulated"):
-            if k in q:
+        for k in ("provider", "data_status", "is_live", "is_simulated", "timestamp", "last_data_timestamp"):
+            if k in q and q[k] is not None:
                 d_entry[k] = q[k]
         detail[s] = d_entry
+    lts = last_data_timestamp
+    if lts is None and max_ts is not None:
+        if calendar_in is not None and any("IST" in str(q.get("time", "")) or q.get("currency") == "INR" for q in quotes.values()):
+            lts = _format_ist_iso(max_ts)
+        else:
+            lts = datetime.datetime.fromtimestamp(max_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc = {"as_of": stamp, "source": source,
            "note": ("Delayed quotes for alerts and sizing checks. Your broker's price is the one that fills. "
                     "detail.fetched is when each price was read."),
            "prices": prices, "detail": detail}
+    if simulated_at is not None:
+        doc["simulated_at"] = simulated_at
+    elif old.get("simulated_at") and simulated_at is None:
+        pass
+    if lts is not None:
+        doc["last_data_timestamp"] = lts
     _write(path, doc)
     return doc
 
@@ -570,13 +611,17 @@ def evaluate(rules, quotes, status, state, now_utc):
         if not q:
             continue
         p = q["price"]
+        q_is_in = (str(status.get("market") or "").upper() in ("IN", "NSE", "BSE")
+                   or str(q.get("currency") or "").upper() == "INR"
+                   or str(q.get("exchange") or "").upper() in ("NSE", "BSE"))
+        curr = "\u20b9" if q_is_in else "$"
         if typ in ("above", "below"):
             hit = p >= r["price"] if typ == "above" else p <= r["price"]
             if hit and rid not in rung:
                 word = "at or above" if typ == "above" else "at or below"
                 label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
-                rings.append({"id": rid, "symbol": sym, "message": "%s %s $%.2f: %s your %s $%s%s."
-                              % (sym, "is" if status["open"] else "last", p, word, label, _n(r["price"]),
+                rings.append({"id": rid, "symbol": sym, "message": "%s %s %s%.2f: %s your %s %s%s%s."
+                              % (sym, "is" if status["open"] else "last", curr, p, word, label, curr, _n(r["price"]),
                                  (" (" + r["note"] + ")") if r.get("note") else "")})
                 rung[rid] = stamp
             elif not hit and rid in rung and r.get("rearm"):
@@ -589,8 +634,8 @@ def evaluate(rules, quotes, status, state, now_utc):
             want = r.get("direction")
             hit = abs(move) >= r["pct"] and (not want or (want == "up") == (move > 0))
             if hit and not _rang_today(rung.get(rid), today):
-                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to $%.2f (from $%.2f)."
-                              % (sym, move, p, float(ref))})
+                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to %s%.2f (from %s%.2f)."
+                              % (sym, move, curr, p, curr, float(ref))})
                 rung[rid] = stamp
     state["last_check"] = stamp
     return rings, state
@@ -916,11 +961,15 @@ def cmd_readiness(a):
             has_warn = True
 
         if market == "IN":
-            max_loss = cfg.get("max_loss_per_trade_inr") or cfg.get("max_loss_per_trade_usd")
-            daily_loss = cfg.get("max_daily_loss_inr") or cfg.get("max_daily_loss_usd")
+            max_loss = (cfg.get("max_loss_per_trade_inr")
+                        or cfg.get("max_loss_per_trade")
+                        or cfg.get("max_loss_per_trade_usd"))
+            daily_loss = (cfg.get("max_daily_loss_inr")
+                          or cfg.get("max_daily_loss")
+                          or cfg.get("max_daily_loss_usd"))
         else:
-            max_loss = cfg.get("max_loss_per_trade_usd")
-            daily_loss = cfg.get("max_daily_loss_usd")
+            max_loss = cfg.get("max_loss_per_trade") or cfg.get("max_loss_per_trade_usd")
+            daily_loss = cfg.get("max_daily_loss") or cfg.get("max_daily_loss_usd")
 
         if not max_loss:
             cfg_issues.append("Missing max_loss_per_trade setting.")
@@ -1091,7 +1140,18 @@ def cmd_quote_in(a):
     except ImportError:
         data_in = None
 
-    now = calendar_in.parse_ist(a.now) if (calendar_in and a.now) else parse_now(a.now)
+    if calendar_in:
+        now_ist = calendar_in.parse_ist(a.now) if a.now else calendar_in.now_ist()
+        now_utc = _to_naive_utc(now_ist)
+        cutoff_ts = int(now_ist.timestamp())
+        sim_at_iso = now_ist.strftime("%Y-%m-%dT%H:%M:%S+05:30") if a.now else None
+    else:
+        now_utc = parse_now(a.now)
+        now_ist = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(
+            datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        )
+        cutoff_ts = int((now_utc - EPOCH).total_seconds())
+        sim_at_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if a.now else None
 
     quotes = {}
     errors = []
@@ -1113,7 +1173,11 @@ def cmd_quote_in(a):
         for s in raw_syms:
             try:
                 c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
-                q = provider.get_quote(c_sym, exchange=exch)
+                q = data_in._call_with_optional_now(
+                    provider.get_quote, c_sym, exchange=exch, now=now_ist if a.now else None
+                )
+                if a.now:
+                    data_in._validate_quote_as_of(q, now_ist, symbol=c_sym)
                 if "price" not in q and q.get("error"):
                     errors.append(str(q["error"]))
                 else:
@@ -1145,6 +1209,11 @@ def cmd_quote_in(a):
 
         for y_sym, q in quotes_raw.items():
             c_sym = yahoo_map.get(y_sym, y_sym)
+            if a.now and q.get("timestamp") is not None and int(q["timestamp"]) > cutoff_ts:
+                errors.append(
+                    "Quote timestamp is after simulated cutoff for %s" % c_sym
+                )
+                continue
             q_copy = dict(q)
             q_copy["symbol"] = c_sym
             q_copy["market"] = exch
@@ -1152,11 +1221,20 @@ def cmd_quote_in(a):
             q_copy["currency"] = "INR"
             quotes[c_sym] = q_copy
 
+    max_q_ts = max(
+        (int(q["timestamp"]) for q in quotes.values() if isinstance(q, dict) and q.get("timestamp") is not None),
+        default=None,
+    )
+    lts_iso = _format_ist_iso(max_q_ts)
+
     if a.write and quotes:
-        write_prices(a.write, quotes, now, eff_source)
+        write_prices(a.write, quotes, now_utc, eff_source, simulated_at=sim_at_iso, last_data_timestamp=lts_iso)
 
     if a.json:
-        print(json.dumps({"provider": eff_source, "quotes": quotes, "errors": errors}, indent=2))
+        out_json = {"provider": eff_source, "quotes": quotes, "errors": errors, "last_data_timestamp": lts_iso}
+        if sim_at_iso is not None:
+            out_json["simulated_at"] = sim_at_iso
+        print(json.dumps(out_json, indent=2))
     else:
         for s in sorted(quotes.keys()):
             q = quotes.get(s)
@@ -1307,6 +1385,9 @@ def cmd_check_in(a, rules):
         data_in = None
 
     now = calendar_in.parse_ist(a.now) if a.now else calendar_in.now_ist()
+    now_utc = _to_naive_utc(now)
+    sim_at_iso = now.strftime("%Y-%m-%dT%H:%M:%S+05:30") if a.now else None
+    cutoff_ts = int(now.timestamp())
     date_str = now.strftime("%Y-%m-%d")
 
     phase, reason = calendar_in.get_session_phase(now, exchange="NSE")
@@ -1345,7 +1426,11 @@ def cmd_check_in(a, rules):
             for s in raw_syms:
                 try:
                     c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
-                    q = provider.get_quote(c_sym, exchange=exch)
+                    q = data_in._call_with_optional_now(
+                        provider.get_quote, c_sym, exchange=exch, now=now if a.now else None
+                    )
+                    if a.now:
+                        data_in._validate_quote_as_of(q, now, symbol=c_sym)
                     if "price" not in q and q.get("error"):
                         errors.append(str(q["error"]))
                     else:
@@ -1368,6 +1453,9 @@ def cmd_check_in(a, rules):
             errors.extend(errs)
             for y_s, q in raw_q.items():
                 c_s = yahoo_map.get(y_s, y_s)
+                if a.now and q.get("timestamp") is not None and int(q["timestamp"]) > cutoff_ts:
+                    errors.append("Quote timestamp is after simulated cutoff for %s" % c_s)
+                    continue
                 q_copy = dict(q)
                 q_copy["symbol"] = c_s
                 q_copy["currency"] = "INR"
@@ -1376,14 +1464,23 @@ def cmd_check_in(a, rules):
     state = _read(a.state, {})
     rings, state = evaluate_in(rules, quotes, status, state, now)
 
+    max_q_ts = max(
+        (int(q["timestamp"]) for q in quotes.values() if isinstance(q, dict) and q.get("timestamp") is not None),
+        default=None,
+    )
+    lts_iso = _format_ist_iso(max_q_ts)
+
     if not a.no_write:
         _write(a.state, state)
         if quotes:
-            write_prices(a.prices_out, quotes, now, eff_source)
+            write_prices(a.prices_out, quotes, now_utc, eff_source, simulated_at=sim_at_iso, last_data_timestamp=lts_iso)
 
     if a.json:
-        print(json.dumps({"provider": eff_source, "market": status, "rings": rings, "errors": errors,
-                          "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2))
+        out_json = {"provider": eff_source, "market": status, "rings": rings, "errors": errors,
+                    "quotes": {s: q["price"] for s, q in quotes.items()}, "last_data_timestamp": lts_iso}
+        if sim_at_iso is not None:
+            out_json["simulated_at"] = sim_at_iso
+        print(json.dumps(out_json, indent=2))
     else:
         print("NSE %s (%s IST, %s)." % ("OPEN" if status["open"] else "closed", now.strftime("%H:%M"), status["phase"]))
         for r in rings:
@@ -1471,7 +1568,7 @@ def cmd_add(a):
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}
     elif a.at:
         if _hhmm(a.at) is None:
-            raise AlertError("--at wants a New York time like 15:55")
+            raise AlertError("--at wants a local market time like 15:55 (US ET) or 15:15 (IN IST)")
         rule = {"id": a.id or ("time-%s" % a.at.replace(":", "")), "type": "time", "at": a.at,
                 "label": a.label or "time alert"}
         if a.symbol:
@@ -1590,14 +1687,14 @@ def main(argv=None):
     g.add_argument("--target", type=float)
     g.add_argument("--pct", type=float)
     g.add_argument("--opening-bell", action="store_true")
-    g.add_argument("--at", metavar="HH:MM", help="a time alert, New York time")
+    g.add_argument("--at", metavar="HH:MM", help="a time alert, market local time (New York ET for US, IST for IN)")
     g.add_argument("--from-plan", action="store_true", help="stop, target and flat-by-close from the plan")
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--config", default="trader/config.json", help="flat_by when the plan has none")
     p.add_argument("--label", help="what a time alert says, e.g. \"flat by close\"")
     p.add_argument("--before-close", action="store_true",
-                   help="a time alert that moves 3 hours earlier on a 1:00 p.m. early close")
-    p.add_argument("--date", help="watch this rule on this New York date only (YYYY-MM-DD)")
+                   help="a time alert that moves 3 hours earlier on a 1:00 p.m. NYSE early close")
+    p.add_argument("--date", help="watch this rule on this market date only (YYYY-MM-DD)")
     p.add_argument("--direction", choices=["up", "down"])
     p.add_argument("--rearm", action="store_true")
     p.add_argument("--note")

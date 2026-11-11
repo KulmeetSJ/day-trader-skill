@@ -449,6 +449,81 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no rules", err)
 
+    def test_indian_quote_fallback_without_calendar_in_uses_epoch(self):
+        import sys
+        self.assertEqual(alerts.EPOCH, DT(1970, 1, 1))
+        orig_cal = alerts.calendar_in
+        had_data_in = "data_in" in sys.modules
+        orig_data_in = sys.modules.get("data_in")
+        try:
+            alerts.calendar_in = None
+            with tempfile.TemporaryDirectory() as td:
+                quote_ts = int((DT(2026, 10, 19, 10, 30, 0) - DT(1970, 1, 1)).total_seconds())
+                future_ts = int((DT(2026, 10, 19, 10, 40, 0) - DT(1970, 1, 1)).total_seconds())
+                payload = {
+                    "chart": {
+                        "result": [{
+                            "meta": {
+                                "symbol": "RELIANCE.NS",
+                                "currency": "INR",
+                                "regularMarketPrice": 1410.0,
+                                "chartPreviousClose": 1400.0,
+                                "regularMarketTime": quote_ts,
+                            }
+                        }]
+                    }
+                }
+                future_payload = {
+                    "chart": {
+                        "result": [{
+                            "meta": {
+                                "symbol": "RELIANCE.NS",
+                                "currency": "INR",
+                                "regularMarketPrice": 1499.0,
+                                "chartPreviousClose": 1400.0,
+                                "regularMarketTime": future_ts,
+                            }
+                        }]
+                    }
+                }
+                with open(os.path.join(td, "RELIANCE.json"), "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                code, text, err = run([
+                    "quote", "RELIANCE", "--market", "IN", "--offline", td,
+                    "--now", "2026-10-19T10:35:00Z", "--json",
+                ])
+                self.assertEqual(code, 0, err)
+                doc = json.loads(text)
+                self.assertEqual(doc["simulated_at"], "2026-10-19T10:35:00Z")
+                self.assertEqual(doc["quotes"]["RELIANCE"]["price"], 1410.0)
+
+                # Also verify future quote > cutoff is rejected when calendar_in is None
+                with open(os.path.join(td, "RELIANCE.json"), "w", encoding="utf-8") as fh:
+                    json.dump(future_payload, fh)
+                code_fut, text_fut, _ = run([
+                    "quote", "RELIANCE", "--market", "IN", "--offline", td,
+                    "--now", "2026-10-19T10:35:00Z", "--json",
+                ])
+                self.assertEqual(code_fut, 1)
+                self.assertIn("after simulated cutoff", "\n".join(json.loads(text_fut)["errors"]))
+
+                # Also exercise pure alerts fallback when both calendar_in and data_in are unavailable
+                sys.modules["data_in"] = None
+                with open(os.path.join(td, "yahoo-RELIANCE.NS.json"), "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                code2, text2, err2 = run([
+                    "quote", "RELIANCE", "--market", "IN", "--offline", td,
+                    "--now", "2026-10-19T10:35:00Z", "--json",
+                ])
+                self.assertEqual(code2, 0, err2)
+                self.assertEqual(json.loads(text2)["quotes"]["RELIANCE"]["price"], 1410.0)
+        finally:
+            alerts.calendar_in = orig_cal
+            if had_data_in:
+                sys.modules["data_in"] = orig_data_in
+            else:
+                sys.modules.pop("data_in", None)
+
 
 if __name__ == "__main__":
     unittest.main()
