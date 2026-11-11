@@ -869,6 +869,15 @@ def cmd_readiness(a):
             opt_desc = provider_name if provider_caps.get("option_chains") else "SIMULATED (Black-Scholes)"
             unsupported = ", ".join(provider_caps.get("not_supported") or [])
             data_detail = "Quotes: %s | Options: %s" % (quote_desc, opt_desc)
+            if hasattr(active_prov, "stream_limits"):
+                try:
+                    slim = active_prov.stream_limits()
+                    data_detail += " | Tier: %s (max %d WS)" % (
+                        slim.get("account_tier", "standard"),
+                        int(slim.get("max_connections", 2)),
+                    )
+                except Exception:
+                    pass
             if unsupported:
                 data_detail += " | Not supported: %s" % unsupported
             data_note = (
@@ -877,7 +886,10 @@ def cmd_readiness(a):
                 % provider_name
             )
         except Exception as e:
-            provider_name = str(cfg.get("india_market_data_provider") or cfg.get("data_provider") or cfg.get("provider") or "unknown")
+            try:
+                provider_name = _data_in.resolve_provider_name(config=cfg)
+            except Exception:
+                provider_name = str(cfg.get("india_market_data_provider") or cfg.get("data_provider") or cfg.get("provider") or "unknown")
             data_state = "ERROR"
             data_detail = "Provider '%s' configuration error" % provider_name
             data_note = str(e)

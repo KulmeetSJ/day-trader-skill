@@ -304,17 +304,37 @@ All stock research, screening, and paper trading capabilities operate 24/7, incl
 
 ### Market Data Configuration
 
-Set the environment variable `BHARAT_DATA_PROVIDER` to choose the data source:
+No Upstox account, login, or API key is required to use this skill. By default it runs out of the box with free delayed Yahoo Finance data (`yahoo`) and local fixture files (`offline`).
 
-- `yahoo` (default): Free market data with automated NSE (`.NS`) and BSE (`.BO`) exchange suffix translation.
+Set `INDIA_MARKET_DATA_PROVIDER` (or `india_market_data_provider` in config, or legacy `BHARAT_DATA_PROVIDER`) to choose the Indian market data source:
+
+- `yahoo` (default): Free market data with automated NSE (`.NS`) and BSE (`.BO`) exchange suffix translation (`DELAYED` 15m, no credentials required).
+- `upstox` (optional): Read-only live market data via an Upstox Analytics Token (`UPSTOX_ANALYTICS_TOKEN`). Supports V3 quotes (`quotes`, `ltp`, `ohlc`), V3 historical/intraday candles with automatic lookback chunking, live option chains with Open Interest and Greeks, exchange instrument masters, market status, and V3 WebSocket streaming (`trader-alerts/upstox_feed.py`). No OAuth login flow or live order placement is enabled.
 - `offline`: Local JSON or JSON.GZ bar and quote files for offline analysis and deterministic backtesting.
+
+#### Using Optional Upstox Analytics Token
+
+For users who already have an Upstox read-only Analytics Token (no Upstox account needed otherwise):
+
+```bash
+export INDIA_MARKET_DATA_PROVIDER=upstox
+export UPSTOX_ANALYTICS_TOKEN="<your-readonly-analytics-token>"
+python3 trader-alerts/alerts.py readiness --market IN
+```
+
+- Never commit or paste `UPSTOX_ANALYTICS_TOKEN` into tracked files or logs. Credentials are never printed in CLI output or error messages.
+- If `INDIA_MARKET_DATA_PROVIDER=upstox` is selected without a valid token, tools fail explicitly with `AuthenticationConfigError` and never fabricate data or silently fall back to Yahoo.
+- To opt into explicit fallback on auth failure, set `"allow_yahoo_fallback": true` and `"fallback_provider": "yahoo"` in config (or `INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK=1`). Fallback payloads remain strictly tagged `provider: "yahoo"`, `is_live: false`, and `DELAYED`.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 | --- | --- | --- |
 | `BHARAT_MARKET` | Market mode (`IN` for India, default `US`) | `US` |
-| `BHARAT_DATA_PROVIDER` | Market data provider (`yahoo`, `offline`) | `yahoo` |
+| `INDIA_MARKET_DATA_PROVIDER` | Market data provider (`yahoo`, `upstox`, `offline`) | `yahoo` |
+| `UPSTOX_ANALYTICS_TOKEN` | Optional read-only Upstox Analytics Token (only when using `upstox`) | unset |
+| `INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK` | Explicitly allow fallback to delayed Yahoo when Upstox auth fails (`1`/`true`) | unset (`false`) |
+| `BHARAT_DATA_PROVIDER` | Legacy alias for `INDIA_MARKET_DATA_PROVIDER` | `yahoo` |
 | `BHARAT_INSTRUMENTS_CACHE` | Path to local instrument metadata cache | `trader/state/instruments.json` |
 
 ### Data Quality Tiers
@@ -642,17 +662,18 @@ All Indian trading workflows (`trader-scanner`, `trader-entry`, `trader-exit`, `
 
 #### Provider Capability Matrix & Current Limitations
 
-| Capability | `YahooMarketDataProvider` (`yahoo`, active) | `OfflineMarketDataProvider` (`offline`) | `SimulatedMarketDataProvider` (`simulated`) | Future Broker Adapter (e.g. Groww) |
+| Capability | `YahooMarketDataProvider` (`yahoo`, default) | `UpstoxMarketDataProvider` (`upstox`, optional) | `OfflineMarketDataProvider` (`offline`) | `SimulatedMarketDataProvider` (`simulated`) |
 | :--- | :--- | :--- | :--- | :--- |
-| `historical_candles` | Supported (`HISTORICAL`) | Supported (`FIXTURE`) | Delegated | Expected |
-| `intraday_candles` | Supported (`5m`/`1m`, max ~60d/7d) | Supported (`FIXTURE`) | Delegated | Expected |
-| `live_quotes` | `NOT_SUPPORTED` (`DELAYED` 15m only) | `NOT_SUPPORTED` (`FIXTURE`) | `NOT_SUPPORTED` | Expected (`CURRENT`/`REAL_TIME`) |
-| `streaming_data` | `NOT_SUPPORTED` | `NOT_SUPPORTED` | `NOT_SUPPORTED` | Expected |
-| `option_chains` / `open_interest` | `NOT_SUPPORTED` (`NotSupportedError`) | Supported if saved fixture | `SIMULATED` (Black-Scholes; OI synthetic) | Expected |
-| `instrument_masters` | `NOT_SUPPORTED` remote; local CSV cache in `instruments.py` | Local fixture / cache | Delegated / `False` | Expected |
-| `market_status` | Supported (IST calendar `calendar_in`) | Supported (`calendar_in`) | Supported (`calendar_in`) | Supported |
+| `historical_candles` | Supported (`HISTORICAL`) | Supported (V3 candles, auto-chunked) | Supported (`FIXTURE`) | Delegated |
+| `intraday_candles` | Supported (`5m`/`1m`, max ~60d/7d) | Supported (V3 historical + intraday) | Supported (`FIXTURE`) | Delegated |
+| `live_quotes` | `NOT_SUPPORTED` (`DELAYED` 15m only) | Supported (`REAL_TIME` / `CURRENT` when open) | `NOT_SUPPORTED` (`FIXTURE`) | `NOT_SUPPORTED` |
+| `streaming_data` | `NOT_SUPPORTED` | Supported (V3 WebSocket + stdlib Protobuf) | `NOT_SUPPORTED` | `NOT_SUPPORTED` |
+| `option_chains` / `open_interest` | `NOT_SUPPORTED` (`NotSupportedError`) | Supported (`/v2/option/chain` + OI/Greeks) | Supported if saved fixture | `SIMULATED` (Black-Scholes; OI synthetic) |
+| `instrument_masters` | `NOT_SUPPORTED` remote; local CSV cache in `instruments.py` | Supported (NSE/BSE gzip JSON masters) | Local fixture / cache | Delegated / `False` |
+| `market_status` | Supported (IST calendar `calendar_in`) | Supported (`/v2/market/status` + `calendar_in`) | Supported (`calendar_in`) | Supported (`calendar_in`) |
 
-- **Current Limitations (Yahoo Finance)**: Yahoo is free, unofficial, and ~15 minutes delayed (`data_status: DELAYED`, `is_live: False`). It does not provide real-time NSE/BSE ticks, streaming feeds, live Indian option chains/OI, or official exchange instrument masters. Failed or timed-out requests raise typed errors (`RateLimitError`, `SymbolNotFoundError`, `ProviderConnectionError`, `MissingDataError`) and never fabricate prices or treat outages as empty setup scans.
+- **Default Unauthenticated Behavior (Yahoo Finance)**: Anyone without an Upstox token runs on free delayed Yahoo Finance data (`data_status: DELAYED`, `is_live: False`). Failed or timed-out requests raise typed errors (`RateLimitError`, `SymbolNotFoundError`, `ProviderConnectionError`, `MissingDataError`) and never fabricate prices or treat outages as empty setup scans.
+- **Optional Read-Only Upstox Feed**: Requires `INDIA_MARKET_DATA_PROVIDER=upstox` and `UPSTOX_ANALYTICS_TOKEN`. Account tier defaults strictly to **`standard`** (`UPSTOX_ACCOUNT_TIER=standard`: 2 concurrent WebSocket V3 connections; LTPC 5,000 individual / 2,000 combined; Option Greeks 3,000 individual / 2,000 combined; Full 2,000 individual / 1,500 combined; `full_d30` disabled). Opt into **`plus`** (`UPSTOX_ACCOUNT_TIER=plus` or `config["provider_credentials"]["upstox"]["account_tier"]`) only if your account holds Upstox Plus to enable 5 concurrent connections and `full_d30` (`50` keys per connection / `1,500` combined). Also enforces V3 historical lookback caps (`2022-01-01` floor for minutes/hours, calendar-safe month/quarter chunking), exponential backoff reconnects with fresh single-use authorization URLs, HTTP redirect following on WebSocket upgrade, and stale-tick detection (`stale_after_seconds`).
 - **Simulated Options Safety**: Analytical Black-Scholes option pricing and chains remain isolated inside `SimulatedMarketDataProvider` and are always tagged `data_status: SIMULATED`, `is_simulated: True`, `is_live: False`.
 
 #### Adding a Future Adapter (e.g. Groww, Zerodha, Dhan)

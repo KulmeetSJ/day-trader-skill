@@ -729,14 +729,17 @@ def _load_daily_chart(sym, offline=None, daily_path=None, market="US", cfg=None,
                 dch["is_live"] = False
             else:
                 dch = data_in.to_entry_chart(payload)
-            if prov.provider_name == "yahoo":
+                if isinstance(payload, dict) and payload.get("fallback_from"):
+                    dch["fallback_from"] = payload.get("fallback_from")
+            eff_d_prov = str(dch.get("provider") or prov.provider_name).lower()
+            if eff_d_prov == "yahoo":
                 dch["data_tier"] = "DELAYED"
                 dch["is_live"] = False
                 dch["is_live_capable"] = False
             else:
                 dch["is_live_capable"] = bool(
                     prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
-                    and prov.provider_name not in ("yahoo", "offline", "simulated")
+                    and eff_d_prov not in ("yahoo", "offline", "simulated")
                 )
     else:
         fetch_sym = symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else yahoo_symbol(sym)
@@ -870,9 +873,12 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
                     raise EntryError(str(e))
             if payload is not None:
                 ch = data_in.to_entry_chart(payload)
+                if isinstance(payload, dict) and payload.get("fallback_from"):
+                    ch["fallback_from"] = payload.get("fallback_from")
+                eff_c_prov = str(ch.get("provider") or prov.provider_name).lower()
                 ch["is_live_capable"] = bool(
                     prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
-                    and prov.provider_name not in ("yahoo", "offline", "simulated")
+                    and eff_c_prov not in ("yahoo", "offline", "simulated")
                 )
     else:
         today = today or to_local(utc_now(), market=market).date()
@@ -1643,7 +1649,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                         ).strftime("%Y-%m-%d")
                     except Exception:
                         exp_arg = None
-                chain = data_in.fetch_option_chain(sym_clean, expiry=exp_arg, spot_price=trig["c"])
+                chain_kw = {"expiry": exp_arg, "spot_price": trig["c"]}
+                if chart.get("is_offline"):
+                    chain_kw["provider"] = data_in.get_provider("simulated")
+                else:
+                    chain_kw["config"] = cfg
+                    chain_kw["now"] = _to_ist_aware(now_utc)
+                chain = data_in.fetch_option_chain(sym_clean, **chain_kw)
                 sel_strike = chain.select_strike(strategy=strike_selection or "ATM", option_type="CE")
                 contract = chain.get_contract(sel_strike, "CE")
                 if contract:

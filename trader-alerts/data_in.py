@@ -10,6 +10,7 @@ import datetime
 import gzip
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -27,6 +28,7 @@ if _alerts_dir not in sys.path:
 import symbols_in
 import calendar_in
 import instruments
+import upstox_feed
 
 # User agent and provider constants
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; BharatTrader/1.0; +https://github.com/KulmeetSJ/day-trader-skill)"
@@ -400,7 +402,7 @@ class MarketDataProvider:
         return bool(self.CAPABILITIES.get(capability, False))
 
     @classmethod
-    def validate_config(cls, config=None, env=None):
+    def validate_config(cls, config=None, env=None, **kwargs):
         """Validate provider credentials and settings before activation."""
         if not cls.requires_auth or not cls.required_credentials:
             return True
@@ -413,7 +415,8 @@ class MarketDataProvider:
         missing = []
         for key in cls.required_credentials:
             val = (
-                prov_creds.get(key)
+                kwargs.get(key)
+                or prov_creds.get(key)
                 or cfg.get(key)
                 or env_map.get("%s_%s" % (cls.provider_name.upper(), key.upper()))
                 or env_map.get(key.upper())
@@ -2012,12 +2015,1559 @@ class SimulatedMarketDataProvider(MarketDataProvider):
         return self.base_provider.get_derivatives_master(exchange=exchange)
 
 
+# ---------------------------------------------------------------- Upstox Analytics Token Provider
+
+_logger = logging.getLogger("day_trader.data_in")
+
+UPSTOX_BASE_URL = "https://api.upstox.com"
+UPSTOX_INSTRUMENTS_CDN_TEMPLATE = "https://assets.upstox.com/market-quote/instruments/exchange/%s.json.gz"
+
+_UPSTOX_AUTH_ERROR_CODES = ("UDAPI100050", "UDAPI100051", "UDAPI100052", "UDAPI100016")
+_UPSTOX_NOT_FOUND_CODES = ("UDAPI100011", "UDAPI100044")
+_UPSTOX_RATE_LIMIT_CODES = ("UDAPI10005", "UDAPI100005")
+
+_UPSTOX_INDEX_KEYS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "NIFTY50": "NSE_INDEX|Nifty 50",
+    "NIFTY 50": "NSE_INDEX|Nifty 50",
+    "^NSEI": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "NIFTY BANK": "NSE_INDEX|Nifty Bank",
+    "^NSEBANK": "NSE_INDEX|Nifty Bank",
+    "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
+    "NIFTY FIN SERVICE": "NSE_INDEX|Nifty Fin Service",
+    "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+    "INDIAVIX": "NSE_INDEX|India VIX",
+    "INDIA VIX": "NSE_INDEX|India VIX",
+    "^INDIAVIX": "NSE_INDEX|India VIX",
+    "SENSEX": "BSE_INDEX|SENSEX",
+    "^BSESN": "BSE_INDEX|SENSEX",
+    "BANKEX": "BSE_INDEX|BANKEX",
+}
+
+
+def _redact_upstox_secret(text, secret=None):
+    return upstox_feed.redact_secret(text, secret=secret)
+
+
+def _is_yahoo_fallback_enabled(config=None, env=None):
+    """Return True only when Yahoo fallback is explicitly enabled in config or env."""
+    cfg = _load_config_dict(config) if isinstance(config, (dict, str)) else (config if isinstance(config, dict) else {})
+    env_map = env if env is not None else os.environ
+    fb_prov = cfg.get("fallback_provider")
+    if fb_prov is None:
+        fb_prov = env_map.get("INDIA_MARKET_DATA_FALLBACK_PROVIDER")
+    if fb_prov is not None and str(fb_prov).strip():
+        fb_name = str(fb_prov).strip().lower()
+        if fb_name != "yahoo":
+            raise ProviderConfigError(
+                "Unsupported fallback_provider: '%s'. Only 'yahoo' is supported." % fb_prov
+            )
+    else:
+        fb_name = ""
+
+    allow_flag = cfg.get("allow_yahoo_fallback")
+    if allow_flag is None:
+        env_flag = str(env_map.get("INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK") or "").strip().lower()
+        if env_flag in ("1", "true", "yes", "on"):
+            allow_flag = True
+        elif env_flag in ("0", "false", "no", "off"):
+            allow_flag = False
+    if allow_flag is False:
+        return False
+    return bool(allow_flag) or (fb_name == "yahoo")
+
+
+def _parse_upstox_timestamp(val):
+    """Parse an Upstox epoch-ms/epoch-s/ISO-8601 timestamp into UTC epoch seconds (int)."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        num = float(val)
+        if num <= 0:
+            return None
+        if num > 1e14:
+            return int(num / 1e6)
+        if num > 1e11:
+            return int(num / 1000.0)
+        return int(num)
+    raw = str(val).strip()
+    if not raw:
+        return None
+    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+        return _parse_upstox_timestamp(float(raw))
+    iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=calendar_in.IST)
+        return int(dt.timestamp())
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(raw, fmt).replace(tzinfo=calendar_in.IST)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_range_days(range_str):
+    raw = str(range_str or "1y").strip().lower()
+    if raw == "max":
+        return 3650
+    m = re.match(r"^(\d+)\s*(d|wk|w|mo|m|y)$", raw)
+    if not m:
+        return 365
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "d":
+        return max(1, n)
+    if unit in ("w", "wk"):
+        return max(7, n * 7)
+    if unit in ("mo", "m"):
+        return max(30, n * 31)
+    return max(365, n * 366)
+
+
+def _to_upstox_interval_v3(interval):
+    raw = str(interval or "1d").strip()
+    low = raw.lower()
+    mapping = {
+        "1d": ("days", "1", 86400),
+        "d": ("days", "1", 86400),
+        "daily": ("days", "1", 86400),
+        "1wk": ("weeks", "1", 604800),
+        "1w": ("weeks", "1", 604800),
+        "w": ("weeks", "1", 604800),
+        "weekly": ("weeks", "1", 604800),
+        "1mo": ("months", "1", 2592000),
+        "mo": ("months", "1", 2592000),
+        "monthly": ("months", "1", 2592000),
+        "1m": ("minutes", "1", 60),
+        "3m": ("minutes", "3", 180),
+        "5m": ("minutes", "5", 300),
+        "15m": ("minutes", "15", 900),
+        "30m": ("minutes", "30", 1800),
+        "60m": ("hours", "1", 3600),
+        "1h": ("hours", "1", 3600),
+    }
+    if low in mapping:
+        return mapping[low]
+    m_min = re.match(r"^(\d+)m$", low)
+    if m_min:
+        val = int(m_min.group(1))
+        if 1 <= val <= 300:
+            return ("minutes", str(val), val * 60)
+    m_hr = re.match(r"^(\d+)h$", low)
+    if m_hr:
+        val = int(m_hr.group(1))
+        if 1 <= val <= 5:
+            return ("hours", str(val), val * 3600)
+    raise InvalidSymbolError("Unsupported Upstox V3 candle interval: '%s'" % interval)
+
+
+def _iter_upstox_date_chunks(start_date, end_date, unit, unit_interval):
+    """Yield (chunk_start, chunk_end) date windows complying with Upstox V3 calendar caps."""
+    if start_date > end_date:
+        return []
+    iv_num = int(unit_interval)
+    if unit == "minutes":
+        # Upstox V3 caps: <=15m at 1 calendar month (28-day Feb -> 27d delta),
+        # >15m at 1 quarter (Feb+Mar+Apr non-leap = 89 days -> 88d delta).
+        max_days = 27 if iv_num <= 15 else 88
+    elif unit == "hours":
+        max_days = 88
+    elif unit == "days":
+        max_days = 3649
+    else:
+        return [(start_date, end_date)]
+    chunks = []
+    cur = start_date
+    while cur <= end_date:
+        chunk_end = min(end_date, cur + datetime.timedelta(days=max_days))
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + datetime.timedelta(days=1)
+    return chunks
+
+
+class UpstoxOptionChain(OptionChain):
+    """OptionChain preserving real Upstox provider, live/historical status, and Greeks."""
+
+    def __init__(self, underlying, underlying_price, expiry, strikes_data,
+                 data_tier=DataTier.REAL_TIME, data_status=DataStatus.CURRENT,
+                 provider="upstox", is_live=True, timestamp=None, exchange="NSE",
+                 pcr_override=None, underlying_key=None):
+        OptionChain.__init__(
+            self,
+            underlying=underlying,
+            underlying_price=underlying_price,
+            expiry=expiry,
+            strikes_data=strikes_data,
+            data_tier=data_tier,
+            timestamp=timestamp,
+            exchange=exchange,
+        )
+        self.provider = str(provider or "upstox")
+        self.data_status = str(data_status or DataStatus.CURRENT)
+        self.is_live = bool(is_live)
+        self.pcr_override = pcr_override
+        self.underlying_key = underlying_key
+
+    @property
+    def pcr(self):
+        calc = OptionChain.pcr.fget(self)
+        if self.pcr_override is not None and not calc:
+            return round(float(self.pcr_override), 3)
+        return calc
+
+    def to_dict(self):
+        doc = OptionChain.to_dict(self)
+        doc["provider"] = self.provider
+        doc["source"] = self.provider
+        doc["tier"] = self.data_tier
+        doc["data_status"] = self.data_status
+        doc["is_live"] = self.is_live
+        doc["is_simulated"] = False
+        if self.underlying_key:
+            doc["underlying_key"] = self.underlying_key
+        if isinstance(doc.get("meta"), dict):
+            doc["meta"]["provider"] = self.provider
+            doc["meta"]["source"] = self.provider
+            doc["meta"]["tier"] = self.data_tier
+            doc["meta"]["data_status"] = self.data_status
+            doc["meta"]["is_live"] = self.is_live
+            doc["meta"]["is_simulated"] = False
+        return doc
+
+
+class UpstoxMarketDataProvider(MarketDataProvider):
+    """Read-only Upstox Analytics Token market-data provider for Indian equities/F&O.
+
+    Supports Upstox API v2/v3 read-only GET endpoints and V3 WebSocket streaming:
+    - Live quotes (/v3/market-quote/quotes, ltp, ohlc)
+    - Historical & intraday candles (/v3/historical-candle/...) with auto-chunking
+    - Option chains (/v2/option/chain), option contracts (/v2/option/contract),
+      option Greeks (/v3/market-quote/option-greek), and Open Interest (OI)
+    - Market status (/v2/market/status/{exchange})
+    - Instrument & derivatives masters (NSE/BSE JSON masters + local ISIN fallback)
+    - WebSocket Market Data Feed V3 (/v3/feed/market-data-feed/authorize + Protobuf)
+
+    Strictly read-only: NO OAuth interactive login and NO order execution.
+    """
+
+    provider_name = "upstox"
+    requires_auth = True
+    required_credentials = ("analytics_token",)
+
+    CAPABILITIES = {
+        CAPABILITY_HISTORICAL_CANDLES: True,
+        CAPABILITY_INTRADAY_CANDLES: True,
+        CAPABILITY_LIVE_QUOTES: True,
+        CAPABILITY_STREAMING_DATA: True,
+        CAPABILITY_OPTION_CHAINS: True,
+        CAPABILITY_OPEN_INTEREST: True,
+        CAPABILITY_INSTRUMENT_MASTERS: True,
+        CAPABILITY_MARKET_STATUS: True,
+    }
+
+    @classmethod
+    def resolve_credentials(cls, config=None, env=None, analytics_token=None):
+        """Resolve non-empty Upstox Analytics Token from explicit arg, config, or env."""
+        if analytics_token is not None and str(analytics_token).strip():
+            return str(analytics_token).strip()
+        cfg = _load_config_dict(config) if config is not None else {}
+        creds_map = cfg.get("provider_credentials") or {}
+        prov_creds = creds_map.get("upstox") if isinstance(creds_map, dict) else {}
+        if not isinstance(prov_creds, dict):
+            prov_creds = {}
+        env_map = env if env is not None else os.environ
+        candidates = (
+            prov_creds.get("analytics_token"),
+            cfg.get("upstox_analytics_token"),
+            cfg.get("analytics_token"),
+            env_map.get("UPSTOX_ANALYTICS_TOKEN"),
+        )
+        for val in candidates:
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        return None
+
+    @classmethod
+    def resolve_account_tier(cls, config=None, env=None, account_tier=None):
+        """Resolve Upstox account tier ('standard' default, or opt-in 'plus')."""
+        if account_tier is not None and str(account_tier).strip():
+            raw = str(account_tier).strip()
+        else:
+            cfg = _load_config_dict(config) if config is not None else {}
+            creds_map = cfg.get("provider_credentials") or {}
+            prov_creds = creds_map.get("upstox") if isinstance(creds_map, dict) else {}
+            if not isinstance(prov_creds, dict):
+                prov_creds = {}
+            env_map = env if env is not None else os.environ
+            raw = None
+            for val in (
+                prov_creds.get("account_tier"),
+                cfg.get("upstox_account_tier"),
+                cfg.get("account_tier"),
+                env_map.get("UPSTOX_ACCOUNT_TIER"),
+            ):
+                if val is not None and str(val).strip():
+                    raw = str(val).strip()
+                    break
+        try:
+            return upstox_feed.normalize_account_tier(raw)
+        except ValueError as e:
+            raise ProviderConfigError(str(e))
+
+    @classmethod
+    def validate_config(cls, config=None, env=None, analytics_token=None, account_tier=None, **_kwargs):
+        """Ensure Upstox Analytics Token and account tier are valid before activating provider."""
+        cfg = _load_config_dict(config) if config is not None else {}
+        env_map = env if env is not None else os.environ
+        _is_yahoo_fallback_enabled(cfg, env_map)
+        cls.resolve_account_tier(config=cfg, env=env_map, account_tier=account_tier)
+        token = cls.resolve_credentials(config=cfg, env=env_map, analytics_token=analytics_token)
+        if not token:
+            raise AuthenticationConfigError(
+                "Upstox Analytics Token is missing. Set UPSTOX_ANALYTICS_TOKEN in your environment "
+                "(or config provider_credentials.upstox.analytics_token) to use INDIA_MARKET_DATA_PROVIDER=upstox, "
+                "or omit it to keep default free Yahoo delayed mode."
+            )
+        return True
+
+    def __init__(
+        self,
+        analytics_token=None,
+        config=None,
+        env=None,
+        http_get=None,
+        ws_connect=None,
+        timeout=DEFAULT_TIMEOUT,
+        base_url=UPSTOX_BASE_URL,
+        instruments_url_template=UPSTOX_INSTRUMENTS_CDN_TEMPLATE,
+        allow_yahoo_fallback=None,
+        fallback_factory=None,
+        now_fn=None,
+        account_tier=None,
+    ):
+        self._config = _load_config_dict(config) if config is not None else {}
+        env_map = env if env is not None else os.environ
+        self.account_tier = self.resolve_account_tier(
+            config=self._config, env=env_map, account_tier=account_tier
+        )
+        token = self.resolve_credentials(config=self._config, env=env_map, analytics_token=analytics_token)
+        if not token:
+            raise AuthenticationConfigError(
+                "Upstox Analytics Token is missing. Set UPSTOX_ANALYTICS_TOKEN or keep default Yahoo mode."
+            )
+        self._analytics_token = token
+        if allow_yahoo_fallback is not None:
+            self._allow_yahoo_fallback = bool(allow_yahoo_fallback)
+        else:
+            self._allow_yahoo_fallback = _is_yahoo_fallback_enabled(self._config, env_map)
+        self._fallback_factory = fallback_factory or YahooMarketDataProvider
+        self._http_get_fn = http_get
+        self._ws_connect = ws_connect
+        self._timeout = int(timeout)
+        self._base_url = str(base_url or UPSTOX_BASE_URL).rstrip("/")
+        self._instruments_url_template = str(instruments_url_template or UPSTOX_INSTRUMENTS_CDN_TEMPLATE)
+        self._now_fn = now_fn
+
+        self._instruments_by_exch = {}
+        self._key_by_symbol = {}
+        self._symbol_by_key = {}
+        self._meta_by_key = {}
+        self._active_ws_connections = [0]
+        self._stream_quota = upstox_feed.UpstoxStreamQuota(account_tier=self.account_tier)
+
+        custom_map = self._config.get("upstox_instruments") or self._config.get("symbol_map") or {}
+        if isinstance(custom_map, dict):
+            exch_default = _normalize_exchange(self._config.get("exchange") or "NSE")
+            for raw_sym, ikey in custom_map.items():
+                if raw_sym and ikey:
+                    c_sym = symbols_in.normalize_symbol(str(raw_sym))
+                    self._key_by_symbol[(exch_default, c_sym)] = str(ikey).strip()
+                    self._symbol_by_key[str(ikey).strip()] = c_sym
+
+    def stream_limits(self):
+        """Return effective Upstox WebSocket V3 connection and subscription limits for configured tier."""
+        return upstox_feed.get_tier_limits(self.account_tier)
+
+    def __repr__(self):
+        return "<UpstoxMarketDataProvider provider='upstox' tier='%s' readonly=True>" % self.account_tier
+
+    __str__ = __repr__
+
+    def _now_ist(self):
+        if self._now_fn is not None:
+            dt = self._now_fn()
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=calendar_in.IST)
+            return dt.astimezone(calendar_in.IST)
+        return calendar_in.now_ist()
+
+    def _auth_headers(self):
+        return {
+            "Accept": "application/json",
+            "Authorization": "Bearer %s" % self._analytics_token,
+            "User-Agent": DEFAULT_USER_AGENT,
+        }
+
+    def _classify_upstox_error(self, status_code, body_text, url=""):
+        clean_url = _redact_upstox_secret(url, self._analytics_token)
+        clean_body = _redact_upstox_secret(body_text, self._analytics_token)
+        err_codes = []
+        err_msgs = []
+        try:
+            parsed = json.loads(body_text) if isinstance(body_text, str) else (
+                body_text if isinstance(body_text, dict) else {}
+            )
+            if isinstance(parsed, dict):
+                for e in (parsed.get("errors") or []):
+                    if isinstance(e, dict):
+                        code = str(e.get("errorCode") or "").strip()
+                        msg = str(e.get("message") or "").strip()
+                        if code:
+                            err_codes.append(code)
+                        if msg:
+                            err_msgs.append(_redact_upstox_secret(msg, self._analytics_token))
+                if not err_msgs and parsed.get("message"):
+                    err_msgs.append(_redact_upstox_secret(parsed.get("message"), self._analytics_token))
+        except Exception:
+            pass
+
+        combined_msg = "; ".join(err_msgs) or clean_body[:240] or ("HTTP %s" % status_code)
+        combined_low = combined_msg.lower()
+        if (
+            status_code in (401, 403)
+            or any(c in _UPSTOX_AUTH_ERROR_CODES for c in err_codes)
+            or "invalid token" in combined_low
+            or "token expired" in combined_low
+            or "unauthorized" in combined_low
+        ):
+            raise AuthenticationConfigError(
+                "Upstox authentication failed (%s): %s. Verify UPSTOX_ANALYTICS_TOKEN."
+                % (", ".join(err_codes) or ("HTTP %s" % status_code), combined_msg)
+            )
+        if status_code == 429 or any(c in _UPSTOX_RATE_LIMIT_CODES for c in err_codes) or "rate limit" in combined_low:
+            raise RateLimitError("Upstox rate limit exceeded (%s): %s" % (status_code, combined_msg))
+        if (
+            status_code == 404
+            or any(c in _UPSTOX_NOT_FOUND_CODES for c in err_codes)
+            or "invalid instrument" in combined_low
+        ):
+            raise SymbolNotFoundError("Upstox instrument/data not found (%s): %s" % (clean_url, combined_msg))
+        if status_code is not None and int(status_code) >= 500:
+            raise ProviderConnectionError("Upstox server error HTTP %s: %s" % (status_code, combined_msg))
+        raise DataError("Upstox API error (%s): %s" % (", ".join(err_codes) or status_code, combined_msg))
+
+    def _raw_http_get(self, url, headers=None, method="GET"):
+        if str(method).upper() != "GET":
+            raise ProviderConfigError(
+                "UpstoxMarketDataProvider is strictly read-only; HTTP %s is forbidden." % method
+            )
+        hdrs = dict(headers or {})
+        if self._http_get_fn is not None:
+            resp = self._http_get_fn(url, headers=hdrs, timeout=self._timeout)
+            if isinstance(resp, tuple) and len(resp) == 2:
+                return int(resp[0]), resp[1]
+            if hasattr(resp, "status_code") or hasattr(resp, "status"):
+                code = getattr(resp, "status_code", None)
+                if code is None:
+                    code = getattr(resp, "status", 200)
+                if hasattr(resp, "read"):
+                    body = resp.read()
+                elif hasattr(resp, "text"):
+                    body = resp.text
+                else:
+                    body = resp.content
+                return int(code), body
+            return 200, resp
+
+        req = urllib.request.Request(url, headers=hdrs, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                return int(getattr(resp, "status", 200)), resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(e)
+            self._classify_upstox_error(e.code, err_body, url=url)
+        except urllib.error.URLError as e:
+            raise ProviderConnectionError(
+                "Upstox connection failed: %s" % _redact_upstox_secret(e.reason, self._analytics_token)
+            )
+        except OSError as e:
+            raise ProviderConnectionError(
+                "Upstox transport error: %s" % _redact_upstox_secret(e, self._analytics_token)
+            )
+
+    def _request_json(self, path_or_url, query_params=None, auth=True):
+        url = path_or_url if str(path_or_url).startswith("http") else (self._base_url + path_or_url)
+        if query_params:
+            pairs = []
+            for k, v in query_params.items():
+                if v is not None:
+                    pairs.append((k, str(v)))
+            if pairs:
+                sep = "&" if "?" in url else "?"
+                url = url + sep + urllib.parse.urlencode(pairs)
+
+        headers = self._auth_headers() if auth else {"Accept": "application/json", "User-Agent": DEFAULT_USER_AGENT}
+        status_code, body = self._raw_http_get(url, headers=headers, method="GET")
+        if status_code >= 400:
+            if isinstance(body, (bytes, bytearray)):
+                body = bytes(body).decode("utf-8", errors="replace")
+            self._classify_upstox_error(status_code, body, url=url)
+
+        if isinstance(body, (dict, list)):
+            data = body
+        else:
+            if isinstance(body, (bytes, bytearray)):
+                raw_b = bytes(body)
+                if raw_b[:2] == b"\x1f\x8b":
+                    raw_b = gzip.decompress(raw_b)
+                body_str = raw_b.decode("utf-8", errors="replace")
+            else:
+                body_str = str(body)
+            try:
+                data = json.loads(body_str)
+            except ValueError as e:
+                raise DataError("Malformed JSON from Upstox API: %s" % e)
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            self._classify_upstox_error(status_code or 400, json.dumps(data), url=url)
+        return data
+
+    def _with_yahoo_fallback(self, fn_name, *args, **kwargs):
+        if not self._allow_yahoo_fallback:
+            raise AuthenticationConfigError(
+                "Upstox authentication failed and Yahoo fallback is disabled by default."
+            )
+        _logger.warning("Upstox auth failed; delegating %s to explicit Yahoo DELAYED fallback.", fn_name)
+        fb = self._fallback_factory()
+        res = getattr(fb, fn_name)(*args, **kwargs)
+        if isinstance(res, dict):
+            out = dict(res)
+            out["fallback_from"] = "upstox"
+            out["fallback_reason"] = "upstox_auth_error"
+            out["provider"] = "yahoo"
+            out["source"] = "yahoo"
+            out["is_live"] = False
+            if str(out.get("tier") or "") == DataTier.REAL_TIME:
+                out["tier"] = DataTier.DELAYED
+            if isinstance(out.get("meta"), dict):
+                out["meta"] = dict(out["meta"])
+                out["meta"]["provider"] = "yahoo"
+                out["meta"]["fallback_from"] = "upstox"
+            return out
+        return res
+
+    def resolve_instrument_key(self, symbol, exchange="NSE"):
+        """Resolve a ticker or instrument_key into (instrument_key, canonical_symbol, exchange)."""
+        if not symbol or not str(symbol).strip():
+            raise InvalidSymbolError("Empty symbol")
+        raw = str(symbol).strip()
+        exch = _normalize_exchange(exchange)
+        raw_upper = raw.upper()
+        if raw_upper.endswith(".NS"):
+            exch = "NSE"
+        elif raw_upper.endswith(".BO"):
+            exch = "BSE"
+
+        # Already an Upstox instrument key (e.g., NSE_EQ|INE002A01018, NSE_INDEX|Nifty 50, NSE_FO|12345)
+        if "|" in raw:
+            seg_part = raw.split("|", 1)[0].strip().upper()
+            if seg_part.startswith("BSE"):
+                exch = "BSE"
+            elif seg_part.startswith("MCX"):
+                exch = "MCX"
+            elif seg_part.startswith("NSE") or seg_part.startswith("NFO"):
+                exch = "NSE"
+            mapped_sym = self._symbol_by_key.get(raw)
+            if not mapped_sym:
+                if seg_part.endswith("_INDEX"):
+                    tail = raw.split("|", 1)[1].strip().upper()
+                    rev = {v.upper(): k for k, v in _UPSTOX_INDEX_KEYS.items() if not k.startswith("^") and " " not in k}
+                    mapped_sym = rev.get(raw.upper(), tail)
+                else:
+                    mapped_sym = raw
+            return raw, mapped_sym, exch
+
+        try:
+            canon = symbols_in.normalize_symbol(raw)
+        except Exception as e:
+            raise InvalidSymbolError("Invalid Indian market symbol '%s': %s" % (raw, e))
+        if canon in _UPSTOX_INDEX_KEYS:
+            ikey = _UPSTOX_INDEX_KEYS[canon]
+            idx_exch = "BSE" if ikey.startswith("BSE_") else "NSE"
+            return ikey, canon, idx_exch
+        if raw_upper in _UPSTOX_INDEX_KEYS:
+            ikey = _UPSTOX_INDEX_KEYS[raw_upper]
+            idx_exch = "BSE" if ikey.startswith("BSE_") else "NSE"
+            return ikey, canon, idx_exch
+
+        if (exch, canon) in self._key_by_symbol:
+            return self._key_by_symbol[(exch, canon)], canon, exch
+        if ("NSE", canon) in self._key_by_symbol and not exchange:
+            return self._key_by_symbol[("NSE", canon)], canon, "NSE"
+
+        # Check instruments metadata / local ISIN directory without extra HTTP call
+        info = None
+        if hasattr(instruments, "get_instrument_info"):
+            try:
+                info = instruments.get_instrument_info(canon, exchange=exch)
+            except TypeError:
+                try:
+                    info = instruments.get_instrument_info(canon)
+                except Exception:
+                    info = None
+            except Exception:
+                info = None
+        if isinstance(info, dict):
+            if info.get("upstox_key"):
+                ikey = str(info["upstox_key"]).strip()
+                self._key_by_symbol[(exch, canon)] = ikey
+                self._symbol_by_key[ikey] = canon
+                return ikey, canon, exch
+            isin = info.get("isin") or info.get("ISIN")
+            if isin and symbols_in.validate_isin(str(isin).strip()):
+                seg = "BSE_EQ" if exch == "BSE" else "NSE_EQ"
+                ikey = "%s|%s" % (seg, str(isin).strip().upper())
+                self._key_by_symbol[(exch, canon)] = ikey
+                self._symbol_by_key[ikey] = canon
+                return ikey, canon, exch
+
+        # Lazy-fetch Upstox official exchange JSON master
+        if exch not in self._instruments_by_exch:
+            try:
+                self.get_instruments(exchange=exch)
+            except AuthenticationConfigError:
+                raise
+            except Exception:
+                pass
+        if (exch, canon) in self._key_by_symbol:
+            return self._key_by_symbol[(exch, canon)], canon, exch
+
+        raise SymbolNotFoundError(
+            "Could not resolve Upstox instrument_key for '%s' (%s). Supply 'NSE_EQ|<ISIN>' or populate "
+            "Upstox instrument master / upstox_instruments mapping." % (symbol, exch)
+        )
+
+    def resolve_instrument_keys(self, symbols, exchange="NSE"):
+        """Resolve multiple symbols into (resolved_keys_list, key_to_symbol_map)."""
+        keys = []
+        key_to_sym = {}
+        for s in (symbols or []):
+            ikey, canon, _ = self.resolve_instrument_key(s, exchange=exchange)
+            keys.append(ikey)
+            key_to_sym[ikey] = canon
+        return keys, key_to_sym
+
+    def _extract_quote_item(self, data_map, instrument_key, canon_symbol, exchange):
+        if not isinstance(data_map, dict) or not data_map:
+            return None
+        if instrument_key in data_map:
+            return data_map[instrument_key]
+        seg = instrument_key.split("|", 1)[0] if "|" in instrument_key else ("BSE_EQ" if exchange == "BSE" else "NSE_EQ")
+        colon_key = "%s:%s" % (seg, canon_symbol)
+        if colon_key in data_map:
+            return data_map[colon_key]
+
+        ikey_low = instrument_key.lower()
+        sym_up = str(canon_symbol).upper()
+        for k, val in data_map.items():
+            if not isinstance(val, dict):
+                continue
+            tok = str(val.get("instrument_token") or val.get("instrument_key") or "").strip().lower()
+            if tok and tok == ikey_low:
+                return val
+            k_up = str(k).upper()
+            if k_up == colon_key.upper() or k_up.endswith(":%s" % sym_up) or k_up.endswith("|%s" % sym_up):
+                return val
+            tail = instrument_key.split("|", 1)[1].upper() if "|" in instrument_key else sym_up
+            if k_up.endswith(":%s" % tail) or k_up.endswith("|%s" % tail):
+                return val
+
+        # Guard against mismatched single-entry response returning another company
+        if len(data_map) == 1:
+            only_k, only_v = next(iter(data_map.items()))
+            if isinstance(only_v, dict):
+                tok = str(only_v.get("instrument_token") or only_v.get("instrument_key") or "").strip()
+                if tok and tok.lower() != ikey_low:
+                    raise DataError(
+                        "Upstox returned quote for %s instead of requested %s (%s)"
+                        % (tok, canon_symbol, instrument_key)
+                    )
+                if ":" in str(only_k):
+                    ret_sym = str(only_k).split(":", 1)[1].upper()
+                    if ret_sym != sym_up and ("|" not in instrument_key or ret_sym != instrument_key.split("|", 1)[1].upper()):
+                        raise DataError(
+                            "Upstox returned quote for %s instead of requested %s"
+                            % (only_k, canon_symbol)
+                        )
+                return only_v
+        return None
+
+    def _normalize_quote_item(
+        self,
+        item,
+        instrument_key,
+        canon_symbol,
+        exchange,
+        now=None,
+        mode="full",
+        ohlc_interval="1d",
+    ):
+        if not isinstance(item, dict):
+            raise MissingDataError("No quote data returned from Upstox for %s" % canon_symbol)
+        last_price = item.get("last_price")
+        if last_price is None:
+            raise MissingDataError("Upstox quote missing last_price for %s" % canon_symbol)
+        price = float(last_price)
+
+        ohlc = item.get("ohlc") or item.get("live_ohlc") or {}
+        if not isinstance(ohlc, dict):
+            ohlc = {}
+        prev_ohlc = item.get("prev_ohlc") or {}
+        if not isinstance(prev_ohlc, dict):
+            prev_ohlc = {}
+
+        is_daily_ohlc = (str(ohlc_interval or "1d").strip().lower() == "1d")
+        prev_close = None
+        cands = [item.get("cp"), item.get("prev_close_price")]
+        if mode != "ohlc" or is_daily_ohlc:
+            cands.append(prev_ohlc.get("close"))
+        for cand in cands:
+            if cand is not None and float(cand) > 0:
+                prev_close = float(cand)
+                break
+        if prev_close is None and item.get("net_change") is not None:
+            prev_close = round(price - float(item["net_change"]), 4)
+        if prev_close is None and is_daily_ohlc and mode != "ohlc" and ohlc.get("close") is not None and float(ohlc["close"]) > 0:
+            prev_close = float(ohlc["close"])
+
+        open_px = float(ohlc["open"]) if ohlc.get("open") is not None else None
+        high_px = float(ohlc["high"]) if ohlc.get("high") is not None else None
+        low_px = float(ohlc["low"]) if ohlc.get("low") is not None else None
+        close_px = float(ohlc["close"]) if ohlc.get("close") is not None else price
+
+        vol_val = item.get("volume")
+        if vol_val is None:
+            vol_val = ohlc.get("volume")
+        volume = int(vol_val) if vol_val is not None else None
+
+        q_ts = (
+            _parse_upstox_timestamp(item.get("last_trade_time"))
+            or _parse_upstox_timestamp(item.get("timestamp"))
+            or _parse_upstox_timestamp(ohlc.get("ts"))
+        )
+
+        now_dt, cutoff_ts = _parse_cutoff_ts(now)
+        ref_dt = now_dt if now_dt is not None else self._now_ist()
+        if cutoff_ts is not None:
+            if q_ts is None:
+                raise MissingDataError(
+                    "Upstox quote for %s has no timestamp before simulated cutoff %s"
+                    % (canon_symbol, _format_ist(cutoff_ts))
+                )
+            if int(q_ts) > int(cutoff_ts):
+                raise MissingDataError(
+                    "Quote timestamp %s is after simulated cutoff %s for %s"
+                    % (_format_ist(q_ts), _format_ist(cutoff_ts), canon_symbol)
+                )
+        elif q_ts is None:
+            q_ts = int(ref_dt.timestamp())
+
+        is_open = bool(calendar_in.is_market_hours_in(ref_dt, exchange=exchange))
+        q_dt_ist = datetime.datetime.fromtimestamp(int(q_ts), tz=calendar_in.IST)
+        same_session = (q_dt_ist.date() == ref_dt.date())
+        if is_open and same_session and (int(ref_dt.timestamp()) - int(q_ts)) <= 600:
+            data_status = DataStatus.CURRENT
+            tier = DataTier.REAL_TIME
+            is_live = True
+        elif same_session and not is_open:
+            data_status = DataStatus.HISTORICAL
+            tier = DataTier.HISTORICAL
+            is_live = False
+        else:
+            data_status = DataStatus.HISTORICAL
+            tier = DataTier.HISTORICAL
+            is_live = False
+
+        age_secs, freshness = _compute_freshness(q_ts, data_status, now=now if now is not None else ref_dt)
+        if age_secs is not None and age_secs > 600 and data_status == DataStatus.CURRENT:
+            data_status = DataStatus.STALE
+            is_live = False
+            _, freshness = _compute_freshness(q_ts, data_status, now=now if now is not None else ref_dt)
+
+        depth = item.get("depth") if isinstance(item.get("depth"), dict) else None
+        best_bid = None
+        best_ask = None
+        if depth:
+            buys = depth.get("buy") or []
+            sells = depth.get("sell") or []
+            if buys and isinstance(buys[0], dict):
+                best_bid = buys[0].get("price")
+            if sells and isinstance(sells[0], dict):
+                best_ask = sells[0].get("price")
+
+        payload = {
+            "symbol": canon_symbol,
+            "exchange": exchange,
+            "instrument_key": instrument_key,
+            "instrument_token": item.get("instrument_token") or instrument_key,
+            "quote_mode": mode,
+            "price": price,
+            "last_price": price,
+            "prev_close": prev_close,
+            "open": open_px,
+            "high": high_px,
+            "low": low_px,
+            "close": close_px,
+            "volume": volume,
+            "ltq": int(item["ltq"]) if item.get("ltq") is not None else None,
+            "oi": float(item["oi"]) if item.get("oi") is not None else None,
+            "prev_oi": float(item["previous_oi"]) if item.get("previous_oi") is not None else (
+                float(item["prev_oi"]) if item.get("prev_oi") is not None else None
+            ),
+            "average_price": float(item["average_price"]) if item.get("average_price") is not None else None,
+            "total_buy_quantity": item.get("total_buy_quantity"),
+            "total_sell_quantity": item.get("total_sell_quantity"),
+            "lower_circuit": item.get("lower_circuit_limit") or item.get("lower_circuit"),
+            "upper_circuit": item.get("upper_circuit_limit") or item.get("upper_circuit"),
+            "bid": best_bid,
+            "ask": best_ask,
+            "depth": depth,
+            "timestamp": int(q_ts),
+            "as_of": _format_ist(q_ts),
+            "last_data_timestamp": _format_ist_iso(q_ts),
+            "age_seconds": age_secs,
+            "freshness": freshness,
+            "meta": {
+                "symbol": canon_symbol,
+                "exchangeName": exchange,
+                "instrument_key": instrument_key,
+                "regularMarketPrice": price,
+                "previousClose": prev_close,
+                "regularMarketTime": int(q_ts),
+            },
+        }
+        return _standardize_payload(
+            payload,
+            provider_name=self.provider_name,
+            symbol=canon_symbol,
+            exchange=exchange,
+            data_status=data_status,
+            tier=tier,
+            is_live=is_live,
+            is_simulated=False,
+            now=now,
+        )
+
+    def get_quote(self, symbol, exchange="NSE", now=None):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        try:
+            resp = self._request_json("/v3/market-quote/quotes", query_params={"instrument_key": ikey})
+        except AuthenticationConfigError:
+            if self._allow_yahoo_fallback:
+                return self._with_yahoo_fallback("get_quote", symbol, exchange=exchange, now=now)
+            raise
+        data_map = (resp or {}).get("data") or {}
+        item = self._extract_quote_item(data_map, ikey, canon, exch)
+        return self._normalize_quote_item(item, ikey, canon, exch, now=now, mode="full")
+
+    def get_ltp(self, symbol, exchange="NSE", now=None):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        try:
+            resp = self._request_json("/v3/market-quote/ltp", query_params={"instrument_key": ikey})
+        except AuthenticationConfigError:
+            if self._allow_yahoo_fallback:
+                return self._with_yahoo_fallback("get_ltp", symbol, exchange=exchange, now=now)
+            raise
+        data_map = (resp or {}).get("data") or {}
+        item = self._extract_quote_item(data_map, ikey, canon, exch)
+        return self._normalize_quote_item(item, ikey, canon, exch, now=now, mode="ltp")
+
+    def get_ohlc(self, symbol, interval="1d", exchange="NSE", now=None):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        upstox_iv = {"1d": "1d", "1m": "I1", "30m": "I30"}.get(str(interval or "1d").lower(), interval)
+        try:
+            resp = self._request_json(
+                "/v3/market-quote/ohlc",
+                query_params={"instrument_key": ikey, "interval": upstox_iv},
+            )
+        except AuthenticationConfigError:
+            if self._allow_yahoo_fallback:
+                return self._with_yahoo_fallback("get_ohlc", symbol, exchange=exchange, interval=interval, now=now)
+            raise
+        data_map = (resp or {}).get("data") or {}
+        item = self._extract_quote_item(data_map, ikey, canon, exch)
+        out = self._normalize_quote_item(
+            item, ikey, canon, exch, now=now, mode="ohlc", ohlc_interval=upstox_iv
+        )
+        out["interval"] = interval
+        return out
+
+    def get_quotes(self, symbols, exchange="NSE", mode="full", now=None):
+        req_mode = str(mode or "full").strip().lower()
+        endpoint = {
+            "ltp": "/v3/market-quote/ltp",
+            "ohlc": "/v3/market-quote/ohlc",
+            "full": "/v3/market-quote/quotes",
+        }.get(req_mode, "/v3/market-quote/quotes")
+
+        resolved_entries = []
+        for s in (symbols or []):
+            ikey, canon, exch = self.resolve_instrument_key(s, exchange=exchange)
+            resolved_entries.append((ikey, canon, exch))
+
+        out = {}
+        batch_size = 500
+        for idx in range(0, len(resolved_entries), batch_size):
+            batch = resolved_entries[idx:idx + batch_size]
+            keys_param = ",".join(b[0] for b in batch)
+            qparams = {"instrument_key": keys_param}
+            if req_mode == "ohlc":
+                qparams["interval"] = "1d"
+            try:
+                resp = self._request_json(endpoint, query_params=qparams)
+            except AuthenticationConfigError:
+                if self._allow_yahoo_fallback:
+                    return self._with_yahoo_fallback("get_quotes", symbols, exchange=exchange, now=now)
+                raise
+            data_map = (resp or {}).get("data") or {}
+            for ikey, canon, exch in batch:
+                item = self._extract_quote_item(data_map, ikey, canon, exch)
+                if item is not None:
+                    out[canon] = self._normalize_quote_item(item, ikey, canon, exch, now=now, mode=req_mode)
+        return out
+
+    def _parse_upstox_candles(self, raw_candles, unit):
+        bars = []
+        daily = (unit in ("days", "weeks", "months"))
+        for row in (raw_candles or []):
+            if isinstance(row, (list, tuple)):
+                if len(row) < 5:
+                    continue
+                ts_raw, o, h, l, c = row[0], row[1], row[2], row[3], row[4]
+                v = row[5] if len(row) > 5 else 0
+                oi = row[6] if len(row) > 6 else None
+            elif isinstance(row, dict):
+                ts_raw = row.get("ts") or row.get("timestamp") or row.get("date")
+                o, h, l, c = row.get("open", row.get("o")), row.get("high", row.get("h")), row.get("low", row.get("l")), row.get("close", row.get("c"))
+                v = row.get("volume", row.get("v", 0))
+                oi = row.get("oi")
+            else:
+                continue
+            if None in (ts_raw, o, h, l, c):
+                continue
+            ts_int = _parse_upstox_timestamp(ts_raw)
+            if ts_int is None:
+                continue
+            dt_ist = datetime.datetime.fromtimestamp(int(ts_int), tz=calendar_in.IST)
+            bar = {
+                "ts": int(ts_int),
+                "t": int(ts_int),
+                "date": dt_ist.strftime("%Y-%m-%d"),
+                "slot": dt_ist.strftime("%H:%M") if not daily else dt_ist.strftime("%Y-%m-%d"),
+                "start": dt_ist.strftime("%H:%M") if not daily else dt_ist.strftime("%Y-%m-%d"),
+                "ist_time": dt_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+                "o": float(o),
+                "h": float(h),
+                "l": float(l),
+                "c": float(c),
+                "v": int(v or 0),
+            }
+            if oi is not None:
+                bar["oi"] = float(oi)
+            bars.append(bar)
+        return bars
+
+    def get_historical_data(
+        self,
+        symbol,
+        start=None,
+        end=None,
+        range_str="1y",
+        interval="1d",
+        exchange="NSE",
+        now=None,
+        include_intraday=False,
+    ):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        unit, unit_iv, iv_secs = _to_upstox_interval_v3(interval)
+        is_daily = unit in ("days", "weeks", "months")
+
+        cutoff_dt, cutoff_ts = _parse_cutoff_ts(now)
+        now_dt = self._now_ist()
+        today_ist = now_dt.date()
+
+        def _parse_d(val, default_d):
+            if val is None:
+                return default_d
+            if isinstance(val, datetime.datetime):
+                return val.astimezone(calendar_in.IST).date() if val.tzinfo else val.date()
+            if isinstance(val, datetime.date):
+                return val
+            return datetime.date.fromisoformat(str(val)[:10])
+
+        end_date = _parse_d(end, today_ist)
+        if cutoff_dt is not None:
+            end_date = min(end_date, cutoff_dt.date())
+        default_start = end_date - datetime.timedelta(days=_parse_range_days(range_str))
+        # Upstox V3 historical limits: minutes/hours from Jan 2022, days/weeks/months from Jan 2000.
+        min_floor = datetime.date(2000, 1, 1) if is_daily else datetime.date(2022, 1, 1)
+        start_date = max(min_floor, _parse_d(start, default_start))
+        if end_date < start_date:
+            raise MissingDataError(
+                "Upstox %s range [%s, %s] has no bars inside API history bounds (>= %s)"
+                % (interval, start_date.isoformat(), end_date.isoformat(), min_floor.isoformat())
+            )
+
+        encoded_key = urllib.parse.quote(ikey, safe="")
+        by_ts = {}
+        try:
+            for c_start, c_end in _iter_upstox_date_chunks(start_date, end_date, unit, unit_iv):
+                path = "/v3/historical-candle/%s/%s/%s/%s/%s" % (
+                    encoded_key, unit, unit_iv, c_end.isoformat(), c_start.isoformat()
+                )
+                try:
+                    resp = self._request_json(path)
+                except SymbolNotFoundError:
+                    if include_intraday and c_end >= today_ist:
+                        continue
+                    raise
+                candles = ((resp or {}).get("data") or {}).get("candles") or []
+                for bar in self._parse_upstox_candles(candles, unit):
+                    by_ts[bar["ts"]] = bar
+
+            if include_intraday and end_date >= today_ist:
+                intra_path = "/v3/historical-candle/intraday/%s/%s/%s" % (encoded_key, unit, unit_iv)
+                try:
+                    resp_intra = self._request_json(intra_path)
+                    candles_intra = ((resp_intra or {}).get("data") or {}).get("candles") or []
+                    for bar in self._parse_upstox_candles(candles_intra, unit):
+                        by_ts[bar["ts"]] = bar
+                except SymbolNotFoundError:
+                    pass
+        except AuthenticationConfigError:
+            if self._allow_yahoo_fallback:
+                if is_daily:
+                    return self._with_yahoo_fallback(
+                        "get_daily_bars", symbol, range_str=range_str, exchange=exchange, now=now
+                    )
+                return self._with_yahoo_fallback(
+                    "get_intraday_bars", symbol, interval=interval, range_str=range_str, exchange=exchange, now=now
+                )
+            raise
+
+        bars = sorted(by_ts.values(), key=lambda b: b["ts"])
+        if cutoff_ts is not None:
+            filtered = []
+            for b in bars:
+                b_date = datetime.date.fromisoformat(b["date"])
+                if is_daily:
+                    if b_date > cutoff_dt.date():
+                        continue
+                    if b_date == cutoff_dt.date() and not _is_daily_session_complete(b_date, cutoff_dt, exchange=exch):
+                        continue
+                else:
+                    if int(b["ts"]) + int(iv_secs) > int(cutoff_ts):
+                        continue
+                filtered.append(b)
+            bars = filtered
+
+        if not bars:
+            raise MissingDataError(
+                "No Upstox %s bars available for %s%s"
+                % (interval, canon, (" before simulated cutoff %s" % _format_ist(cutoff_ts)) if cutoff_ts else "")
+            )
+
+        last_bar = bars[-1]
+        last_ts = int(last_bar["ts"]) if is_daily else (
+            min(int(cutoff_ts), int(last_bar["ts"]) + int(iv_secs))
+            if cutoff_ts is not None else int(last_bar["ts"]) + int(iv_secs)
+        )
+        prev_close = bars[-2]["c"] if len(bars) >= 2 else None
+        if not is_daily and bars:
+            distinct_dates = sorted(set(b["date"] for b in bars))
+            if len(distinct_dates) >= 2:
+                prev_day = distinct_dates[-2]
+                prev_day_bars = [b for b in bars if b["date"] == prev_day]
+                if prev_day_bars:
+                    prev_close = prev_day_bars[-1]["c"]
+
+        ref_dt = cutoff_dt if cutoff_dt is not None else now_dt
+        is_open = bool(calendar_in.is_market_hours_in(ref_dt, exchange=exch))
+        last_bar_date = datetime.date.fromisoformat(last_bar["date"])
+        if not is_daily and is_open and last_bar_date == ref_dt.date() and (int(ref_dt.timestamp()) - last_ts) <= (iv_secs + 180):
+            data_status = DataStatus.CURRENT
+            tier = DataTier.REAL_TIME
+            is_live = True
+        else:
+            data_status = DataStatus.HISTORICAL
+            tier = DataTier.HISTORICAL
+            is_live = False
+
+        meta = {
+            "symbol": canon,
+            "exchangeName": exch,
+            "instrument_key": ikey,
+            "dataGranularity": interval,
+            "regularMarketPrice": last_bar["c"],
+            "regularMarketTime": last_ts,
+            "previousClose": prev_close,
+        }
+        if cutoff_ts is not None:
+            meta = _sanitize_meta_as_of(meta, bars, cutoff_ts, interval_secs=iv_secs, daily=is_daily)
+
+        payload = {
+            "symbol": canon,
+            "exchange": exch,
+            "instrument_key": ikey,
+            "interval": interval,
+            "range": range_str,
+            "bars": bars,
+            "count": len(bars),
+            "last_price": last_bar["c"],
+            "prev_close": prev_close,
+            "timestamp": last_ts,
+            "as_of": _format_ist(last_ts),
+            "last_data_timestamp": _format_ist_iso(last_ts),
+            "meta": meta,
+        }
+        return _standardize_payload(
+            payload,
+            provider_name=self.provider_name,
+            symbol=canon,
+            exchange=exch,
+            data_status=data_status,
+            tier=tier,
+            is_live=is_live,
+            is_simulated=False,
+            now=now,
+        )
+
+    def get_daily_bars(self, symbol, range_str="1y", exchange="NSE", now=None):
+        return self.get_historical_data(
+            symbol,
+            range_str=range_str,
+            interval="1d",
+            exchange=exchange,
+            now=now,
+            include_intraday=False,
+        )
+
+    def get_intraday_data(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
+        return self.get_historical_data(
+            symbol,
+            range_str=range_str,
+            interval=interval,
+            exchange=exchange,
+            now=now,
+            include_intraday=True,
+        )
+
+    def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
+        return self.get_intraday_data(
+            symbol,
+            interval=interval,
+            range_str=range_str,
+            exchange=exchange,
+            now=now,
+            is_cas_eligible=is_cas_eligible,
+        )
+
+    def get_batch_series(self, symbols, range_str="3mo", interval="1d", exchange="NSE", now=None, pause=0.0):
+        out = {}
+        last_err = None
+        is_daily = str(interval or "1d").lower() in ("1d", "d", "daily", "1wk", "1mo")
+        for idx, sym in enumerate(symbols or []):
+            canon = symbols_in.normalize_symbol(sym) if "|" not in str(sym) else str(sym)
+            try:
+                if is_daily:
+                    pl = self.get_daily_bars(sym, range_str=range_str, exchange=exchange, now=now)
+                else:
+                    pl = self.get_intraday_data(sym, interval=interval, range_str=range_str, exchange=exchange, now=now)
+                out[canon] = to_scanner_series(pl)
+                if pl.get("fallback_from"):
+                    out[canon]["fallback_from"] = pl["fallback_from"]
+            except AuthenticationConfigError:
+                raise
+            except (SymbolNotFoundError, MissingDataError) as e:
+                last_err = e
+                continue
+            if pause and idx + 1 < len(symbols):
+                time.sleep(pause)
+        if not out and symbols and last_err is not None:
+            raise last_err
+        return out
+
+    def get_instruments(self, exchange="NSE", symbol=None, force_refresh=False):
+        exch_req = str(exchange or "NSE").strip().upper()
+        norm_exch = _normalize_exchange(exch_req)
+        url_key = "complete" if exch_req in ("ALL", "COMPLETE") else norm_exch
+
+        records = None if force_refresh else self._instruments_by_exch.get(url_key)
+        if records is None:
+            url = self._instruments_url_template % url_key
+            # Public Upstox asset CDN requires no bearer token, though mock handlers accept either
+            raw = self._request_json(url, auth=False)
+            if isinstance(raw, dict):
+                raw_list = raw.get("data") or raw.get("instruments") or []
+            elif isinstance(raw, list):
+                raw_list = raw
+            else:
+                raw_list = []
+
+            records = []
+            for rec in raw_list:
+                if not isinstance(rec, dict):
+                    continue
+                ikey = str(rec.get("instrument_key") or "").strip()
+                tsym = str(rec.get("trading_symbol") or rec.get("tradingsymbol") or "").strip()
+                ex = _normalize_exchange(rec.get("exchange") or norm_exch)
+                item = {
+                    "symbol": tsym,
+                    "trading_symbol": tsym,
+                    "name": rec.get("name") or rec.get("short_name") or tsym,
+                    "exchange": ex,
+                    "segment": rec.get("segment") or "",
+                    "instrument_key": ikey,
+                    "instrument_token": rec.get("exchange_token") or ikey,
+                    "isin": rec.get("isin") or "",
+                    "instrument_type": rec.get("instrument_type") or "",
+                    "tick_size": rec.get("tick_size"),
+                    "lot_size": rec.get("lot_size"),
+                    "expiry": rec.get("expiry"),
+                    "strike_price": rec.get("strike_price"),
+                    "underlying_symbol": rec.get("underlying_symbol") or "",
+                    "underlying_key": rec.get("underlying_key") or "",
+                }
+                records.append(item)
+                if ikey:
+                    self._meta_by_key[ikey] = item
+                    if tsym:
+                        self._symbol_by_key[ikey] = tsym
+                        sym_norm = symbols_in.normalize_symbol(tsym) if not symbols_in.is_derivative_symbol(tsym) else tsym.upper()
+                        # Prefer EQ / INDEX segments for canonical equity symbol resolution
+                        if item["segment"] in ("NSE_EQ", "BSE_EQ", "NSE_INDEX", "BSE_INDEX") or (ex, sym_norm) not in self._key_by_symbol:
+                            self._key_by_symbol[(ex, sym_norm)] = ikey
+            self._instruments_by_exch[url_key] = records
+
+        filtered = records
+        if url_key != "complete":
+            filtered = [r for r in filtered if (r.get("exchange") or norm_exch).upper() == norm_exch]
+        if symbol:
+            target = symbols_in.normalize_symbol(symbol) if "|" not in str(symbol) else str(symbol).strip().upper()
+            filtered = [
+                r for r in filtered
+                if (r.get("trading_symbol") or "").upper() == target
+                or (r.get("symbol") or "").upper() == target
+                or (r.get("instrument_key") or "").upper() == str(symbol).strip().upper()
+            ]
+        return _standardize_payload(
+            {
+                "symbol": symbol or norm_exch,
+                "exchange": norm_exch,
+                "instruments": filtered,
+                "count": len(filtered),
+            },
+            provider_name=self.provider_name,
+            symbol=symbol or norm_exch,
+            exchange=norm_exch,
+            data_status=DataStatus.CURRENT,
+            tier=DataTier.HISTORICAL,
+            is_live=False,
+        )
+
+    def get_derivatives_master(self, exchange="NSE", underlying=None):
+        norm_exch = _normalize_exchange(exchange)
+        inst_doc = self.get_instruments(exchange=norm_exch)
+        all_recs = inst_doc.get("instruments") or []
+        fo_segs = ("NSE_FO", "BSE_FO", "MCX_FO", "NFO", "BFO")
+        und_up = symbols_in.normalize_symbol(underlying) if underlying else None
+        filtered = []
+        for r in all_recs:
+            seg = str(r.get("segment") or "").upper()
+            itype = str(r.get("instrument_type") or "").upper()
+            if seg not in fo_segs and itype not in ("FUT", "CE", "PE", "OPTIDX", "OPTSTK", "FUTIDX", "FUTSTK"):
+                continue
+            if und_up:
+                u_sym = str(r.get("underlying_symbol") or "").upper()
+                t_sym = str(r.get("trading_symbol") or "").upper()
+                if u_sym != und_up and not t_sym.startswith(und_up):
+                    continue
+            filtered.append(r)
+        return _standardize_payload(
+            {
+                "symbol": und_up or norm_exch,
+                "exchange": norm_exch,
+                "contracts": filtered,
+                "count": len(filtered),
+            },
+            provider_name=self.provider_name,
+            symbol=und_up or norm_exch,
+            exchange=norm_exch,
+            data_status=DataStatus.CURRENT,
+            tier=DataTier.HISTORICAL,
+            is_live=False,
+        )
+
+    def get_option_contracts(self, symbol, expiry=None, exchange="NSE"):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        params = {"instrument_key": ikey}
+        if expiry:
+            params["expiry_date"] = str(expiry)[:10]
+        resp = self._request_json("/v2/option/contract", query_params=params)
+        contracts = (resp or {}).get("data") or []
+        expiries = sorted(set(str(c.get("expiry"))[:10] for c in contracts if isinstance(c, dict) and c.get("expiry")))
+        return _standardize_payload(
+            {
+                "symbol": canon,
+                "exchange": exch,
+                "instrument_key": ikey,
+                "contracts": contracts,
+                "expiries": expiries,
+                "count": len(contracts),
+            },
+            provider_name=self.provider_name,
+            symbol=canon,
+            exchange=exch,
+            data_status=DataStatus.CURRENT,
+            tier=DataTier.REAL_TIME,
+            is_live=True,
+        )
+
+    def get_option_greeks(self, symbols, exchange="NSE"):
+        """Fetch live option Greeks via Upstox V3 /v3/market-quote/option-greek (max 50 keys per call)."""
+        resolved = []
+        for s in (symbols or []):
+            ikey, canon, exch = self.resolve_instrument_key(s, exchange=exchange)
+            resolved.append((ikey, canon, exch))
+        out = {}
+        for idx in range(0, len(resolved), 50):
+            batch = resolved[idx:idx + 50]
+            resp = self._request_json(
+                "/v3/market-quote/option-greek",
+                query_params={"instrument_key": ",".join(b[0] for b in batch)},
+            )
+            data_map = (resp or {}).get("data") or {}
+            for ikey, canon, exch in batch:
+                item = self._extract_quote_item(data_map, ikey, canon, exch)
+                if item is not None:
+                    out[ikey] = item
+        return out
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None, now=None):
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        cutoff_dt, _ = _parse_cutoff_ts(now)
+        now_dt = self._now_ist()
+        if cutoff_dt is not None and cutoff_dt.date() < now_dt.date():
+            raise MissingDataError(
+                "Upstox option chain provides current session snapshots only and cannot serve past date %s for %s"
+                % (cutoff_dt.date().isoformat(), canon)
+            )
+        ref_dt = cutoff_dt if cutoff_dt is not None else now_dt
+        exp_str = str(expiry)[:10] if expiry else None
+        if not exp_str:
+            exp_dt = calendar_in.get_next_expiry(as_of_date=ref_dt, underlying=canon)
+            exp_str = exp_dt.isoformat() if isinstance(exp_dt, datetime.date) else str(exp_dt)[:10]
+
+        resp = self._request_json(
+            "/v2/option/chain",
+            query_params={"instrument_key": ikey, "expiry_date": exp_str},
+        )
+        rows = (resp or {}).get("data") or []
+        if not isinstance(rows, list) or not rows:
+            raise MissingDataError("Upstox returned empty option chain for %s expiry %s" % (canon, exp_str))
+
+        is_open = bool(calendar_in.is_market_hours_in(ref_dt, exchange=exch))
+        tier = DataTier.REAL_TIME if is_open else DataTier.HISTORICAL
+        data_status = DataStatus.CURRENT if is_open else DataStatus.HISTORICAL
+        exp_compact = exp_str.replace("-", "")
+        strikes_data = {}
+        derived_spot = spot_price
+        pcr_val = None
+        returned_exp = exp_str
+
+        for row in rows:
+            if not isinstance(row, dict) or row.get("strike_price") is None:
+                continue
+            strike = float(row["strike_price"])
+            if row.get("expiry"):
+                returned_exp = str(row["expiry"])[:10]
+                exp_compact = returned_exp.replace("-", "")
+            if derived_spot is None and row.get("underlying_spot_price") is not None:
+                spot_cand = float(row["underlying_spot_price"])
+                if spot_cand > 0:
+                    derived_spot = spot_cand
+            if pcr_val is None and row.get("pcr") is not None:
+                pcr_val = float(row["pcr"])
+
+            strike_label = int(strike) if strike.is_integer() else strike
+            sides = {}
+            for api_side, leg in (("call_options", "CE"), ("put_options", "PE")):
+                opt = row.get(api_side)
+                if not isinstance(opt, dict):
+                    continue
+                mdata = opt.get("market_data") or {}
+                gdata = opt.get("option_greeks") or {}
+                opt_ikey = opt.get("instrument_key")
+                mapped_sym = self._symbol_by_key.get(opt_ikey) if opt_ikey else None
+                c_sym = mapped_sym or ("%s%s%s%s" % (canon, exp_compact, strike_label, leg))
+                raw_oi = mdata.get("oi")
+                oi_val = int(raw_oi) if raw_oi is not None else 0
+                raw_prev_oi = mdata.get("prev_oi")
+                if raw_prev_oi is None:
+                    raw_prev_oi = mdata.get("previous_oi")
+                prev_oi = int(raw_prev_oi) if raw_prev_oi is not None else None
+                change_in_oi = (oi_val - prev_oi) if (raw_oi is not None and prev_oi is not None) else None
+                ltp_val = mdata.get("ltp")
+                if ltp_val is None:
+                    ltp_val = mdata.get("close_price")
+                greeks = {
+                    "delta": gdata.get("delta"),
+                    "gamma": gdata.get("gamma"),
+                    "theta": gdata.get("theta"),
+                    "vega": gdata.get("vega"),
+                }
+                if gdata.get("pop") is not None:
+                    greeks["pop"] = gdata.get("pop")
+                sides[leg.lower()] = {
+                    "symbol": c_sym,
+                    "instrument_key": opt_ikey,
+                    "last_price": float(ltp_val) if ltp_val is not None else 0.0,
+                    "close_price": float(mdata["close_price"]) if mdata.get("close_price") is not None else None,
+                    "bid": float(mdata["bid_price"]) if mdata.get("bid_price") is not None else None,
+                    "bid_qty": int(mdata["bid_qty"]) if mdata.get("bid_qty") is not None else None,
+                    "ask": float(mdata["ask_price"]) if mdata.get("ask_price") is not None else None,
+                    "ask_qty": int(mdata["ask_qty"]) if mdata.get("ask_qty") is not None else None,
+                    "volume": int(mdata.get("volume") or 0),
+                    "open_interest": oi_val,
+                    "prev_oi": prev_oi,
+                    "change_in_oi": change_in_oi,
+                    "iv": float(gdata["iv"]) if gdata.get("iv") is not None else None,
+                    "greeks": greeks,
+                    "tier": tier,
+                    "data_status": data_status,
+                    "is_simulated": False,
+                    "is_live": is_open,
+                }
+            if sides:
+                strikes_data[strike] = sides
+
+        if not strikes_data:
+            raise MissingDataError("No usable option strikes returned from Upstox for %s" % canon)
+        if derived_spot is None:
+            try:
+                derived_spot = self.get_ltp(canon, exchange=exch)["price"]
+            except Exception:
+                derived_spot = sorted(strikes_data.keys())[len(strikes_data) // 2]
+
+        return UpstoxOptionChain(
+            underlying=canon,
+            underlying_price=float(derived_spot),
+            expiry=returned_exp,
+            strikes_data=strikes_data,
+            data_tier=tier,
+            data_status=data_status,
+            provider=self.provider_name,
+            is_live=is_open,
+            timestamp=int(ref_dt.timestamp()),
+            exchange=exch,
+            pcr_override=pcr_val,
+            underlying_key=ikey,
+        )
+
+    def get_market_status(self, exchange="NSE", as_of=None):
+        exch = _normalize_exchange(exchange)
+        base = MarketDataProvider.get_market_status(self, exchange=exch, as_of=as_of)
+        if as_of is not None:
+            return base
+        try:
+            resp = self._request_json("/v2/market/status/%s" % urllib.parse.quote(exch))
+        except AuthenticationConfigError:
+            if self._allow_yahoo_fallback:
+                return self._with_yahoo_fallback("get_market_status", exchange=exchange, as_of=as_of)
+            raise
+        data = (resp or {}).get("data") or {}
+        raw_status = str(data.get("status") or "").strip().upper()
+        last_updated = _parse_upstox_timestamp(data.get("last_updated"))
+        out = dict(base)
+        if raw_status:
+            out["raw_status"] = raw_status
+            if "OPEN" in raw_status and "PRE" not in raw_status:
+                out["is_open"] = True
+                out["status"] = "OPEN"
+            elif "PRE_OPEN" in raw_status or "PRE" in raw_status:
+                out["is_open"] = False
+                out["status"] = "PRE_OPEN"
+            elif "CLOSING" in raw_status or "CLOSE" in raw_status:
+                out["is_open"] = False
+                out["status"] = "CLOSED"
+        if data.get("cas_eligible_status") is not None:
+            out["cas_eligible_status"] = data.get("cas_eligible_status")
+        if last_updated is not None:
+            out["timestamp"] = last_updated
+            out["as_of"] = _format_ist(last_updated)
+            out["last_data_timestamp"] = _format_ist_iso(last_updated)
+        return _standardize_payload(
+            out,
+            provider_name=self.provider_name,
+            symbol=exch,
+            exchange=exch,
+            data_status=DataStatus.CURRENT,
+            tier=DataTier.REAL_TIME,
+            is_live=True,
+            is_simulated=False,
+        )
+
+    def create_streamer(
+        self,
+        on_message=None,
+        on_status=None,
+        stale_after_seconds=30.0,
+        clock=None,
+        sleep_fn=None,
+    ):
+        """Create a lifecycle-managed Upstox V3 WebSocket streamer authenticated with Analytics Token."""
+        def _authorize_wss():
+            try:
+                resp = self._request_json("/v3/feed/market-data-feed/authorize")
+            except AuthenticationConfigError as e:
+                raise upstox_feed.UpstoxStreamAuthError(_redact_upstox_secret(e, self._analytics_token))
+            data = (resp or {}).get("data") or {}
+            uri = data.get("authorized_redirect_uri") or data.get("authorizedRedirectUri")
+            if not uri:
+                raise upstox_feed.UpstoxStreamError("Upstox authorize response missing authorized_redirect_uri")
+            return str(uri).strip()
+
+        return upstox_feed.UpstoxMarketDataStreamer(
+            authorize_fn=_authorize_wss,
+            ws_connect=self._ws_connect,
+            on_message=on_message,
+            on_status=on_status,
+            stale_after_seconds=stale_after_seconds,
+            clock=clock,
+            sleep_fn=sleep_fn,
+            active_connections_counter=self._active_ws_connections,
+            account_tier=self.account_tier,
+            quota=self._stream_quota,
+        )
+
+
 # ---------------------------------------------------------------- Provider Registry
 
 _BUILTIN_PROVIDERS = {
     "yahoo": YahooMarketDataProvider,
     "offline": OfflineMarketDataProvider,
     "simulated": SimulatedMarketDataProvider,
+    "upstox": UpstoxMarketDataProvider,
 }
 _REGISTRY = dict(_BUILTIN_PROVIDERS)
 _CUSTOM_REGISTRY = sys.__dict__.setdefault("_DAY_TRADER_IN_CUSTOM_PROVIDERS", {})
@@ -2099,7 +3649,29 @@ def get_provider(name=None, source=None, config=None, **kwargs):
             "Unknown market data provider: '%s'. Available: %s" % (resolved, list_providers())
         )
     cfg = _load_config_dict(config)
-    provider_cls.validate_config(config=cfg)
+    try:
+        if isinstance(provider_cls, type) and issubclass(provider_cls, UpstoxMarketDataProvider):
+            provider_cls.validate_config(
+                config=cfg,
+                env=kwargs.get("env"),
+                analytics_token=kwargs.get("analytics_token"),
+                account_tier=kwargs.get("account_tier"),
+            )
+        elif "env" in kwargs:
+            provider_cls.validate_config(config=cfg, env=kwargs.get("env"))
+        else:
+            provider_cls.validate_config(config=cfg)
+    except AuthenticationConfigError as e:
+        if resolved == "upstox" and _is_yahoo_fallback_enabled(cfg):
+            _logger.warning(
+                "Upstox credentials missing (%s); falling back to explicit Yahoo DELAYED provider.",
+                _redact_upstox_secret(e),
+            )
+            fb = YahooMarketDataProvider()
+            fb.fallback_from = "upstox"
+            fb.fallback_reason = "missing_credentials"
+            return fb
+        raise
     if cfg and "config" not in kwargs:
         try:
             init_fn = provider_cls.__init__
@@ -2403,9 +3975,21 @@ def fetch_instruments(exchange="NSE", symbol=None, provider=None):
     return prov.get_instruments(exchange=exchange, symbol=symbol)
 
 
-def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_price=None):
-    prov = provider or get_provider("simulated")
-    return prov.get_option_chain(symbol, expiry=expiry, exchange=exchange, spot_price=spot_price)
+def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_price=None, config=None, now=None):
+    if provider is not None:
+        prov = provider
+    else:
+        resolved = resolve_provider_name(config=config)
+        prov_cls = _CUSTOM_REGISTRY.get(resolved) or _REGISTRY.get(resolved)
+        if prov_cls is not None and resolved != "simulated" and prov_cls.CAPABILITIES.get(CAPABILITY_OPTION_CHAINS):
+            prov = get_provider(resolved, config=config)
+            if not prov.supports(CAPABILITY_OPTION_CHAINS):
+                return prov.get_option_chain(symbol, expiry=expiry, exchange=exchange, spot_price=spot_price)
+        else:
+            prov = get_provider("simulated")
+    return _call_with_optional_now(
+        prov.get_option_chain, symbol, expiry=expiry, exchange=exchange, spot_price=spot_price, now=now
+    )
 
 
 def fetch_market_status(exchange="NSE", as_of=None, provider=None):
