@@ -9,6 +9,7 @@ today and a flag on anything that touches your tickers.
     python3 news.py                                  # watchlist + plan + portfolio tickers
     python3 news.py --tickers TSLA NVDA AMD
     python3 news.py --tickers RELIANCE TCS INFY      # Indian equities (NSE/BSE)
+    python3 news.py --tickers RELIANCE --research    # include low-relevance & incidental stories
     python3 news.py --tickers TSLA --all --hours 72  # everything in the last 3 days, seen or not
     python3 news.py --no-sec                         # headlines only
     python3 news.py --no-moves                       # skip the price line per ticker
@@ -63,17 +64,20 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-# Sibling path resolution for Indian market symbols
+# Sibling path resolution for Indian market symbols (../trader-alerts)
 try:
-    import symbols_in
+    import symbols_in  # type: ignore
+    import data_in  # type: ignore
 except ImportError:
     try:
         _alerts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-alerts")
         if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
             sys.path.insert(0, _alerts_dir)
-        import symbols_in
+        import symbols_in  # type: ignore
+        import data_in  # type: ignore
     except ImportError:
         symbols_in = None
+        data_in = None
 
 YAHOO = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%s&region=US&lang=en-US"
 GOOGLE_NEWS = "https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en"
@@ -85,6 +89,16 @@ PLACEHOLDER = "you@example.com"
 BROWSER_UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 KEEP_DAYS = 30
 MOVE_PCT = 3.0  # a stock this far from yesterday's close is flagged as moving
+
+CATEGORIES = ("corporate", "business", "analyst", "market", "low_relevance")
+
+CATEGORY_RANK = {
+    "corporate": 400,
+    "business": 300,
+    "analyst": 200,
+    "market": 100,
+    "low_relevance": 0,
+}
 
 ITEMS_8K = {
     "1.01": "material agreement", "1.02": "agreement ended", "1.03": "bankruptcy",
@@ -167,6 +181,63 @@ INDIAN_COMPANY_NAMES = {
     "BANKEX": "BSE Bankex",
 }
 
+SUBSIDIARIES = {
+    "RELIANCE": [
+        ("Reliance Consumer Products", re.compile(r"\b(?:Reliance\s+Consumer(?:\s+Products)?|RCPL|Independence\s+biscuits?|entry\s+into\s+biscuits?|biscuit(?:s)?|cola\s+business)\b", re.I)),
+        ("Reliance Retail", re.compile(r"\b(?:Reliance\s+Retail(?:\s+Ventures)?|RRVL)\b", re.I)),
+        ("Jio Platforms / Reliance Jio", re.compile(r"\b(?:Reliance\s+Jio(?:\s+Infocomm)?|Jio\s+Platforms|Jio\s+telecom|Jio\s+Cinema)\b", re.I)),
+        ("Reliance New Energy", re.compile(r"\b(?:Reliance\s+New\s+Energy|Reliance\s+Green|HJT\s+Solar|ALMM-II)\b", re.I)),
+        ("Reliance ADAG (Separate Group)", re.compile(r"\b(?:Reliance\s+Power|Reliance\s+Infra(?:structure)?|Reliance\s+Capital|ADAG|Anil\s+Ambani|5\s+Reliance\s+Group\s+Stocks)\b", re.I)),
+    ],
+    "TCS": [
+        ("Tata Group Parent", re.compile(r"\b(?:Tata\s+Sons|Tata\s+Group)\b", re.I)),
+    ],
+    "INFY": [
+        ("Infosys BPM", re.compile(r"\b(?:Infosys\s+BPM)\b", re.I)),
+        ("EdgeVerve", re.compile(r"\bEdgeVerve\b", re.I)),
+    ],
+    "HDFCBANK": [
+        ("HDFC Life", re.compile(r"\b(?:HDFC\s+Life)\b", re.I)),
+        ("HDFC AMC", re.compile(r"\b(?:HDFC\s+AMC|HDFC\s+Asset\s+Management)\b", re.I)),
+        ("HDFC ERGO", re.compile(r"\b(?:HDFC\s+ERGO)\b", re.I)),
+        ("HDFC Securities", re.compile(r"\b(?:HDFC\s+Securities)\b", re.I)),
+    ]
+}
+
+LOW_RELEVANCE_PATTERNS = [
+    re.compile(r"\b(?:marathon|marathons|media\s+surge\s+via\s+AI\s+activations)\b", re.I),
+    re.compile(r"\b(?:earthshot|prize\s+venue|ceremony\s+to\s+be\s+held|venue\s+owned|wedding\s+venue)\b", re.I),
+    re.compile(r"\b(?:wedding|cricket|ipl|charity\s+run|csr\s+award|marathons\s+generate)\b", re.I),
+    re.compile(r"\b(?:5\s+Reliance\s+Group\s+Stocks\s+Trading)\b", re.I),
+    re.compile(r"\b(?:Buy,\s+Sell\s+Or\s+Hold:.*Ask\s+Profit)\b", re.I),
+]
+
+CORPORATE_PATTERNS = [
+    re.compile(r"\b(?:earnings|results|quarterly\s+results|net\s+profit|net\s+sales|revenue|PAT|EBITDA|financial\s+results|dividend|buyback|bonus\s+issue|stock\s+split|annual\s+report|second-quarter\s+report|earnings\s+call)\b", re.I),
+    re.compile(r"\b(?:filing|8-K|10-Q|SEBI|circular|intimations?|exchange\s+filing|disclosures?|enlistment|ALMM|compliance)\b", re.I),
+    re.compile(r"\b(?:invest(?:s|ment|ing)?\s+up\s+to|invests?\s+in|acquisition|acquires?|merger|demerger|takeover|stake\s+sale|stake\s+buy|divestment|QIP|rights\s+issue)\b", re.I),
+    re.compile(r"\b(?:CEO|CFO|MD|appoints?|resigns?|steps?\s+down|board\s+meeting|AGM|EGM|shareholders?\s+meeting|variable\s+pay)\b", re.I),
+    re.compile(r"\b(?:court|tribunal|NCLT|NCLAT|GSTAT|refund\s+relief|tax\s+order|ED\s+probe|CBI\s+probe|penalty|dismisses\s+.*appeals?)\b", re.I),
+    re.compile(r"\b(?:schedules?\s+analyst\s+meetings?|investor\s+meetings?|offshore\s+gas\s+hub|shared\s+offshore\s+infrastructure|data\s+center\s+campus|Mahanadi\s+project)\b", re.I),
+]
+
+BUSINESS_PATTERNS = [
+    re.compile(r"\b(?:launches|launching|unveils|rolls?\s+out|new\s+product|portfolio\s+expands?|entry\s+into\s+biscuits|biscuits?\s+portfolio|biscuit\s+market|cola\s+business|Industrial\s+Intelligence\s+Foundry|sovereign\s+cloud|AI\s+deployment\s+engineers)\b", re.I),
+    re.compile(r"\b(?:partners?\s+with|partnership|alliances?|collaborat(?:e|ion)|joint\s+venture|tie-up|MOU)\b", re.I),
+    re.compile(r"\b(?:higher\s+bench|subcontracting|expands?\s+operations|new\s+facility|opens?\s+new\s+campus)\b", re.I),
+    re.compile(r"\b(?:secures?\s+contract|wins?\s+deal|bags?\s+order|multi-million\s+deal|commercial\s+agreement)\b", re.I),
+]
+
+ANALYST_PATTERNS = [
+    re.compile(r"\b(?:target\s+price|price\s+target|Jefferies|Morgan\s+Stanley|Goldman\s+Sachs|Bernstein|CLSA|Nomura|Motilal\s+Oswal|ICICI\s+Direct|Kotak\s+Institutional|Emkay|Nuvama|Axis\s+Capital|Macquarie|UBS)\b", re.I),
+    re.compile(r"\b(?:upgrade[sd]?|downgrade[sd]?|outperform|underperform|buy\s+rating|sell\s+rating|neutral\s+rating|accumulate|analysts?\s+(?:have\s+made|made|say|buy|predict|estimate|expect)|initiates?\s+coverage)\b", re.I),
+]
+
+MARKET_PATTERNS = [
+    re.compile(r"\b(?:share\s+price|shares?\s+rally|shares?\s+drop|shares?\s+surge|shares?\s+fall|slides|slips|plunges|down\s+\d+%|falls?\s+\d+%|gain(?:s|ed)?\s+over|mcap\s+erosion|profit\s+booking|52-week\s+high|52-week\s+low|all-time\s+high|at\s+17-month\s+low|bottoming\s+out|market\s+correct|undervaluing|stock\s+radar|stocks?\s+in\s+focus|top\s+losers?|top\s+gainers?|Nifty\s+IT\s+falls|Sensex\s+declines|stock\s+markets?\s+today)\b", re.I),
+    re.compile(r"\b(?:FPI\s+revival|FII|DII|retail\s+investors?\s+shed|AMFI\s+Rejig|large\s*cap\s+upgrade|index\s+rejig)\b", re.I),
+]
+
 # Regex to detect automated stock price tracker pages and separate them from real news
 PRICE_TRACKER_PATTERN = re.compile(
     r"\b(?:share|stock)\s+price\s+(?:today|live)\b|"
@@ -218,7 +289,7 @@ def to_ist(utc):
     return utc.replace(tzinfo=None) + IST_OFFSET
 
 
-# ---------------------------------------------------------------- symbols
+# ---------------------------------------------------------------- symbols & classification
 
 def is_indian_ticker(ticker, exchange=None, offline=None):
     """Check if ticker corresponds to an Indian equity or index."""
@@ -268,6 +339,68 @@ def normalize_ticker(ticker, default_exchange=None):
 def is_price_movement_headline(title):
     """Identify automated price quotes / ticker tracker pages."""
     return bool(PRICE_TRACKER_PATTERN.search(title or ""))
+
+
+def classify_news_item(item, ticker):
+    """Classify an item into one of the 5 standardized categories:
+
+    corporate, business, analyst, market, or low_relevance.
+    Detects subsidiaries, group companies, and incidental mentions.
+    Returns (category, subsidiary_name_or_None, relevance_score).
+    """
+    title = item.get("title", "")
+    summary = item.get("summary", "")
+    hay = "%s %s" % (title, summary)
+    kind = item.get("kind", "")
+    t = ticker.upper()
+
+    # SEC filings are authoritative corporate disclosures
+    if kind == "filing":
+        score = CATEGORY_RANK["corporate"] + (50 if item.get("important") else 20)
+        return "corporate", None, score
+
+    # Detect subsidiaries or related group entities first
+    sub_name = None
+    if t in SUBSIDIARIES:
+        for name, rx in SUBSIDIARIES[t]:
+            if rx.search(hay):
+                sub_name = name
+                if "Separate Group" in name:
+                    return "low_relevance", sub_name, CATEGORY_RANK["low_relevance"]
+                break
+
+    # Check incidental / peripheral topics
+    for rx in LOW_RELEVANCE_PATTERNS:
+        if rx.search(title):
+            return "low_relevance", sub_name, CATEGORY_RANK["low_relevance"]
+
+    # Determine primary subject focus
+    is_primary = bool(re.search(r"^\b(?:%s|%s)\b" % (re.escape(t), re.escape(INDIAN_COMPANY_NAMES.get(t, t))), title, re.I))
+
+    # Pattern based categorization
+    for rx in ANALYST_PATTERNS:
+        if rx.search(title):
+            score = CATEGORY_RANK["analyst"] + (10 if is_primary else 0)
+            return "analyst", sub_name, score
+
+    for rx in CORPORATE_PATTERNS:
+        if rx.search(title):
+            score = CATEGORY_RANK["corporate"] + (20 if is_primary else 0)
+            return "corporate", sub_name, score
+
+    for rx in BUSINESS_PATTERNS:
+        if rx.search(title):
+            score = CATEGORY_RANK["business"] + (20 if is_primary else 0)
+            return "business", sub_name, score
+
+    for rx in MARKET_PATTERNS:
+        if rx.search(title):
+            score = CATEGORY_RANK["market"]
+            return "market", sub_name, score
+
+    # Default fallback
+    score = CATEGORY_RANK["market"]
+    return "market", sub_name, score
 
 
 # ---------------------------------------------------------------- inputs
@@ -433,8 +566,19 @@ def parse_rss(data, ticker, default_source="Yahoo Finance"):
             if _local(c.tag) == "source":
                 src_el = c
                 break
-        source_name = (src_el.text or "").strip() if src_el is not None and (src_el.text or "").strip() else default_source
+        source_name = (src_el.text or "").strip() if src_el is not None and (src_el.text or "").strip() else ""
         source_url = src_el.get("url", "") if src_el is not None else ""
+
+        # Extract publisher from title suffix if missing or if generic aggregator name
+        if not source_name or source_name == "Google News":
+            if " - " in title:
+                candidate = title.rsplit(" - ", 1)[-1].strip()
+                if candidate and len(candidate) <= 35:
+                    source_name = candidate
+
+        publisher_name = source_name if source_name and source_name != "Google News" else None
+        source_name = publisher_name or default_source
+
         if not source_url and default_source == "Yahoo Finance":
             source_url = "https://finance.yahoo.com"
 
@@ -445,7 +589,9 @@ def parse_rss(data, ticker, default_source="Yahoo Finance"):
             "id": "rss:" + guid,
             "source": source_name,
             "source_url": source_url,
-            "publisher": source_name,
+            "publisher": publisher_name,
+            "publisher_url": source_url if source_url and source_url != link else None,
+            "article_url": link,
             "kind": "price_movement" if is_move else "headline",
             "is_price_movement": is_move,
             "ticker": ticker,
@@ -491,6 +637,8 @@ def parse_sec_atom(data, ticker):
             "source": "SEC EDGAR",
             "source_url": "https://www.sec.gov",
             "publisher": "SEC EDGAR",
+            "publisher_url": "https://www.sec.gov",
+            "article_url": link,
             "kind": "filing",
             "form": form,
             "ticker": ticker,
@@ -501,7 +649,9 @@ def parse_sec_atom(data, ticker):
             "link": link,
             "time": pub_time,
             "time_utc": pub_time.isoformat() if pub_time else None,
-            "is_price_movement": False
+            "is_price_movement": False,
+            "category": "corporate",
+            "relevance_score": CATEGORY_RANK["corporate"] + (50 if bool(set(items) & IMPORTANT_ITEMS) else 20)
         })
     return out
 
@@ -526,10 +676,50 @@ def parse_chart(data, ticker):
             "currency": curr, "timezone": tz}
 
 
-def collect_moves(fetcher, watch, errors=None, exchange=None):
+def _move_from_provider_quote(q, ticker):
+    price = q.get("price") if q.get("price") is not None else q.get("ltp")
+    prev = q.get("prev_close")
+    if price is None or not prev:
+        raise NewsError("provider quote for %s has no price or prev_close" % ticker)
+    ts = q.get("timestamp")
+    when = _dt.datetime.fromtimestamp(int(ts), _dt.timezone.utc) if isinstance(ts, (int, float)) else None
+    return {
+        "ticker": ticker,
+        "price": round(float(price), 2),
+        "prev_close": round(float(prev), 2),
+        "pct": round((float(price) / float(prev) - 1.0) * 100.0, 2),
+        "time": when,
+        "currency": q.get("currency") or "INR",
+        "timezone": "IST",
+        "provider": q.get("provider") or q.get("source"),
+        "data_status": q.get("data_status"),
+    }
+
+
+def collect_moves(fetcher, watch, errors=None, exchange=None, config=None):
     errors = [] if errors is None else errors
     out = []
+    in_prov = None
+    in_prov_err = None
+    if not getattr(fetcher, "offline", None) and data_in is not None:
+        try:
+            in_prov = data_in.get_provider(config=config)
+        except Exception as exc:
+            in_prov_err = str(exc)
+
     for t in sorted(watch):
+        if not getattr(fetcher, "offline", None) and is_indian_ticker(t, exchange=exchange) and (in_prov is not None or in_prov_err):
+            if in_prov_err:
+                errors.append("price for %s: %s" % (t, in_prov_err))
+                continue
+            try:
+                exch = exchange or (config or {}).get("exchange") or "NSE"
+                q = in_prov.get_quote(t, exchange=exch)
+                out.append(_move_from_provider_quote(q, t))
+            except Exception as exc:
+                errors.append("price for %s: %s" % (t, exc))
+            continue
+
         y_sym = yahoo_symbol(t, exchange=exchange)
         name = "chart-%s.json" % t
         try:
@@ -562,7 +752,7 @@ def mention_patterns(watch):
 
 
 def tag(items, watch):
-    """Which of your tickers each item touches, and why it matters."""
+    """Which of your tickers each item touches, why it matters, category and subsidiary."""
     pats = mention_patterns(watch)
     for it in items:
         hay = "%s %s" % (it["title"], it.get("summary") or "")
@@ -574,6 +764,14 @@ def tag(items, watch):
         it["tags"] = [label for label, rx in KEYWORDS if re.search(rx, hay, re.I)]
         if it["kind"] == "filing" and "2.02" in it.get("items", []) and "earnings" not in it["tags"]:
             it["tags"].insert(0, "earnings")
+
+        # Classify news category and detect subsidiary / group company
+        cat, sub, score = classify_news_item(it, it["ticker"])
+        it["category"] = cat
+        it["subsidiary"] = sub
+        it["relevance_score"] = score
+        if sub:
+            it["tags"].append("subsidiary: %s" % sub)
     return items
 
 
@@ -675,7 +873,44 @@ def collect(fetcher, watch, state, sec=True, forms=("8-K",), count=10, errors=No
     return items
 
 
-def select(items, state, now, hours=48, show_all=False):
+def compute_coverage(watch, items, errors):
+    """Compute per-ticker coverage breakdown, distinguishing status and categories."""
+    coverage = {}
+    for t in sorted(watch):
+        ticker_items = [it for it in items if t in it.get("touches", [it.get("ticker")])]
+        cat_counts = {c: 0 for c in CATEGORIES}
+        subs = set()
+        for it in ticker_items:
+            c = it.get("category") or "market"
+            cat_counts[c] = cat_counts.get(c, 0) + 1
+            if it.get("subsidiary"):
+                subs.add(it["subsidiary"])
+
+        total = len(ticker_items)
+        rel_count = sum(cat_counts[c] for c in ("corporate", "business", "analyst", "market"))
+        low_count = cat_counts.get("low_relevance", 0)
+
+        ticker_errors = [e for e in errors if t in e]
+        if ticker_errors:
+            status = "UNAVAILABLE"
+        elif total == 0:
+            status = "EMPTY"
+        else:
+            status = "OK"
+
+        coverage[t] = {
+            "total": total,
+            "relevant": rel_count,
+            "low_relevance": low_count,
+            "categories": cat_counts,
+            "subsidiaries": sorted(subs),
+            "status": status,
+            "notes": ticker_errors
+        }
+    return coverage
+
+
+def select(items, state, now, hours=48, show_all=False, include_low_relevance=False, sort_by=None):
     """Items within the window; only unseen ones unless show_all."""
     seen = state.setdefault("seen", {})
     cutoff = now - _dt.timedelta(hours=hours)
@@ -687,8 +922,22 @@ def select(items, state, now, hours=48, show_all=False):
         fp = fingerprint(it)
         it["new"] = fp not in seen
         if it["new"] or show_all:
+            if not include_low_relevance and it.get("category") == "low_relevance":
+                continue
             out.append(it)
-    out.sort(key=lambda i: (i["time"] or now), reverse=True)
+
+    # Sorting: relevance ranking prioritized by category, with chronological fallback
+    if sort_by == "time":
+        out.sort(key=lambda i: (i["time"] or now), reverse=True)
+    elif sort_by == "relevance":
+        out.sort(key=lambda i: (CATEGORY_RANK.get(i.get("category"), 0), i.get("relevance_score", 0), i["time"] or now), reverse=True)
+    else:
+        # Default behavior: rank by relevance if any Indian ticker, else reverse by time (preserving US tests)
+        has_indian = any(is_indian_ticker(i.get("ticker", "")) for i in out)
+        if has_indian:
+            out.sort(key=lambda i: (CATEGORY_RANK.get(i.get("category"), 0), i.get("relevance_score", 0), i["time"] or now), reverse=True)
+        else:
+            out.sort(key=lambda i: (i["time"] or now), reverse=True)
     return out
 
 
@@ -717,7 +966,32 @@ def render_moves(moves, move_pct=MOVE_PCT):
     return out
 
 
-def render(items, errors, now, moves=None, move_pct=MOVE_PCT, exchange=None):
+def render_coverage(coverage, show_research=False):
+    lines = ["Coverage Summary:"]
+    for t, c in sorted(coverage.items()):
+        if c["status"] == "UNAVAILABLE":
+            err_msg = "; ".join(c["notes"]) if c["notes"] else "feed unavailable"
+            lines.append("  %-10s 0 stories (feed unavailable: %s)" % (t + ":", err_msg))
+        elif c["status"] == "EMPTY":
+            lines.append("  %-10s 0 stories found in public feeds within window" % (t + ":"))
+        else:
+            cats = []
+            for cat in ("corporate", "business", "analyst", "market"):
+                cnt = c["categories"].get(cat, 0)
+                if cnt > 0:
+                    cats.append("%d %s" % (cnt, cat))
+            cats_str = ", ".join(cats) if cats else "0"
+            sub_str = ("; subsidiaries: " + ", ".join(c["subsidiaries"])) if c["subsidiaries"] else ""
+            if c["low_relevance"] > 0 and not show_research:
+                lines.append("  %-10s %d relevant (%s%s) | %d low-relevance excluded (pass --research to view)" % (
+                    t + ":", c["relevant"], cats_str, sub_str, c["low_relevance"]))
+            else:
+                lines.append("  %-10s %d stories (%s%s)" % (
+                    t + ":", c["relevant"] if not show_research else c["total"], cats_str, sub_str))
+    return lines
+
+
+def render(items, errors, now, moves=None, move_pct=MOVE_PCT, exchange=None, coverage=None, show_research=False):
     out = render_moves(moves or [], move_pct)
     if out:
         out.append("")
@@ -738,14 +1012,18 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT, exchange=None):
                 when = to_eastern(it["time"]).strftime("%Y-%m-%d %H:%M ET") if it["time"] else "time unknown"
             mark = "!" if it.get("important") else " "
             who = ",".join(it["touches"]) or it["ticker"]
-            source_lbl = (it.get("source") or "News")[:13]
-            out.append("%s %s  %-11s %-13s %s" % (mark, when, who, source_lbl, it["title"]))
+            source_lbl = it.get("source") or "News"
+            out.append("%s %s  %-11s %-18s %s" % (mark, when, who, source_lbl, it["title"]))
             extra = []
+            if it.get("category"):
+                extra.append("[%s]" % it["category"].upper())
+            if it.get("subsidiary"):
+                extra.append("[subsidiary: %s]" % it["subsidiary"])
             if it.get("tags"):
                 extra.append("tags: " + ", ".join(it["tags"]))
             extra.append(it["link"])
-            if it.get("source_url") and it.get("source_url") != it["link"]:
-                extra.append("source: " + it["source_url"])
+            if it.get("publisher_url") and it.get("publisher_url") != it["link"]:
+                extra.append("publisher_site: " + it["publisher_url"])
             out.append("      " + "  ".join(extra))
     elif moves:
         for m in moves:
@@ -753,6 +1031,10 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT, exchange=None):
                 all_us = False
             else:
                 all_indian = False
+
+    if coverage:
+        out.append("")
+        out.extend(render_coverage(coverage, show_research=show_research))
 
     for e in errors:
         out.append("note: %s" % e)
@@ -799,6 +1081,8 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian tickers (default: NSE)")
     ap.add_argument("--include-quotes", action="store_true", help="include automated price tracker pages in headlines")
+    ap.add_argument("--research", action="store_true", help="include low-relevance and incidental stories for research")
+    ap.add_argument("--sort", choices=["relevance", "time"], default=None, help="sort by relevance or time")
     args = ap.parse_args(argv)
 
     if args.tickers:
@@ -838,16 +1122,20 @@ def main(argv=None):
     items = collect(fetcher, watch, state, sec=sec, forms=forms, errors=errors,
                     exchange=args.exchange, include_quotes=args.include_quotes)
     items = dedupe(tag(items, watch))
-    shown = select(items, state, now, hours=args.hours, show_all=args.all)
-    moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, exchange=args.exchange)
+    coverage = compute_coverage(watch, items, errors)
+    shown = select(items, state, now, hours=args.hours, show_all=args.all,
+                   include_low_relevance=args.research, sort_by=args.sort)
+    cfg = load_json(args.config) or {}
+    moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, exchange=args.exchange, config=cfg)
 
     if args.json:
         mv = [dict(m, time=m["time"].isoformat() if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
         print(json.dumps({"checked": now.isoformat(), "moves": mv, "items": _json_ready(shown),
-                          "notes": errors}, indent=2))
+                          "coverage": coverage, "notes": errors}, indent=2))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, exchange=args.exchange))
+        sys.stdout.write(render(shown, errors, now, moves, args.move_pct, exchange=args.exchange,
+                                coverage=coverage, show_research=args.research))
 
     if not args.dry_run:
         remember(items, state, now)

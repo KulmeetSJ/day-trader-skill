@@ -84,11 +84,12 @@ _alerts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import symbols_in
-    import calendar_in
-    import data_in
-    import instruments
+    import symbols_in  # type: ignore
+    import calendar_in  # type: ignore
+    import data_in  # type: ignore
+    import instruments  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
@@ -1379,6 +1380,42 @@ def fetch_spark(symbols, rng, interval, pause, a=None, market="US"):
     return data, failed
 
 
+_ORIG_YAHOO_GET = yahoo_get
+
+
+def _get_in_provider(cfg):
+    """Resolve active Indian market data provider via data_in."""
+    if data_in is None:
+        return None
+    try:
+        return data_in.get_provider(config=cfg)
+    except Exception as e:
+        raise ScanError("Market data provider configuration error: %s" % e)
+
+
+def _to_ist_aware(now_utc):
+    if now_utc is None or data_in is None:
+        return None
+    if getattr(now_utc, "tzinfo", None) is None:
+        return now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(data_in.calendar_in.IST)
+    return now_utc.astimezone(data_in.calendar_in.IST)
+
+
+def _fetch_in_provider_series(provider, symbols, rng, interval, pause, exchange="NSE", now=None):
+    """Fetch batch daily/intraday series through the abstract MarketDataProvider interface."""
+    try:
+        return provider.get_batch_series(
+            symbols,
+            range_str=rng,
+            interval=interval,
+            exchange=exchange,
+            now=_to_ist_aware(now),
+            pause=pause,
+        )
+    except Exception as e:
+        raise ScanError("Provider '%s' error: %s" % (getattr(provider, "provider_name", "unknown"), e))
+
+
 def read_json(path, what=None, required=False):
     if not path or not os.path.exists(path):
         if required:
@@ -1402,17 +1439,26 @@ def read_symbols(a, offline_syms=None):
         syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
     elif getattr(a, "watchlist", None):
         syms = symbols_from_file(a.watchlist)
+    elif getattr(a, "universe", None):
+        if not os.path.exists(a.universe):
+            raise ScanError("no %s yet: run `scan.py universe` first, or pass --symbols" % a.universe)
+        syms = symbols_from_file(a.universe)
     elif cfg_syms:
         if isinstance(cfg_syms, list):
             syms = [str(s).strip().upper() for s in cfg_syms if str(s).strip()]
         else:
             syms = [s for s in re.split(r"[,\s]+", str(cfg_syms).upper()) if s]
     elif cfg_wl:
-        syms = symbols_from_file(cfg_wl)
-    elif offline_syms is not None and not getattr(a, "universe", None):
+        if isinstance(cfg_wl, list):
+            syms = [str(s).strip().upper() for s in cfg_wl if str(s).strip()]
+        elif isinstance(cfg_wl, str) and not os.path.exists(cfg_wl) and ("," in cfg_wl or " " in cfg_wl):
+            syms = [s for s in re.split(r"[,\s]+", cfg_wl.upper()) if s]
+        else:
+            syms = symbols_from_file(cfg_wl)
+    elif offline_syms is not None:
         syms = sorted(offline_syms)  # offline: every chart in the file, unless a list was given
     else:
-        path = getattr(a, "universe", None) or DEFAULT_UNIVERSE
+        path = DEFAULT_UNIVERSE
         if not os.path.exists(path):
             raise ScanError("no %s yet: run `scan.py universe` first, or pass --symbols" % path)
         syms = symbols_from_file(path)
@@ -1564,20 +1610,42 @@ def cmd_daily(a):
         data, failed = load_offline(a.offline, market=market)
         offline_syms = sorted(set(data) | set(failed))
     symbols = read_symbols(a, offline_syms)
+    provider_name = "offline" if a.offline else "yahoo"
+    data_status = "FIXTURE" if a.offline else "HISTORICAL"
     if not a.offline:
-        progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
-                 % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a, market=market)
+        in_prov = _get_in_provider(cfg) if market == "IN" else None
+        use_prov = in_prov is not None and (in_prov.provider_name != "yahoo" or yahoo_get is _ORIG_YAHOO_GET)
+        if use_prov:
+            provider_name = in_prov.provider_name
+            exch = cfg.get("exchange") or "NSE"
+            progress(a, "Fetching daily closes for %s symbols via %s provider..."
+                     % ("{:,}".format(len(symbols)), provider_name))
+            data, failed = _fetch_in_provider_series(in_prov, symbols, "3mo", "1d", a.pause, exchange=exch, now=now)
+        else:
+            progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
+                     % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
+            data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a, market=market)
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, market=market, strategy_cfg=strategy_cfg)
     if getattr(a, "strategy", None):
         hits = [h for h in hits if a.strategy in h.get("setups", [])]
     nfailed = len(symbols) - counts["fetched"]
+    if not a.offline and counts["fetched"] == 0 and len(symbols) > 0:
+        data_status = "UNAVAILABLE"
+    elif not a.offline and data:
+        first_s = next(iter(data.values()), {})
+        data_status = first_s.get("data_status") or "HISTORICAL"
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
+    doc_source = "yahoo" if (a.offline or market != "IN") else provider_name
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
-           "market": market,
+           "market": market, "provider": provider_name, "data_status": data_status,
+           "is_live": any(bool(s.get("is_live")) for s in data.values()),
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "source": doc_source, "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
+    if failed:
+        doc["failed_count"] = len(failed)
+    if data_status == "UNAVAILABLE":
+        doc["provider_error"] = "All %d symbol requests failed on provider '%s'." % (len(symbols), provider_name)
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -1588,8 +1656,8 @@ def cmd_daily(a):
     local = to_local(now, market=market)
     tz_label = "IST" if market == "IN" else "ET"
     curr_sym = "\u20b9" if market == "IN" else "$"
-    print("Daily scan, %s %s, closes through %s (Yahoo spark, daily closes only)." % (
-        local.strftime("%a %Y-%m-%d %H:%M"), tz_label, last_date.isoformat() if last_date else "nothing"))
+    print("Daily scan, %s %s, closes through %s (%s, daily closes only)." % (
+        local.strftime("%a %Y-%m-%d %H:%M"), tz_label, last_date.isoformat() if last_date else "nothing", provider_name))
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (%s%s+ and %s+ shares)%s; "
           "%s scanned." % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
                            (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -1597,7 +1665,10 @@ def cmd_daily(a):
                            "{:,}".format(a.min_volume),
                            (", %d had under %d days" % (counts["short"], MIN_DAILY_BARS)) if counts["short"] else "",
                            "{:,}".format(counts["scanned"])))
-    if hits:
+    if data_status == "UNAVAILABLE":
+        print("PROVIDER ERROR (%s): 0 of %s charts fetched (%s failed); cannot evaluate setups."
+              % (provider_name, "{:,}".format(len(symbols)), "{:,}".format(nfailed)))
+    elif hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
                                                   ", ".join("%d %s" % (n, LABEL[k]) for k, n in per if n)))
@@ -1644,37 +1715,72 @@ def cmd_orb(a):
     day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day, market=market)
     symbols = read_symbols(a, offline_syms)
     confirm = None
+    provider_name = "offline" if a.offline else "yahoo"
     if not a.offline:
+        in_prov = _get_in_provider(cfg) if market == "IN" else None
+        use_prov = in_prov is not None and (in_prov.provider_name != "yahoo" or yahoo_get is _ORIG_YAHOO_GET)
         now_dt = parse_now(None, market="IN") if market == "IN" else parse_now(None)
         today = to_local(now_dt, market=market).date()
-        if (today - day).days > 6:
+        if (today - day).days > 6 and (not use_prov or in_prov.provider_name == "yahoo"):
             raise ScanError("Yahoo's free 5-minute history is short: replay %s with --offline" % day.isoformat())
         rng = "1d" if day == today else "5d"
-        progress(a, "Stage 1: 5-minute closes for %s symbols (%d spark requests)..."
-                 % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, rng, "%dm" % BAR_MIN, a.pause, a, market=market)
-        done = []
+        if use_prov:
+            provider_name = in_prov.provider_name
+            exch = cfg.get("exchange") or "NSE"
+            progress(a, "Stage 1: 5-minute bars for %s symbols via %s provider..."
+                     % ("{:,}".format(len(symbols)), provider_name))
+            data, failed = _fetch_in_provider_series(in_prov, symbols, rng, "%dm" % BAR_MIN, a.pause, exchange=exch, now=now)
+            done = []
 
-        def confirm(sym):
-            if a.pause:
-                SLEEP(a.pause)
-            done.append(sym)
-            if len(done) % 50 == 0:
-                progress(a, "  stage 2: %d v8 charts so far" % len(done))
-            return parse_chart(yahoo_get(chart_path(sym, rng, "%dm" % BAR_MIN, market=market)), sym)
+            def confirm(sym):
+                if in_prov.provider_name == "yahoo" and a.pause:
+                    SLEEP(a.pause)
+                done.append(sym)
+                if len(done) % 50 == 0:
+                    progress(a, "  stage 2: %d charts so far" % len(done))
+                if in_prov.provider_name != "yahoo" and sym in data:
+                    return data[sym]
+                try:
+                    payload = in_prov.get_intraday_data(sym, interval="%dm" % BAR_MIN, range_str=rng, exchange=exch, now=_to_ist_aware(now))
+                    return data_in.to_scanner_series(payload)
+                except Exception as e:
+                    raise ScanError(str(e))
+        else:
+            progress(a, "Stage 1: 5-minute closes for %s symbols (%d spark requests)..."
+                     % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
+            data, failed = fetch_spark(symbols, rng, "%dm" % BAR_MIN, a.pause, a, market=market)
+            done = []
+
+            def confirm(sym):
+                if a.pause:
+                    SLEEP(a.pause)
+                done.append(sym)
+                if len(done) % 50 == 0:
+                    progress(a, "  stage 2: %d v8 charts so far" % len(done))
+                return parse_chart(yahoo_get(chart_path(sym, rng, "%dm" % BAR_MIN, market=market)), sym)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
                                      a.max_confirm, market=market)
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
+    data_status = "FIXTURE" if a.offline else (
+        "UNAVAILABLE" if (counts["fetched"] == 0 and len(symbols) > 0)
+        else (next(iter(data.values()), {}).get("data_status") if data else "HISTORICAL")
+    )
     tz_label = "IST" if market == "IN" else "ET"
     as_of = "%s %s %s" % (day.isoformat(), cutoff.strftime("%H:%M"), tz_label)
+    doc_source = "yahoo" if (a.offline or market != "IN") else provider_name
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
-           "market": market,
+           "market": market, "provider": provider_name, "data_status": data_status,
+           "is_live": any(bool(s.get("is_live")) for s in (data or {}).values()),
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
+           "unconfirmed": counts["unconfirmed"], "source": doc_source, "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
+    if failed:
+        doc["failed_count"] = len(failed)
+    if data_status == "UNAVAILABLE":
+        doc["provider_error"] = "All %d symbol requests failed on provider '%s'." % (len(symbols), provider_name)
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -1683,9 +1789,9 @@ def cmd_orb(a):
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     open_str = "09:15" if market == "IN" else "9:30"
-    print("Opening-range breakout scan, %s %s %s: %d-minute range (%s to %s), 5-minute bars, Yahoo."
+    print("Opening-range breakout scan, %s %s %s: %d-minute range (%s to %s), 5-minute bars, %s."
           % (day_label(day), clock_label(cutoff), tz_label, a.or_minutes, open_str,
-             clock_label(slot(day, a.or_minutes // BAR_MIN, market=market))))
+             clock_label(slot(day, a.or_minutes // BAR_MIN, market=market)), provider_name))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",

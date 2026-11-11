@@ -237,6 +237,52 @@ class TestBharatRules2026(unittest.TestCase):
         self.assertEqual(c_small["profitability_impact"]["gross_pnl"], 20.00)
         self.assertLess(c_small["profitability_impact"]["net_pnl"], 0)
 
+    def test_reliance_56_shares_intraday_and_positional_charge_reconciliation(self):
+        # Buy 56 RELIANCE @ 1326.00 (entry=74256.00), sell 56 @ 1340.10 (exit=75045.60), turnover=149301.60
+        c = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", entry_price=1326.00, exit_price=1340.10, qty=56, trading_style="intraday",
+            as_of_date="2026-10-19"
+        )
+        self.assertEqual(c["buy_value"], 74256.00)
+        self.assertEqual(c["sell_value"], 75045.60)
+        self.assertEqual(c["turnover"], 149301.60)
+        self.assertTrue(c["is_estimate"])
+        self.assertEqual(c["stt"], 18.76)              # 0.025% * 75045.60 (sell leg only)
+        self.assertEqual(c["exchange_charges"], 4.58)   # 0.00307% * 149301.60 (both legs)
+        self.assertEqual(c["sebi_charges"], 0.15)       # 0.0001% * 149301.60 (both legs)
+        self.assertEqual(c["stamp_duty"], 2.23)         # 0.003% * 74256.00 (buy leg only)
+        self.assertEqual(c["brokerage"], 40.00)         # min(20, 22.28) + min(20, 22.51)
+        self.assertEqual(c["gst"], 8.05)                # 18% * (40.00 + 4.58 + 0.15)
+        self.assertEqual(c["total"], 73.77)
+
+        # Verify buy and sell legs independently for intraday vs delivery (positional)
+        c_pos = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", entry_price=1326.00, exit_price=1340.10, qty=56, trading_style="positional",
+            as_of_date="2026-10-19"
+        )
+        # Delivery STT = 0.1% * 74256.00 (74.26) + 0.1% * 75045.60 (75.05) = 149.31
+        self.assertEqual(c_pos["stt"], 149.31)
+        # Delivery Stamp Duty = 0.015% * 74256.00 (buy leg only) = 11.14
+        self.assertEqual(c_pos["stamp_duty"], 11.14)
+        self.assertEqual(c_pos["brokerage"], 0.00)
+
+        # Verify plan_report displays all components (including Stamp Duty & SEBI) and estimate notice
+        plan = {
+            "symbol": "RELIANCE", "entry": 1326.0, "stop": 1318.95, "target": 1340.10,
+            "risk_per_share": 7.05, "reward_risk": 2.0, "entry_from": "plan", "flat_by": "15:20",
+            "market": "IN", "currency": "INR", "trading_style": "intraday"
+        }
+        cfg = {
+            "budget": 100000, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_inr": 75000,
+            "max_loss_per_trade_inr": 1500, "min_order_inr": 100, "paper": True, "market": "IN"
+        }
+        s = budget_mod.size_trade(plan, cfg, today="2026-10-19")
+        rep = budget_mod.plan_report(s, budget_mod.bracket_order(s))
+        self.assertIn("Est transaction charges: ₹73.77", rep)
+        self.assertIn("Stamp ₹2.23", rep)
+        self.assertIn("SEBI ₹0.15", rep)
+        self.assertIn("Brokerage est", rep)
+
 
 if __name__ == "__main__":
     unittest.main()

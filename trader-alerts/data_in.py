@@ -35,12 +35,46 @@ DEFAULT_PAUSE = 0.3
 DEFAULT_BACKOFF = 2.0
 
 
+class DataStatus:
+    """Standardized market data freshness and availability status."""
+    CURRENT = "CURRENT"
+    DELAYED = "DELAYED"
+    HISTORICAL = "HISTORICAL"
+    FIXTURE = "FIXTURE"
+    SIMULATED = "SIMULATED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class DataTier:
     """Classification of market data quality, latency, and origin."""
     REAL_TIME = "REAL_TIME"    # Direct exchange/broker tick stream (un-delayed)
     DELAYED = "DELAYED"        # Delayed exchange feed (e.g. Yahoo Finance 15-minute delay)
     HISTORICAL = "HISTORICAL"  # Closed session completed bars (EOD or settled intraday)
     SIMULATED = "SIMULATED"    # Synthetic, mock, or backtest replay data
+    FIXTURE = "FIXTURE"        # Local offline saved fixture snapshot
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+# Standard capability keys across Indian market data providers
+CAPABILITY_HISTORICAL_CANDLES = "historical_candles"
+CAPABILITY_INTRADAY_CANDLES = "intraday_candles"
+CAPABILITY_LIVE_QUOTES = "live_quotes"
+CAPABILITY_STREAMING_DATA = "streaming_data"
+CAPABILITY_OPTION_CHAINS = "option_chains"
+CAPABILITY_OPEN_INTEREST = "open_interest"
+CAPABILITY_INSTRUMENT_MASTERS = "instrument_masters"
+CAPABILITY_MARKET_STATUS = "market_status"
+
+ALL_CAPABILITIES = (
+    CAPABILITY_HISTORICAL_CANDLES,
+    CAPABILITY_INTRADAY_CANDLES,
+    CAPABILITY_LIVE_QUOTES,
+    CAPABILITY_STREAMING_DATA,
+    CAPABILITY_OPTION_CHAINS,
+    CAPABILITY_OPEN_INTEREST,
+    CAPABILITY_INSTRUMENT_MASTERS,
+    CAPABILITY_MARKET_STATUS,
+)
 
 
 class DataError(Exception):
@@ -73,16 +107,307 @@ class MissingDataError(DataError):
     pass
 
 
+class NotSupportedError(DataError):
+    """Raised when the active market data provider does not support a capability."""
+
+    def __init__(self, message, capability=None, provider=None):
+        super().__init__(message)
+        self.status = "NOT_SUPPORTED"
+        self.capability = capability
+        self.provider = provider
+
+    def to_dict(self):
+        return {
+            "status": self.status,
+            "capability": self.capability,
+            "provider": self.provider,
+            "error": str(self),
+            "data_status": DataStatus.UNAVAILABLE,
+            "is_live": False,
+            "is_simulated": False,
+        }
+
+
+class ProviderConfigError(DataError):
+    """Raised when provider selection or configuration is invalid."""
+    pass
+
+
+class AuthenticationConfigError(ProviderConfigError):
+    """Raised when an authenticated provider is missing required credentials."""
+    pass
+
+
+def _normalize_exchange(exchange):
+    exch = (exchange or "NSE").upper().strip()
+    if exch in ("NSI", "NSE_EQ"):
+        return "NSE"
+    if exch in ("BOM", "BSE_EQ"):
+        return "BSE"
+    return exch
+
+
+def _format_ist(ts):
+    if ts is None:
+        return ""
+    try:
+        dt_ist = datetime.datetime.fromtimestamp(int(ts), tz=calendar_in.IST)
+        return dt_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return ""
+
+
+def _compute_freshness(timestamp, data_status, now=None):
+    """Compute standardized freshness metadata from epoch timestamp and data_status."""
+    now_dt = calendar_in.parse_ist(now) if now else calendar_in.now_ist()
+    now_ts = int(now_dt.timestamp())
+    age_secs = None
+    if timestamp is not None:
+        try:
+            age_secs = max(0, int(now_ts - int(timestamp)))
+        except Exception:
+            age_secs = None
+
+    if data_status == DataStatus.DELAYED:
+        note = "Delayed unofficial feed (do not treat as real-time)"
+    elif data_status == DataStatus.FIXTURE:
+        note = "Local offline fixture (historical snapshot)"
+    elif data_status == DataStatus.SIMULATED:
+        note = "Simulated / theoretical model output"
+    elif data_status == DataStatus.HISTORICAL:
+        note = "Historical completed bars"
+    elif data_status == DataStatus.CURRENT:
+        note = "Current session quote or bar"
+    else:
+        note = "Data unavailable"
+
+    return age_secs, {
+        "status": data_status,
+        "age_seconds": age_secs,
+        "delayed": data_status == DataStatus.DELAYED,
+        "note": note,
+    }
+
+
+def _standardize_payload(payload, provider_name, symbol=None, exchange="NSE",
+                         data_status=DataStatus.DELAYED, tier=DataTier.DELAYED,
+                         timestamp=None, is_live=False, is_simulated=False, now=None):
+    """Attach standardized provider, symbol, IST timestamp, freshness, and status metadata."""
+    exch = _normalize_exchange(exchange or payload.get("exchange") or "NSE")
+    canon = symbol or payload.get("symbol") or payload.get("underlying") or ""
+    ts = timestamp if timestamp is not None else payload.get("timestamp")
+    ist_time = payload.get("ist_time") or payload.get("time") or (_format_ist(ts) if ts else "")
+    age_secs, freshness = _compute_freshness(ts, data_status, now=now)
+
+    out = dict(payload)
+    out["provider"] = provider_name
+    out["source"] = out.get("source") or provider_name
+    out["exchange"] = exch
+    if canon:
+        if "symbol" in out or not out.get("underlying"):
+            out["symbol"] = canon
+        out["instrument_id"] = "%s:%s" % (exch, canon)
+    out["timestamp"] = ts
+    out["ist_time"] = ist_time
+    if "time" not in out and ist_time:
+        out["time"] = ist_time
+    out["freshness_seconds"] = age_secs
+    out["freshness"] = freshness
+    out["data_status"] = data_status
+    out["tier"] = out.get("tier") or tier
+    out["is_live"] = bool(is_live)
+    out["is_simulated"] = bool(is_simulated)
+    out["is_real_time"] = bool(is_live)
+    return out
+
+
 class MarketDataProvider:
     """Abstract base interface for Indian market data providers."""
+
+    provider_name = "base"
+    requires_auth = False
+    required_credentials = ()
+    CAPABILITIES = {cap: False for cap in ALL_CAPABILITIES}
+
+    @classmethod
+    def capabilities(cls):
+        caps = {cap: bool(cls.CAPABILITIES.get(cap, False)) for cap in ALL_CAPABILITIES}
+        caps["provider"] = cls.provider_name
+        caps["requires_auth"] = bool(cls.requires_auth)
+        caps["required_credentials"] = list(cls.required_credentials)
+        caps["not_supported"] = [cap for cap in ALL_CAPABILITIES if not caps[cap]]
+        return caps
+
+    def supports(self, capability):
+        return bool(self.CAPABILITIES.get(capability, False))
+
+    @classmethod
+    def validate_config(cls, config=None, env=None):
+        """Validate provider credentials and settings before activation."""
+        if not cls.requires_auth or not cls.required_credentials:
+            return True
+        cfg = config if isinstance(config, dict) else {}
+        creds_map = cfg.get("provider_credentials") or {}
+        prov_creds = creds_map.get(cls.provider_name) if isinstance(creds_map, dict) else {}
+        if not isinstance(prov_creds, dict):
+            prov_creds = {}
+        env_map = env if env is not None else os.environ
+        missing = []
+        for key in cls.required_credentials:
+            val = (
+                prov_creds.get(key)
+                or cfg.get(key)
+                or env_map.get("%s_%s" % (cls.provider_name.upper(), key.upper()))
+                or env_map.get(key.upper())
+            )
+            if not val:
+                missing.append(key)
+        if missing:
+            raise AuthenticationConfigError(
+                "Provider '%s' requires credentials that are missing: %s"
+                % (cls.provider_name, ", ".join(missing))
+            )
+        return True
+
+    def not_supported_response(self, capability, message=None):
+        msg = message or (
+            "Capability '%s' is not supported by provider '%s'." % (capability, self.provider_name)
+        )
+        return {
+            "status": "NOT_SUPPORTED",
+            "capability": capability,
+            "provider": self.provider_name,
+            "error": msg,
+            "data_status": DataStatus.UNAVAILABLE,
+            "is_live": False,
+            "is_simulated": False,
+        }
 
     def get_quote(self, symbol, exchange="NSE"):
         """Fetch current or delayed quote for a single symbol."""
         raise NotImplementedError
 
+    def get_ltp(self, symbol, exchange="NSE"):
+        """Fetch standardized Last Traded Price payload for a single symbol."""
+        q = self.get_quote(symbol, exchange=exchange)
+        ltp = q.get("ltp") if q.get("ltp") is not None else q.get("price")
+        if ltp is None:
+            raise MissingDataError("No LTP available for %s" % symbol)
+        canon = q.get("symbol") or symbols_in.normalize_symbol(symbol)
+        exch = q.get("exchange") or _normalize_exchange(exchange)
+        payload = {
+            "symbol": canon,
+            "exchange": exch,
+            "currency": q.get("currency", "INR"),
+            "ltp": float(ltp),
+            "price": float(ltp),
+            "timestamp": q.get("timestamp"),
+            "ist_time": q.get("ist_time") or q.get("time", ""),
+            "source": q.get("source", self.provider_name),
+            "tier": q.get("tier", DataTier.DELAYED),
+        }
+        return _standardize_payload(
+            payload,
+            provider_name=q.get("provider", self.provider_name),
+            symbol=canon,
+            exchange=exch,
+            data_status=q.get("data_status", DataStatus.DELAYED),
+            tier=q.get("tier", DataTier.DELAYED),
+            timestamp=q.get("timestamp"),
+            is_live=q.get("is_live", False),
+            is_simulated=q.get("is_simulated", False),
+        )
+
+    def get_ohlc(self, symbol, exchange="NSE", interval="1d"):
+        """Fetch standardized OHLC snapshot for a symbol."""
+        q = self.get_quote(symbol, exchange=exchange)
+        close_px = q.get("close") if q.get("close") is not None else q.get("price")
+        canon = q.get("symbol") or symbols_in.normalize_symbol(symbol)
+        exch = q.get("exchange") or _normalize_exchange(exchange)
+        payload = {
+            "symbol": canon,
+            "exchange": exch,
+            "interval": interval,
+            "currency": q.get("currency", "INR"),
+            "open": float(q["open"]) if q.get("open") is not None else None,
+            "high": float(q["high"]) if q.get("high") is not None else None,
+            "low": float(q["low"]) if q.get("low") is not None else None,
+            "close": float(close_px) if close_px is not None else None,
+            "prev_close": float(q["prev_close"]) if q.get("prev_close") is not None else None,
+            "volume": int(q["volume"]) if q.get("volume") is not None else None,
+            "timestamp": q.get("timestamp"),
+            "ist_time": q.get("ist_time") or q.get("time", ""),
+            "source": q.get("source", self.provider_name),
+            "tier": q.get("tier", DataTier.DELAYED),
+        }
+        return _standardize_payload(
+            payload,
+            provider_name=q.get("provider", self.provider_name),
+            symbol=canon,
+            exchange=exch,
+            data_status=q.get("data_status", DataStatus.DELAYED),
+            tier=q.get("tier", DataTier.DELAYED),
+            timestamp=q.get("timestamp"),
+            is_live=q.get("is_live", False),
+            is_simulated=q.get("is_simulated", False),
+        )
+
     def get_quotes(self, symbols, exchange="NSE"):
-        """Fetch quotes for a collection of symbols."""
-        raise NotImplementedError
+        """Fetch quotes for a collection of symbols with per-ticker error isolation."""
+        quotes = {}
+        for s in symbols:
+            canon = symbols_in.normalize_symbol(s)
+            try:
+                quotes[canon] = self.get_quote(s, exchange=exchange)
+            except DataError as e:
+                quotes[canon] = _standardize_payload(
+                    {
+                        "symbol": canon,
+                        "exchange": exchange,
+                        "error": str(e),
+                    },
+                    provider_name=self.provider_name,
+                    symbol=canon,
+                    exchange=exchange,
+                    data_status=DataStatus.UNAVAILABLE,
+                    tier=DataTier.UNAVAILABLE,
+                    timestamp=None,
+                    is_live=False,
+                    is_simulated=False,
+                )
+        return quotes
+
+    def get_historical_data(self, symbol, start=None, end=None, range_str="1y", interval="1d", exchange="NSE", now=None):
+        """Fetch standardized historical OHLCV bars (daily default or intraday range)."""
+        if interval in ("1d", "d", "daily"):
+            res = self.get_daily_bars(symbol, range_str=range_str, exchange=exchange, now=now)
+        else:
+            res = self.get_intraday_data(symbol, interval=interval, range_str=range_str, exchange=exchange, now=now)
+        if start or end:
+            s_day = calendar_in._resolve_date(start) if start else None
+            e_day = calendar_in._resolve_date(end) if end else None
+            filtered = []
+            for b in res.get("bars", []):
+                b_day = calendar_in._resolve_date(b["date"]) if b.get("date") else None
+                if s_day and (b_day is None or b_day < s_day):
+                    continue
+                if e_day and (b_day is None or b_day > e_day):
+                    continue
+                filtered.append(b)
+            res = dict(res)
+            res["bars"] = filtered
+        return res
+
+    def get_intraday_data(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
+        """Fetch standardized intraday OHLCV bars aligned to Indian market sessions."""
+        return self.get_intraday_bars(
+            symbol,
+            interval=interval,
+            range_str=range_str,
+            exchange=exchange,
+            now=now,
+            is_cas_eligible=is_cas_eligible,
+        )
 
     def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
         """Fetch historical intraday OHLCV bars aligned to Indian market sessions."""
@@ -92,13 +417,101 @@ class MarketDataProvider:
         """Fetch daily historical OHLCV bars for screening and technical indicators."""
         raise NotImplementedError
 
-    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+    def get_instruments(self, exchange="NSE", symbol=None):
+        """Fetch standardized equity or derivatives instrument records where supported."""
+        raise NotSupportedError(
+            "Provider '%s' does not supply instrument masters." % self.provider_name,
+            capability=CAPABILITY_INSTRUMENT_MASTERS,
+            provider=self.provider_name,
+        )
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
         """Fetch or construct option chain for underlying symbol and expiry."""
-        raise NotImplementedError
+        raise NotSupportedError(
+            "Provider '%s' does not support option chains." % self.provider_name,
+            capability=CAPABILITY_OPTION_CHAINS,
+            provider=self.provider_name,
+        )
 
     def get_derivatives_master(self, exchange="NSE"):
         """Fetch or construct derivatives master containing active contracts and lot sizes."""
-        raise NotImplementedError
+        raise NotSupportedError(
+            "Provider '%s' does not support derivatives instrument master." % self.provider_name,
+            capability=CAPABILITY_INSTRUMENT_MASTERS,
+            provider=self.provider_name,
+        )
+
+    def get_market_status(self, exchange="NSE", as_of=None):
+        """Return standardized IST exchange market status using calendar_in."""
+        exch = _normalize_exchange(exchange)
+        now_dt = calendar_in.parse_ist(as_of) if as_of else calendar_in.now_ist()
+        is_trading, day_status, day_reason = calendar_in.is_trading_day_in(now_dt, exchange=exch)
+        phase, phase_reason = calendar_in.get_session_phase(now_dt, exchange=exch)
+        is_open = bool(calendar_in.is_market_hours_in(now_dt, exchange=exch))
+        last_td = calendar_in.get_last_trading_day(now_dt, exchange=exch)
+        ts = int(now_dt.timestamp())
+        if is_open:
+            mkt_status = "OPEN"
+        elif not is_trading:
+            if day_reason == "weekend":
+                mkt_status = "WEEKEND"
+            elif "holiday" in str(day_reason or "").lower():
+                mkt_status = "HOLIDAY"
+            else:
+                mkt_status = "CLOSED"
+        elif phase in ("pre_open_entry", "order_matching", "buffer"):
+            mkt_status = "PRE_OPEN"
+        else:
+            mkt_status = "CLOSED"
+        payload = {
+            "symbol": exch,
+            "exchange": exch,
+            "status": mkt_status,
+            "calendar_verification": str(day_status or "").upper(),
+            "is_open": is_open,
+            "is_trading_day": bool(is_trading),
+            "session": phase,
+            "session_reason": phase_reason,
+            "day_reason": day_reason,
+            "last_trading_session": last_td.isoformat() if last_td else None,
+            "as_of": now_dt.strftime("%Y-%m-%d %H:%M:%S IST"),
+            "timestamp": ts,
+            "ist_time": now_dt.strftime("%Y-%m-%d %H:%M:%S IST"),
+            "live_supported": self.supports(CAPABILITY_LIVE_QUOTES),
+            "capabilities": self.capabilities(),
+        }
+        return _standardize_payload(
+            payload,
+            provider_name=self.provider_name,
+            symbol=exch,
+            exchange=exch,
+            data_status=DataStatus.CURRENT if is_open else DataStatus.HISTORICAL,
+            tier=DataTier.DELAYED if self.provider_name == "yahoo" else DataTier.HISTORICAL,
+            timestamp=ts,
+            is_live=False,
+            is_simulated=self.provider_name == "simulated",
+            now=now_dt,
+        )
+
+    def get_batch_series(self, symbols, range_str="3mo", interval="1d", exchange="NSE", now=None, pause=0.0):
+        """Fetch standardized scanner series dict for many symbols, isolating partial errors.
+
+        Returns ({canon_symbol: series_dict}, {canon_symbol: error_message}).
+        """
+        data, failed = {}, {}
+        for i, sym in enumerate(symbols):
+            if i > 0 and pause:
+                time.sleep(pause)
+            canon = symbols_in.normalize_symbol(sym)
+            try:
+                if interval in ("1d", "d", "daily"):
+                    payload = self.get_historical_data(canon, range_str=range_str, interval="1d", exchange=exchange, now=now)
+                else:
+                    payload = self.get_intraday_data(canon, interval=interval, range_str=range_str, exchange=exchange, now=now)
+                data[canon] = to_scanner_series(payload)
+            except Exception as e:
+                failed[canon] = str(e)
+        return data, failed
 
 
 class YahooMarketDataProvider(MarketDataProvider):
@@ -108,15 +521,32 @@ class YahooMarketDataProvider(MarketDataProvider):
     polite backoff, rate-limit recovery, and explicit DELAYED tier labeling.
     """
 
+    provider_name = "yahoo"
+    requires_auth = False
+    required_credentials = ()
+    CAPABILITIES = {
+        CAPABILITY_HISTORICAL_CANDLES: True,
+        CAPABILITY_INTRADAY_CANDLES: True,
+        CAPABILITY_LIVE_QUOTES: False,
+        CAPABILITY_STREAMING_DATA: False,
+        CAPABILITY_OPTION_CHAINS: False,
+        CAPABILITY_OPEN_INTEREST: False,
+        CAPABILITY_INSTRUMENT_MASTERS: False,
+        CAPABILITY_MARKET_STATUS: True,
+    }
+
     def __init__(self, hosts=YAHOO_HOSTS, user_agent=DEFAULT_USER_AGENT, timeout=DEFAULT_TIMEOUT,
-                 pause=DEFAULT_PAUSE, backoff=DEFAULT_BACKOFF):
+                 pause=DEFAULT_PAUSE, backoff=DEFAULT_BACKOFF, http_get=None):
         self.hosts = hosts
         self.user_agent = user_agent
         self.timeout = timeout
         self.pause = pause
         self.backoff = backoff
+        self._custom_http_get = http_get
 
     def _http_get(self, url):
+        if self._custom_http_get is not None:
+            return self._custom_http_get(url)
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             code = resp.getcode()
@@ -159,6 +589,128 @@ class YahooMarketDataProvider(MarketDataProvider):
             raise RateLimitError("Rate limit exceeded on provider hosts (HTTP 429). Wait and retry.")
         raise ProviderConnectionError("Could not reach data provider: %s" % last_error)
 
+    def _fetch_spark_url(self, provider_symbols, params):
+        query_params = dict(params or {})
+        query_params["symbols"] = ",".join(provider_symbols)
+        query_string = urllib.parse.urlencode(query_params)
+        last_error = None
+        for n, host in enumerate(self.hosts):
+            if n > 0 and self.pause:
+                time.sleep(self.pause)
+            for attempt in (0, 1):
+                url = "https://%s/v7/finance/spark?%s" % (host, query_string)
+                try:
+                    code, body = self._http_get(url)
+                    if code == 200:
+                        return body
+                except urllib.error.HTTPError as e:
+                    code = e.code
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                    last_error = e
+                    if code == 429:
+                        if attempt == 0:
+                            time.sleep(self.backoff)
+                            continue
+                        break
+                    if code >= 500:
+                        break
+                    raise ProviderConnectionError("Provider returned HTTP %d for spark batch" % code)
+                except (urllib.error.URLError, OSError) as e:
+                    last_error = e
+                    break
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
+            raise RateLimitError("Rate limit exceeded on provider hosts (HTTP 429). Wait and retry.")
+        raise ProviderConnectionError("Could not reach data provider: %s" % last_error)
+
+    def get_batch_series(self, symbols, range_str="3mo", interval="1d", exchange="NSE", now=None, pause=0.0):
+        """Fetch batches of 20 via Yahoo Spark for scan speed, preserving partial failure isolation."""
+        if len(symbols) <= 1 or type(self).get_daily_bars is not YahooMarketDataProvider.get_daily_bars or type(self).get_intraday_bars is not YahooMarketDataProvider.get_intraday_bars:
+            return super().get_batch_series(symbols, range_str=range_str, interval=interval,
+                                            exchange=exchange, now=now, pause=pause)
+        data, failed = {}, {}
+        batches = [symbols[i:i + 20] for i in range(0, len(symbols), 20)]
+        exch = _normalize_exchange(exchange)
+        for k, batch in enumerate(batches):
+            if k > 0 and (pause or self.pause):
+                time.sleep(pause if pause else self.pause)
+            wanted = {}
+            psym_list = []
+            for s in batch:
+                canon = symbols_in.normalize_symbol(s)
+                psym = symbols_in.to_yahoo_symbol(canon, exchange=exch)
+                wanted[psym.upper()] = canon
+                psym_list.append((canon, psym))
+            try:
+                body = self._fetch_spark_url([p for _, p in psym_list], {"range": range_str, "interval": interval})
+                doc = json.loads(body)
+                sp = (doc or {}).get("spark")
+                if not isinstance(sp, dict):
+                    raise DataError("Unexpected Yahoo spark payload shape")
+                got = {}
+                for item in sp.get("result") or []:
+                    resp = item.get("response") or []
+                    if not resp:
+                        continue
+                    ysym = item.get("symbol") or (resp[0].get("meta") or {}).get("symbol") or ""
+                    canon = wanted.get(ysym.upper(), symbols_in.normalize_symbol(ysym))
+                    q_ind = ((resp[0].get("indicators") or {}).get("quote") or [{}])[0] or {}
+                    has_full_ohlc = all(q_ind.get(k) is not None for k in ("open", "high", "low"))
+                    if has_full_ohlc:
+                        single_text = json.dumps({"chart": {"result": [resp[0]], "error": None}})
+                        if interval in ("1d", "d", "daily"):
+                            norm = self.normalize_daily_bars(single_text, canon, exchange=exch, now=now)
+                        else:
+                            norm = self.normalize_intraday_bars(single_text, canon, exchange=exch, interval=interval, now=now)
+                        got[canon] = to_scanner_series(norm)
+                    else:
+                        stamps = resp[0].get("timestamp") or []
+                        closes_raw = q_ind.get("close") if isinstance(q_ind.get("close"), list) else []
+                        vols_raw = q_ind.get("volume") if isinstance(q_ind.get("volume"), list) else None
+                        t_out, c_out = [], []
+                        v_out = [] if vols_raw is not None else None
+                        for idx, raw_ts in enumerate(stamps):
+                            if raw_ts is None:
+                                continue
+                            raw_c = closes_raw[idx] if idx < len(closes_raw) else None
+                            t_out.append(int(raw_ts))
+                            c_out.append(float(raw_c) if raw_c is not None else None)
+                            if v_out is not None:
+                                raw_v = vols_raw[idx] if idx < len(vols_raw) else None
+                                v_out.append(int(raw_v) if raw_v is not None else None)
+                        meta = dict(resp[0].get("meta") or {})
+                        non_null_c = [c for c in c_out if c is not None]
+                        if non_null_c and meta.get("regularMarketPrice") is None:
+                            meta["regularMarketPrice"] = non_null_c[-1]
+                        got[canon] = {
+                            "t": t_out,
+                            "c": c_out,
+                            "o": None,
+                            "h": None,
+                            "l": None,
+                            "v": v_out,
+                            "meta": meta,
+                            "provider": "yahoo",
+                            "data_status": DataStatus.HISTORICAL,
+                            "is_live": False,
+                            "is_simulated": False,
+                        }
+                err = sp.get("error")
+                if err and not got:
+                    raise DataError("Yahoo spark error: %s" % (err.get("description") or err.get("code") or err))
+            except Exception as e:
+                for canon, _ in psym_list:
+                    failed[canon] = str(e)
+                continue
+            for canon, _ in psym_list:
+                if canon in got:
+                    data[canon] = got[canon]
+                else:
+                    failed[canon] = "no data from Yahoo"
+        return data, failed
+
     def get_quote(self, symbol, exchange="NSE"):
         canonical = symbols_in.normalize_symbol(symbol)
         provider_sym = symbols_in.to_yahoo_symbol(canonical, exchange=exchange)
@@ -172,16 +724,26 @@ class YahooMarketDataProvider(MarketDataProvider):
         for i, s in enumerate(symbols):
             if i > 0 and self.pause:
                 time.sleep(self.pause)
+            canon = symbols_in.normalize_symbol(s)
             try:
-                quotes[symbols_in.normalize_symbol(s)] = self.get_quote(s, exchange=exchange)
+                quotes[canon] = self.get_quote(s, exchange=exchange)
             except DataError as e:
                 # Retain partial quotes while reporting errors per ticker
-                quotes[symbols_in.normalize_symbol(s)] = {
-                    "symbol": symbols_in.normalize_symbol(s),
-                    "exchange": exchange,
-                    "error": str(e),
-                    "is_real_time": False,
-                }
+                quotes[canon] = _standardize_payload(
+                    {
+                        "symbol": canon,
+                        "exchange": exchange,
+                        "error": str(e),
+                    },
+                    provider_name="yahoo",
+                    symbol=canon,
+                    exchange=exchange,
+                    data_status=DataStatus.UNAVAILABLE,
+                    tier=DataTier.UNAVAILABLE,
+                    timestamp=None,
+                    is_live=False,
+                    is_simulated=False,
+                )
         return quotes
 
     def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
@@ -238,21 +800,21 @@ class YahooMarketDataProvider(MarketDataProvider):
             change_pct = round((price / prev_close - 1) * 100.0, 3)
 
         rmt = meta.get("regularMarketTime")
-        time_str = ""
-        if rmt:
-            dt_ist = datetime.datetime.fromtimestamp(rmt, tz=calendar_in.IST)
-            time_str = dt_ist.strftime("%Y-%m-%d %H:%M:%S IST")
-
-        return {
+        time_str = _format_ist(rmt) if rmt else ""
+        exch = _normalize_exchange(exchange)
+        open_px = meta.get("regularMarketOpen")
+        payload = {
             "symbol": symbol,
             "raw_symbol": raw_symbol or symbol,
-            "exchange": exchange,
+            "exchange": exch,
             "currency": meta.get("currency", "INR"),
             "price": float(price),
+            "ltp": float(price),
+            "close": float(price),
             "prev_close": float(prev_close) if prev_close else None,
             "change": change,
             "change_pct": change_pct,
-            "open": float(meta["regularMarketDayLow"]) if "regularMarketDayLow" in meta and False else meta.get("regularMarketOpen"),
+            "open": float(open_px) if open_px is not None else None,
             "high": float(meta["regularMarketDayHigh"]) if "regularMarketDayHigh" in meta else None,
             "low": float(meta["regularMarketDayLow"]) if "regularMarketDayLow" in meta else None,
             "volume": int(meta["regularMarketVolume"]) if meta.get("regularMarketVolume") is not None else None,
@@ -260,8 +822,18 @@ class YahooMarketDataProvider(MarketDataProvider):
             "time": time_str,
             "source": "yahoo",
             "tier": DataTier.DELAYED,
-            "is_real_time": False,
         }
+        return _standardize_payload(
+            payload,
+            provider_name="yahoo",
+            symbol=symbol,
+            exchange=exch,
+            data_status=DataStatus.DELAYED,
+            tier=DataTier.DELAYED,
+            timestamp=int(rmt) if rmt else None,
+            is_live=False,
+            is_simulated=False,
+        )
 
     def normalize_intraday_bars(self, text, symbol, exchange="NSE", interval="5m", now=None, is_cas_eligible=False):
         try:
@@ -337,6 +909,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                 "date": date_str,
                 "slot": slot,
                 "start": dt_ist.strftime("%H:%M"),
+                "ist_time": dt_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
                 "o": round(float(o), 2),
                 "h": round(float(h), 2),
                 "l": round(float(l), 2),
@@ -345,17 +918,32 @@ class YahooMarketDataProvider(MarketDataProvider):
                 "ts": ts,
             })
 
-        return {
+        exch = _normalize_exchange(exchange)
+        prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+        last_ts = bars[-1]["ts"] if bars else meta.get("regularMarketTime")
+        payload = {
             "symbol": symbol,
-            "exchange": exchange,
+            "exchange": exch,
             "interval": interval,
+            "prev_close": float(prev_close) if prev_close is not None else None,
             "tier": DataTier.HISTORICAL,
             "source": "yahoo",
-            "is_real_time": False,
             "bars": bars,
             "dropped": dropped,
             "meta": meta,
         }
+        return _standardize_payload(
+            payload,
+            provider_name="yahoo",
+            symbol=symbol,
+            exchange=exch,
+            data_status=DataStatus.HISTORICAL,
+            tier=DataTier.HISTORICAL,
+            timestamp=int(last_ts) if last_ts else None,
+            is_live=False,
+            is_simulated=False,
+            now=now_dt,
+        )
 
     def normalize_daily_bars(self, text, symbol, exchange="NSE", now=None):
         try:
@@ -396,6 +984,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             # Store completed daily bar
             bars_by_date[d] = {
                 "date": d.isoformat(),
+                "ist_time": dt_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
                 "o": round(float(o), 2),
                 "h": round(float(h), 2),
                 "l": round(float(l), 2),
@@ -405,33 +994,59 @@ class YahooMarketDataProvider(MarketDataProvider):
             }
 
         sorted_bars = [bars_by_date[k] for k in sorted(bars_by_date.keys())]
-        return {
+        exch = _normalize_exchange(exchange)
+        last_ts = sorted_bars[-1]["ts"] if sorted_bars else meta.get("regularMarketTime")
+        payload = {
             "symbol": symbol,
-            "exchange": exchange,
+            "exchange": exch,
             "interval": "1d",
             "tier": DataTier.HISTORICAL,
             "source": "yahoo",
-            "is_real_time": False,
             "bars": sorted_bars,
             "meta": meta,
         }
+        return _standardize_payload(
+            payload,
+            provider_name="yahoo",
+            symbol=symbol,
+            exchange=exch,
+            data_status=DataStatus.HISTORICAL,
+            tier=DataTier.HISTORICAL,
+            timestamp=int(last_ts) if last_ts else None,
+            is_live=False,
+            is_simulated=False,
+            now=now_dt,
+        )
 
-    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+    def get_instruments(self, exchange="NSE", symbol=None):
+        """Report capability limitation for remote instrument master download."""
+        raise NotSupportedError(
+            "Yahoo Finance does not provide official Indian equity or derivatives instrument masters. "
+            "Use local instrument cache (instruments.py) or a broker adapter.",
+            capability=CAPABILITY_INSTRUMENT_MASTERS,
+            provider="yahoo",
+        )
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
         """Fetch option chain for Indian derivatives.
 
         Identifies provider capability limitation: Yahoo Finance does not provide
         reliable real-time option chains with open interest and Greeks for Indian equities/indices.
         """
-        raise MissingDataError(
+        raise NotSupportedError(
             "Yahoo Finance does not provide reliable Indian options chains with live OI and Greeks. "
-            "Use SimulatedMarketDataProvider (simulated tier) or official broker adapters for options trading."
+            "Use SimulatedMarketDataProvider (simulated tier) or official broker adapters for options trading.",
+            capability=CAPABILITY_OPTION_CHAINS,
+            provider="yahoo",
         )
 
     def get_derivatives_master(self, exchange="NSE"):
         """Fetch derivatives instrument master."""
-        raise MissingDataError(
+        raise NotSupportedError(
             "Yahoo Finance does not provide Indian derivatives instrument master. "
-            "Use authoritative NSE/BSE metadata files or local instrument cache."
+            "Use authoritative NSE/BSE metadata files or local instrument cache.",
+            capability=CAPABILITY_INSTRUMENT_MASTERS,
+            provider="yahoo",
         )
 
 
@@ -440,6 +1055,20 @@ class OfflineMarketDataProvider(MarketDataProvider):
 
     Reads saved JSON or JSON.GZ chart responses from a local folder or file mapping.
     """
+
+    provider_name = "offline"
+    requires_auth = False
+    required_credentials = ()
+    CAPABILITIES = {
+        CAPABILITY_HISTORICAL_CANDLES: True,
+        CAPABILITY_INTRADAY_CANDLES: True,
+        CAPABILITY_LIVE_QUOTES: False,
+        CAPABILITY_STREAMING_DATA: False,
+        CAPABILITY_OPTION_CHAINS: True,
+        CAPABILITY_OPEN_INTEREST: False,
+        CAPABILITY_INSTRUMENT_MASTERS: True,
+        CAPABILITY_MARKET_STATUS: True,
+    }
 
     def __init__(self, base_path, tier=DataTier.HISTORICAL):
         self.base_path = base_path
@@ -470,49 +1099,162 @@ class OfflineMarketDataProvider(MarketDataProvider):
 
     def get_quote(self, symbol, exchange="NSE"):
         canonical = symbols_in.normalize_symbol(symbol)
+        exch = _normalize_exchange(exchange)
         path = self._locate_file(canonical, "quote")
         text = self._read_file(path)
-        res = self.parser.normalize_quote(text, canonical, exchange=exchange)
+        res = self.parser.normalize_quote(text, canonical, exchange=exch)
         res["source"] = "offline"
         res["tier"] = self.tier
-        return res
+        return _standardize_payload(
+            res,
+            provider_name="offline",
+            symbol=canonical,
+            exchange=exch,
+            data_status=DataStatus.FIXTURE,
+            tier=self.tier,
+            timestamp=res.get("timestamp"),
+            is_live=False,
+            is_simulated=False,
+        )
 
     def get_quotes(self, symbols, exchange="NSE"):
+        exch = _normalize_exchange(exchange)
         quotes = {}
         for s in symbols:
+            canon = symbols_in.normalize_symbol(s)
             try:
-                quotes[symbols_in.normalize_symbol(s)] = self.get_quote(s, exchange=exchange)
+                quotes[canon] = self.get_quote(s, exchange=exch)
             except DataError as e:
-                quotes[symbols_in.normalize_symbol(s)] = {
-                    "symbol": symbols_in.normalize_symbol(s),
-                    "exchange": exchange,
-                    "error": str(e),
-                    "is_real_time": False,
-                }
+                quotes[canon] = _standardize_payload(
+                    {
+                        "symbol": canon,
+                        "exchange": exch,
+                        "error": str(e),
+                    },
+                    provider_name="offline",
+                    symbol=canon,
+                    exchange=exch,
+                    data_status=DataStatus.UNAVAILABLE,
+                    tier=DataTier.UNAVAILABLE,
+                    timestamp=None,
+                    is_live=False,
+                    is_simulated=False,
+                )
         return quotes
 
     def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
         canonical = symbols_in.normalize_symbol(symbol)
+        exch = _normalize_exchange(exchange)
         suffix = interval
         path = self._locate_file(canonical, suffix)
         text = self._read_file(path)
-        res = self.parser.normalize_intraday_bars(text, canonical, exchange=exchange, interval=interval,
+        res = self.parser.normalize_intraday_bars(text, canonical, exchange=exch, interval=interval,
                                                   now=now, is_cas_eligible=is_cas_eligible)
         res["source"] = "offline"
         res["tier"] = self.tier
-        return res
+        return _standardize_payload(
+            res,
+            provider_name="offline",
+            symbol=canonical,
+            exchange=exch,
+            data_status=DataStatus.FIXTURE,
+            tier=self.tier,
+            timestamp=res.get("timestamp"),
+            is_live=False,
+            is_simulated=False,
+            now=now,
+        )
 
     def get_daily_bars(self, symbol, range_str="1y", exchange="NSE", now=None):
         canonical = symbols_in.normalize_symbol(symbol)
+        exch = _normalize_exchange(exchange)
         path = self._locate_file(canonical, "daily")
         text = self._read_file(path)
-        res = self.parser.normalize_daily_bars(text, canonical, exchange=exchange, now=now)
+        res = self.parser.normalize_daily_bars(text, canonical, exchange=exch, now=now)
         res["source"] = "offline"
         res["tier"] = self.tier
-        return res
+        return _standardize_payload(
+            res,
+            provider_name="offline",
+            symbol=canonical,
+            exchange=exch,
+            data_status=DataStatus.FIXTURE,
+            tier=self.tier,
+            timestamp=res.get("timestamp"),
+            is_live=False,
+            is_simulated=False,
+            now=now,
+        )
 
-    def get_option_chain(self, symbol, expiry=None, exchange="NSE"):
+    def get_instruments(self, exchange="NSE", symbol=None):
+        exch = _normalize_exchange(exchange)
+        items = []
+        raw_items = None
+        if os.path.isdir(self.base_path):
+            for fname in ("instruments.json", "instruments-%s.json" % exch.lower(), "nse_instruments.json"):
+                cand = os.path.join(self.base_path, fname)
+                if os.path.exists(cand):
+                    doc = json.loads(self._read_file(cand))
+                    raw_items = doc.get("instruments") if isinstance(doc, dict) else doc
+                    break
+        if raw_items is None and os.path.isdir(self.base_path):
+            for fname in ("EQUITY_L.csv", "EQUITY_L_sample.csv"):
+                cand = os.path.join(self.base_path, fname)
+                if os.path.exists(cand):
+                    try:
+                        raw_items = instruments.parse_equity_l_csv(self._read_file(cand), exchange=exch)
+                    except Exception:
+                        raw_items = None
+                    break
+        if raw_items is None and os.path.exists(instruments.DEFAULT_CACHE_PATH):
+            try:
+                cache_payload = instruments.load_instrument_cache(max_age_days=3650)
+                if cache_payload and cache_payload.get("instruments"):
+                    raw_items = list(cache_payload["instruments"].values())
+            except Exception:
+                raw_items = None
+        if raw_items is None:
+            raw_items = list(instruments.INDEX_INSTRUMENTS.values())
+        target_sym = symbols_in.normalize_symbol(symbol) if symbol else None
+        for rec in (raw_items or []):
+            if not isinstance(rec, dict):
+                continue
+            sym = symbols_in.normalize_symbol(rec.get("symbol") or "")
+            rec_exch = _normalize_exchange(rec.get("exchange") or exch)
+            if target_sym and sym != target_sym:
+                continue
+            items.append({
+                "symbol": sym,
+                "exchange": rec_exch,
+                "instrument_id": "%s:%s" % (rec_exch, sym),
+                "name": rec.get("name", ""),
+                "asset_type": rec.get("asset_type", "EQUITY"),
+                "lot_size": int(rec.get("lot_size") or 1),
+                "tick_size": float(rec.get("tick_size") or 0.05),
+                "isin": rec.get("isin"),
+            })
+        return _standardize_payload(
+            {
+                "symbol": target_sym or exch,
+                "exchange": exch,
+                "instruments": items,
+                "count": len(items),
+                "source": "offline",
+                "tier": self.tier,
+            },
+            provider_name="offline",
+            symbol=target_sym or exch,
+            exchange=exch,
+            data_status=DataStatus.FIXTURE,
+            tier=self.tier,
+            timestamp=None,
+            is_live=False,
+            is_simulated=False,
+        )
+
+    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
         canonical = symbols_in.normalize_symbol(symbol)
+        exch = _normalize_exchange(exchange)
         try:
             path = self._locate_file(canonical, "chain")
         except SymbolNotFoundError:
@@ -525,6 +1267,17 @@ class OfflineMarketDataProvider(MarketDataProvider):
         if isinstance(data, dict):
             data["source"] = "offline"
             data["tier"] = self.tier
+            data = _standardize_payload(
+                data,
+                provider_name="offline",
+                symbol=canonical,
+                exchange=exch,
+                data_status=DataStatus.FIXTURE,
+                tier=self.tier,
+                timestamp=data.get("timestamp"),
+                is_live=False,
+                is_simulated=False,
+            )
         return data
 
     def get_derivatives_master(self, exchange="NSE"):
@@ -715,24 +1468,38 @@ class OptionChain:
         return round(float(pe_oi) / float(ce_oi), 3)
 
     def to_dict(self):
-        return {
-            "underlying": self.underlying,
-            "underlying_price": self.underlying_price,
-            "expiry": self.expiry,
-            "exchange": self.exchange,
-            "tier": self.data_tier,
-            "timestamp": self.timestamp,
-            "atm_strike": self.atm_strike,
-            "pcr": self.pcr,
-            "strikes": [
-                {
-                    "strike": k,
-                    "ce": self.strikes_data[k].get("ce"),
-                    "pe": self.strikes_data[k].get("pe"),
-                }
-                for k in self.sorted_strikes
-            ]
-        }
+        is_sim = self.data_tier == DataTier.SIMULATED
+        status = DataStatus.SIMULATED if is_sim else (
+            DataStatus.FIXTURE if self.data_tier == DataTier.FIXTURE else DataStatus.DELAYED
+        )
+        return _standardize_payload(
+            {
+                "underlying": self.underlying,
+                "underlying_price": self.underlying_price,
+                "expiry": self.expiry,
+                "exchange": self.exchange,
+                "tier": self.data_tier,
+                "timestamp": self.timestamp,
+                "atm_strike": self.atm_strike,
+                "pcr": self.pcr,
+                "strikes": [
+                    {
+                        "strike": k,
+                        "ce": self.strikes_data[k].get("ce"),
+                        "pe": self.strikes_data[k].get("pe"),
+                    }
+                    for k in self.sorted_strikes
+                ],
+            },
+            provider_name="simulated" if is_sim else "unknown",
+            symbol=self.underlying,
+            exchange=self.exchange,
+            data_status=status,
+            tier=self.data_tier,
+            timestamp=None,
+            is_live=False,
+            is_simulated=is_sim,
+        )
 
 
 class SimulatedMarketDataProvider(MarketDataProvider):
@@ -742,10 +1509,31 @@ class SimulatedMarketDataProvider(MarketDataProvider):
     Explicitly labeled with DataTier.SIMULATED.
     """
 
+    provider_name = "simulated"
+    requires_auth = False
+    required_credentials = ()
+    CAPABILITIES = {
+        CAPABILITY_HISTORICAL_CANDLES: True,
+        CAPABILITY_INTRADAY_CANDLES: True,
+        CAPABILITY_LIVE_QUOTES: False,
+        CAPABILITY_STREAMING_DATA: False,
+        CAPABILITY_OPTION_CHAINS: True,
+        CAPABILITY_OPEN_INTEREST: False,
+        CAPABILITY_INSTRUMENT_MASTERS: False,
+        CAPABILITY_MARKET_STATUS: True,
+    }
+
     def __init__(self, base_provider=None, default_iv=0.18, rate=0.07):
         self.base_provider = base_provider or YahooMarketDataProvider()
         self.default_iv = default_iv
         self.rate = rate
+
+    def supports(self, capability):
+        if capability == CAPABILITY_OPTION_CHAINS:
+            return True
+        if capability in (CAPABILITY_HISTORICAL_CANDLES, CAPABILITY_INTRADAY_CANDLES, CAPABILITY_INSTRUMENT_MASTERS):
+            return self.base_provider.supports(capability)
+        return bool(self.CAPABILITIES.get(capability, False))
 
     def get_quote(self, symbol, exchange="NSE"):
         # If symbol is a derivative contract, resolve price using Black-Scholes
@@ -758,20 +1546,31 @@ class SimulatedMarketDataProvider(MarketDataProvider):
             except Exception:
                 spot = 24000.0 if underlying in ("NIFTY", "^NSEI") else 2800.0
 
+            now_ts = int(calendar_in.now_ist().timestamp())
             if parsed["asset_type"] == "FUTURES":
                 price = round(spot * (1.0 + self.rate * (15.0 / 365.0)), 2)
-                return {
-                    "symbol": parsed["canonical_symbol"],
-                    "exchange": exchange,
-                    "price": price,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price,
-                    "tier": DataTier.SIMULATED,
-                    "source": "simulated",
-                    "is_real_time": False,
-                }
+                return _standardize_payload(
+                    {
+                        "symbol": parsed["canonical_symbol"],
+                        "exchange": exchange,
+                        "price": price,
+                        "ltp": price,
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price,
+                        "tier": DataTier.SIMULATED,
+                        "source": "simulated",
+                    },
+                    provider_name="simulated",
+                    symbol=parsed["canonical_symbol"],
+                    exchange=exchange,
+                    data_status=DataStatus.SIMULATED,
+                    tier=DataTier.SIMULATED,
+                    timestamp=now_ts,
+                    is_live=False,
+                    is_simulated=True,
+                )
             else:
                 strike = parsed["strike"]
                 opt_type = parsed["option_type"]
@@ -779,23 +1578,33 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                 days = max(1, calendar_in.days_to_expiry(exp_dt))
                 t_years = days / 365.0
                 bs = black_scholes(spot, strike, t_years, rate=self.rate, vol=self.default_iv, option_type=opt_type)
-                return {
-                    "symbol": parsed["canonical_symbol"],
-                    "exchange": exchange,
-                    "price": bs["price"],
-                    "strike": strike,
-                    "option_type": opt_type,
-                    "expiry": exp_dt.strftime("%Y-%m-%d"),
-                    "greeks": bs,
-                    "tier": DataTier.SIMULATED,
-                    "source": "simulated",
-                    "is_real_time": False,
-                }
+                return _standardize_payload(
+                    {
+                        "symbol": parsed["canonical_symbol"],
+                        "exchange": exchange,
+                        "price": bs["price"],
+                        "ltp": bs["price"],
+                        "strike": strike,
+                        "option_type": opt_type,
+                        "expiry": exp_dt.strftime("%Y-%m-%d"),
+                        "greeks": bs,
+                        "tier": DataTier.SIMULATED,
+                        "source": "simulated",
+                    },
+                    provider_name="simulated",
+                    symbol=parsed["canonical_symbol"],
+                    exchange=exchange,
+                    data_status=DataStatus.SIMULATED,
+                    tier=DataTier.SIMULATED,
+                    timestamp=now_ts,
+                    is_live=False,
+                    is_simulated=True,
+                )
 
         return self.base_provider.get_quote(symbol, exchange=exchange)
 
     def get_quotes(self, symbols, exchange="NSE"):
-        return {s: self.get_quote(s, exchange=exchange) for s in symbols}
+        return {symbols_in.normalize_symbol(s): self.get_quote(s, exchange=exchange) for s in symbols}
 
     def get_intraday_bars(self, symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False):
         return self.base_provider.get_intraday_bars(symbol, interval=interval, range_str=range_str,
@@ -803,6 +1612,9 @@ class SimulatedMarketDataProvider(MarketDataProvider):
 
     def get_daily_bars(self, symbol, range_str="1y", exchange="NSE", now=None):
         return self.base_provider.get_daily_bars(symbol, range_str=range_str, exchange=exchange, now=now)
+
+    def get_instruments(self, exchange="NSE", symbol=None):
+        return self.base_provider.get_instruments(exchange=exchange, symbol=symbol)
 
     def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
         canonical = symbols_in.normalize_symbol(symbol)
@@ -843,6 +1655,9 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     "iv": self.default_iv,
                     "greeks": ce_bs,
                     "tier": DataTier.SIMULATED,
+                    "data_status": DataStatus.SIMULATED,
+                    "is_simulated": True,
+                    "is_live": False,
                 },
                 "pe": {
                     "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "PE"),
@@ -855,6 +1670,9 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     "iv": self.default_iv,
                     "greeks": pe_bs,
                     "tier": DataTier.SIMULATED,
+                    "data_status": DataStatus.SIMULATED,
+                    "is_simulated": True,
+                    "is_live": False,
                 }
             }
 
@@ -873,53 +1691,226 @@ class SimulatedMarketDataProvider(MarketDataProvider):
 
 # ---------------------------------------------------------------- Provider Registry
 
-_REGISTRY = {
+_BUILTIN_PROVIDERS = {
     "yahoo": YahooMarketDataProvider,
     "offline": OfflineMarketDataProvider,
     "simulated": SimulatedMarketDataProvider,
 }
+_REGISTRY = dict(_BUILTIN_PROVIDERS)
+_CUSTOM_REGISTRY = sys.__dict__.setdefault("_DAY_TRADER_IN_CUSTOM_PROVIDERS", {})
 
 
 def register_provider(name, provider_cls):
     """Register a new market data provider class."""
-    _REGISTRY[name.lower()] = provider_cls
+    key = str(name).lower().strip()
+    _CUSTOM_REGISTRY[key] = provider_cls
+    _REGISTRY[key] = provider_cls
 
 
-def get_provider(name=None, source=None, **kwargs):
-    """Factory to retrieve a configured market data provider instance.
+def unregister_provider(name):
+    """Remove a dynamically registered provider (useful in isolated tests)."""
+    key = str(name).lower().strip()
+    removed = _CUSTOM_REGISTRY.pop(key, None)
+    if key in _BUILTIN_PROVIDERS:
+        _REGISTRY[key] = _BUILTIN_PROVIDERS[key]
+        return removed
+    local_removed = _REGISTRY.pop(key, None)
+    return removed if removed is not None else local_removed
 
-    Checks environment variable BHARAT_DATA_PROVIDER (defaults to 'yahoo').
+
+def list_providers():
+    """Return sorted names of registered Indian market data providers."""
+    return sorted(set(_REGISTRY.keys()) | set(_CUSTOM_REGISTRY.keys()))
+
+
+def _load_config_dict(config=None):
+    if isinstance(config, dict):
+        return config
+    for path in (os.environ.get("TRADER_CONFIG"), os.path.join("trader", "config.json")):
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, dict):
+                        return data
+            except Exception:
+                pass
+    return {}
+
+
+def resolve_provider_name(name=None, source=None, config=None):
+    """Resolve active Indian market data provider name.
+
+    Precedence:
+    1. explicit name argument
+    2. explicit source override
+    3. INDIA_MARKET_DATA_PROVIDER environment variable
+    4. config dict ('india_market_data_provider', 'data_provider', 'provider')
+    5. BHARAT_DATA_PROVIDER legacy environment variable
+    6. 'yahoo' safe default
     """
-    if name is None:
-        name = source or os.environ.get("BHARAT_DATA_PROVIDER", "yahoo")
-    name = str(name).lower()
-    if name not in _REGISTRY:
-        raise DataError("Unknown market data provider: '%s'. Available: %s" % (name, list(_REGISTRY.keys())))
-    return _REGISTRY[name](**kwargs)
+    if name:
+        return str(name).lower().strip()
+    if source:
+        return str(source).lower().strip()
+    env_primary = os.environ.get("INDIA_MARKET_DATA_PROVIDER")
+    if env_primary and str(env_primary).strip():
+        return str(env_primary).lower().strip()
+    cfg = _load_config_dict(config)
+    for key in ("india_market_data_provider", "INDIA_MARKET_DATA_PROVIDER", "data_provider", "provider"):
+        val = cfg.get(key)
+        if val and str(val).strip():
+            return str(val).lower().strip()
+    env_legacy = os.environ.get("BHARAT_DATA_PROVIDER")
+    if env_legacy and str(env_legacy).strip():
+        return str(env_legacy).lower().strip()
+    return "yahoo"
+
+
+def get_provider(name=None, source=None, config=None, **kwargs):
+    """Factory to retrieve a configured market data provider instance."""
+    resolved = resolve_provider_name(name=name, source=source, config=config)
+    provider_cls = _CUSTOM_REGISTRY.get(resolved) or _REGISTRY.get(resolved)
+    if provider_cls is None:
+        raise ProviderConfigError(
+            "Unknown market data provider: '%s'. Available: %s" % (resolved, list_providers())
+        )
+    cfg = _load_config_dict(config)
+    provider_cls.validate_config(config=cfg)
+    if cfg and "config" not in kwargs:
+        try:
+            init_fn = provider_cls.__init__
+            code_obj = getattr(init_fn, "__code__", None)
+            if code_obj and "config" in code_obj.co_varnames[:code_obj.co_argcount + code_obj.co_kwonlyargcount]:
+                kwargs["config"] = cfg
+        except Exception:
+            pass
+    return provider_cls(**kwargs)
 
 
 # ---------------------------------------------------------------- Engine Adapters & Technical Indicators
 
 def to_scanner_series(daily_bars_payload):
-    """Convert normalized daily bars into the series dict format expected by scan_daily."""
+    """Convert normalized daily bars into the series dict format expected by scan_daily/scan_orb."""
     bars = daily_bars_payload.get("bars", [])
     timestamps = [b["ts"] for b in bars]
     closes = [b["c"] for b in bars]
+    opens = [b.get("o") for b in bars]
     highs = [b["h"] for b in bars]
     lows = [b["l"] for b in bars]
     volumes = [b["v"] for b in bars]
-    meta = daily_bars_payload.get("meta") or {}
+    meta = dict(daily_bars_payload.get("meta") or {})
     if bars:
-        meta["regularMarketPrice"] = closes[-1]
-        meta["regularMarketVolume"] = volumes[-1]
+        meta.setdefault("regularMarketPrice", closes[-1])
+        is_daily = daily_bars_payload.get("interval") in ("1d", "d", "daily", None)
+        vol_fallback = volumes[-1] if is_daily else sum(v or 0 for v in volumes)
+        meta.setdefault("regularMarketVolume", vol_fallback)
+        meta.setdefault("regularMarketTime", timestamps[-1])
     return {
         "t": timestamps,
         "c": closes,
+        "o": opens,
         "h": highs,
         "l": lows,
         "v": volumes,
         "meta": meta,
+        "provider": daily_bars_payload.get("provider", daily_bars_payload.get("source", "yahoo")),
+        "data_status": daily_bars_payload.get("data_status", DataStatus.HISTORICAL),
+        "is_live": bool(daily_bars_payload.get("is_live", False)),
+        "is_simulated": bool(daily_bars_payload.get("is_simulated", False)),
     }
+
+
+def to_entry_chart(intraday_payload):
+    """Convert provider get_intraday_data() payload into trader-entry chart dict."""
+    bars_out = []
+    for b in intraday_payload.get("bars", []):
+        t = b.get("t") if b.get("t") is not None else b.get("ts")
+        if t is None:
+            continue
+        bars_out.append({
+            "t": int(t),
+            "o": float(b["o"]),
+            "h": float(b["h"]),
+            "l": float(b["l"]),
+            "c": float(b["c"]),
+            "v": int(b.get("v") or 0),
+        })
+    meta = dict(intraday_payload.get("meta") or {})
+    prev_close = intraday_payload.get("prev_close")
+    if prev_close is None:
+        prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+    data_time = intraday_payload.get("timestamp") or meta.get("regularMarketTime")
+    if data_time is None and bars_out:
+        data_time = bars_out[-1]["t"]
+    if prev_close is not None:
+        meta.setdefault("previousClose", prev_close)
+    if data_time is not None:
+        meta.setdefault("regularMarketTime", data_time)
+    provider = intraday_payload.get("provider") or intraday_payload.get("source") or "yahoo"
+    tier = intraday_payload.get("tier") or (
+        DataTier.DELAYED if provider == "yahoo" else DataTier.HISTORICAL
+    )
+    return {
+        "symbol": intraday_payload.get("symbol", ""),
+        "meta": meta,
+        "bars": bars_out,
+        "prev_close": prev_close,
+        "data_time": data_time,
+        "is_offline": provider == "offline",
+        "provider": provider,
+        "source": provider,
+        "data_tier": tier,
+        "provider_data_status": intraday_payload.get("data_status", DataStatus.HISTORICAL),
+        "is_live": bool(intraday_payload.get("is_live", False)),
+        "is_simulated": bool(intraday_payload.get("is_simulated", False)),
+        "freshness_seconds": intraday_payload.get("freshness_seconds"),
+    }
+
+
+def to_exit_chart(bars_payload):
+    """Convert provider intraday/daily bars payload into trader-exit ATR bar format."""
+    bars_out = []
+    for b in bars_payload.get("bars", []):
+        t = b.get("t") if b.get("t") is not None else b.get("ts")
+        if t is None:
+            continue
+        bars_out.append({
+            "t": int(t),
+            "h": float(b["h"]),
+            "l": float(b["l"]),
+            "c": float(b["c"]),
+        })
+    meta = bars_payload.get("meta") or {}
+    data_time = bars_payload.get("timestamp") or meta.get("regularMarketTime")
+    if data_time is None and bars_out:
+        data_time = bars_out[-1]["t"]
+    return {
+        "bars": bars_out,
+        "data_time": data_time,
+        "provider": bars_payload.get("provider") or bars_payload.get("source") or "yahoo",
+        "data_status": bars_payload.get("data_status", DataStatus.HISTORICAL),
+        "is_live": bool(bars_payload.get("is_live", False)),
+        "is_simulated": bool(bars_payload.get("is_simulated", False)),
+    }
+
+
+def to_timemachine_bars(intraday_payload):
+    """Convert provider intraday payload into normalized timemachine OHLCV bar tuples."""
+    bars = []
+    for b in intraday_payload.get("bars", []):
+        t = b.get("t") if b.get("t") is not None else b.get("ts")
+        if t is None:
+            continue
+        bars.append((
+            int(t),
+            float(b["o"]),
+            float(b["h"]),
+            float(b["l"]),
+            float(b["c"]),
+            int(b.get("v") or 0),
+        ))
+    return sorted(bars, key=lambda row: row[0])
 
 
 def calculate_rsi(closes, period=14):
@@ -1003,9 +1994,31 @@ def fetch_quote(symbol, exchange="NSE", provider=None):
     return prov.get_quote(symbol, exchange=exchange)
 
 
+def fetch_ltp(symbol, exchange="NSE", provider=None):
+    prov = provider or get_provider()
+    return prov.get_ltp(symbol, exchange=exchange)
+
+
+def fetch_ohlc(symbol, exchange="NSE", interval="1d", provider=None):
+    prov = provider or get_provider()
+    return prov.get_ohlc(symbol, exchange=exchange, interval=interval)
+
+
 def fetch_quotes(symbols, exchange="NSE", provider=None):
     prov = provider or get_provider()
     return prov.get_quotes(symbols, exchange=exchange)
+
+
+def fetch_historical_data(symbol, start=None, end=None, range_str="1y", interval="1d", exchange="NSE", now=None, provider=None):
+    prov = provider or get_provider()
+    return prov.get_historical_data(symbol, start=start, end=end, range_str=range_str,
+                                    interval=interval, exchange=exchange, now=now)
+
+
+def fetch_intraday_data(symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False, provider=None):
+    prov = provider or get_provider()
+    return prov.get_intraday_data(symbol, interval=interval, range_str=range_str,
+                                  exchange=exchange, now=now, is_cas_eligible=is_cas_eligible)
 
 
 def fetch_intraday_bars(symbol, interval="5m", range_str="60d", exchange="NSE", now=None, is_cas_eligible=False, provider=None):
@@ -1018,7 +2031,17 @@ def fetch_daily_bars(symbol, range_str="1y", exchange="NSE", now=None, provider=
     return prov.get_daily_bars(symbol, range_str=range_str, exchange=exchange, now=now)
 
 
+def fetch_instruments(exchange="NSE", symbol=None, provider=None):
+    prov = provider or get_provider()
+    return prov.get_instruments(exchange=exchange, symbol=symbol)
+
+
 def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_price=None):
     prov = provider or get_provider("simulated")
     return prov.get_option_chain(symbol, expiry=expiry, exchange=exchange, spot_price=spot_price)
+
+
+def fetch_market_status(exchange="NSE", as_of=None, provider=None):
+    prov = provider or get_provider()
+    return prov.get_market_status(exchange=exchange, as_of=as_of)
 

@@ -46,9 +46,10 @@ _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import symbols_in
-    import calendar_in
+    import symbols_in  # type: ignore
+    import calendar_in  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
@@ -67,6 +68,25 @@ YES_WORDS = ("yes", "y")
 BATCH_WORDS = {"all", "every", "everything", "rest", "remaining", "them", "both", "batch", "each"}
 DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "maybe", "later",
                "hold", "unless", "if"}
+BUY_WORDS = {"buy", "buying", "bought", "purchase"}
+SELL_WORDS = {"sell", "selling", "sold", "short"}
+CONFIRM_WORDS = (
+    {"yes", "y", "please", "pls", "thanks", "thank", "you",
+     "place", "send", "submit", "execute", "confirm", "confirmed", "approve", "approved",
+     "proceed", "do", "go", "ahead",
+     "order", "trade", "ticket", "entry", "exit", "flatten", "close", "position",
+     "market", "mkt", "limit", "lmt", "bracket", "target", "tp", "sl", "loss", "stoploss",
+     "take", "profit", "max", "risk", "est", "charges", "about",
+     "share", "shares", "sh", "contract", "contracts", "lot", "lots", "qty", "quantity",
+     "notional", "amount", "price", "at", "for", "of", "on", "to", "in", "with", "by", "as",
+     "and", "only", "this", "that", "the", "my", "a", "an", "it", "one", "now", "today",
+     "day", "gtc", "opg", "cls", "ioc", "fok", "good", "til", "until", "canceled", "cancelled",
+     "usd", "inr", "rs", "dollar", "dollars", "rupee", "rupees", "nse", "bse", "alpaca", "ibkr", "paper",
+     "let's", "it's", "that's", "there's", "i'm", "i'll", "i'd", "we'll", "we're"}
+    | BUY_WORDS | SELL_WORDS
+)
+UPPER_SAFE_WORDS = {"YES", "BUY", "SELL", "USD", "INR", "RS", "NSE", "BSE", "GTC", "OPG", "CLS", "IOC", "FOK", "IBKR"}
+_REPLY_TOKEN_RE = re.compile(r"\^?[A-Za-z0-9']+(?:[.\-&:][A-Za-z0-9]+)*")
 
 
 class TicketError(Exception):
@@ -341,6 +361,92 @@ def amount_numbers(order):
     return nums
 
 
+def _exchange_tag(symbol):
+    u = str(symbol or "").strip().upper()
+    if u.startswith("NSE:") or u.endswith(".NS"):
+        return "NSE"
+    if u.startswith("BSE:") or u.endswith(".BO"):
+        return "BSE"
+    return None
+
+
+def _strip_symbol_affixes(symbol):
+    u = str(symbol or "").strip().upper()
+    for pref in ("NSE:", "BSE:"):
+        if u.startswith(pref):
+            u = u[len(pref):]
+            break
+    for suf in (".NS", ".BO", "-EQ"):
+        if u.endswith(suf) and len(u) > len(suf):
+            u = u[:-len(suf)]
+            break
+    return u
+
+
+def _norm_symbol(symbol):
+    u = str(symbol or "").strip().upper()
+    if not u:
+        return ""
+    if symbols_in is not None:
+        try:
+            return symbols_in.normalize_symbol(u)
+        except Exception:
+            pass
+    return _strip_symbol_affixes(u)
+
+
+def _symbol_matches(token, target_symbol):
+    tok = str(token or "").strip().upper()
+    sym = str(target_symbol or "").strip().upper()
+    if not tok or not sym:
+        return False
+    if tok == sym:
+        return True
+    tok_exch = _exchange_tag(tok)
+    sym_exch = _exchange_tag(sym)
+    if tok_exch and sym_exch and tok_exch != sym_exch:
+        return False
+    return bool(_norm_symbol(tok) and _norm_symbol(tok) == _norm_symbol(sym))
+
+
+def _explicit_qty_spans(text, target_symbol):
+    """Find numeric strings in explicit order-quantity positions (e.g. 'buy 26 RELIANCE', '8 shares')."""
+    spans = []
+    qty_after_side = re.compile(
+        r"\b(?:buy|buying|bought|purchase|sell|selling|sold|short)\s+(-?\d[\d,]*(?:\.\d+)?)(?![\w.])",
+        re.I,
+    )
+    for m in qty_after_side.finditer(text):
+        spans.append((m.start(1), m.end(1), m.group(1)))
+
+    qty_before_unit = re.compile(
+        r"(?<![A-Za-z0-9.$\u20b9-])(-?\d[\d,]*(?:\.\d+)?)\s+(?:shares?|sh|contracts?|lots?)\b",
+        re.I,
+    )
+    for m in qty_before_unit.finditer(text):
+        spans.append((m.start(1), m.end(1), m.group(1)))
+
+    base_sym = _strip_symbol_affixes(target_symbol)
+    if base_sym:
+        esc = re.escape(base_sym)
+        # Allow optional exchange prefix/suffix on the symbol in '8 TSLA' / '26 RELIANCE.NS'
+        sym_pat = r"(?:(?:NSE|BSE):)?" + esc + r"(?:\.(?:NS|BO)|-EQ)?"
+        qty_before_sym = re.compile(
+            r"(?<![A-Za-z0-9.$\u20b9-])(-?\d[\d,]*(?:\.\d+)?)\s+" + sym_pat + r"(?![A-Za-z0-9])",
+            re.I,
+        )
+        price_prefixes = {"at", "limit", "lmt", "stop", "target", "tp", "sl", "loss", "price", "rs", "inr", "usd"}
+        for m in qty_before_sym.finditer(text):
+            prefix = text[:m.start(1)].rstrip()
+            if prefix.endswith(("@", "$", "\u20b9")):
+                continue
+            prev_words = re.findall(r"[a-z]+", prefix.lower())
+            if prev_words and prev_words[-1] in price_prefixes:
+                continue
+            spans.append((m.start(1), m.end(1), m.group(1)))
+    return spans
+
+
 def parse_yes(reply, order, batch_symbols=()):
     """Is this reply an explicit yes for THIS one order? Returns (ok, why)."""
     raw = (reply or "").strip()
@@ -355,19 +461,53 @@ def parse_yes(reply, order, batch_symbols=()):
         return False, "a yes covers one order at a time, not a batch"
     if DOUBT_WORDS & set(words[1:]):
         return False, "the reply has a condition or a doubt in it; ask again"
-    sym = str(order.get("symbol", "")).upper()
-    tokens = set(re.findall(r"[A-Z0-9.\-&]{1,20}", raw.upper()))
-    others = {s.upper() for s in batch_symbols} - {sym}
-    named = tokens & others
-    named = tokens & others
-    if named:
-        return False, "the reply names %s, but this order is for %s" % (", ".join(sorted(named)), sym)
-    nums = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", raw)]
+
+    order_side = str(order.get("side") or "").strip().lower()
+    reply_sides = set()
+    if BUY_WORDS & set(words):
+        reply_sides.add("buy")
+    if SELL_WORDS & set(words):
+        reply_sides.add("sell")
+    if len(reply_sides) > 1:
+        return False, "the reply names conflicting sides, but this order is %s" % plain(order)
+    if reply_sides and order_side and reply_sides != {order_side}:
+        return False, "the reply says %s, but this order is %s" % (next(iter(reply_sides)), plain(order))
+
+    sym = str(order.get("symbol", "")).strip().upper()
+    others = {str(s).strip().upper() for s in (batch_symbols or ()) if s and str(s).strip()} - ({sym} if sym else set())
+    raw_has_lower = any(c.islower() for c in raw)
+    sym_spans = []
+    for m in _REPLY_TOKEN_RE.finditer(raw):
+        tok = m.group(0)
+        if not any(c.isalpha() for c in tok):
+            continue
+        sym_spans.append((m.start(), m.end()))
+        if _symbol_matches(tok, sym):
+            continue
+        low = tok.lower()
+        in_others = any(_symbol_matches(tok, o) for o in others)
+        if in_others and (low not in CONFIRM_WORDS or tok.isupper()):
+            return False, "the reply names %s, but this order is for %s" % (tok.upper(), sym)
+        if low not in CONFIRM_WORDS or (raw_has_lower and tok.isupper() and tok.upper() not in UPPER_SAFE_WORDS):
+            return False, "the reply names %s, but this order is for %s" % (tok.upper(), sym)
+
+    chars = list(raw)
+    for start, end in sym_spans:
+        for i in range(start, end):
+            chars[i] = " "
+    masked = "".join(chars)
+    nums = [float(n.replace(",", "")) for n in re.findall(r"(?<![A-Za-z0-9.])(-?\d[\d,]*(?:\.\d+)?)", masked)]
     if nums:
         want = amount_numbers(order)
-        if not any(abs(n - w) < 0.005 for n in nums for w in want):
+        if any(not any(abs(n - w) < 0.005 for w in want) for n in nums):
             return False, "the reply says %s, but this order is %s" % (
                 ", ".join(_str_num(n) for n in nums), plain(order))
+        order_qty = _f(order.get("qty"))
+        if order_qty is not None:
+            for _, _, q_str in _explicit_qty_spans(raw, sym):
+                q_val = float(q_str.replace(",", ""))
+                if abs(q_val - order_qty) >= 0.005:
+                    return False, "the reply says qty %s, but this order is %s" % (_str_num(q_val), plain(order))
     return True, "explicit yes for %s" % plain(order)
 
 
@@ -497,12 +637,20 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None)
     for p in pf.setdefault("positions", []):
         if str(p.get("ticker", "")).upper() == symbol:
             pos = p
+    if side not in ("buy", "sell"):
+        raise TicketError("--side wants buy or sell, not %r" % side)
     if side == "buy":
         if pos is None:
             pos = {"ticker": symbol, "shares": 0.0, "lots": []}
             pf["positions"].append(pos)
         lots = pos.setdefault("lots", [])
-        lots.append({"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost})
+        used_ids = set()
+        for l in lots:
+            m = re.match(r"^%s-(\d+)$" % re.escape(symbol), str(l.get("id", "")))
+            if m:
+                used_ids.add(int(m.group(1)))
+        next_num = (max(used_ids) + 1) if used_ids else (len(lots) + 1)
+        lots.append({"id": "%s-%d" % (symbol, next_num), "date": date, "shares": qty, "cost": cost})
         pos["shares"] = round(float(pos.get("shares", 0)) + qty, 6)
         pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
     else:
@@ -510,19 +658,32 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None)
             raise TicketError("cannot record selling %s %s: the portfolio holds %s"
                               % (_str_num(qty), symbol, pos.get("shares", 0) if pos else 0))
         left = qty
+        relieved_cost = 0.0
         for lot in sorted(pos.get("lots", []), key=lambda l: l.get("date", "")):
             if left <= 1e-9:
                 break
-            take = min(left, float(lot["shares"]))
-            per = float(lot["cost"]) / float(lot["shares"]) if float(lot["shares"]) else 0
-            lot["cost"] = round(float(lot["cost"]) - per * take, 2)
-            lot["shares"] = round(float(lot["shares"]) - take, 6)
-            left -= take
+            lot_shares = float(lot["shares"])
+            lot_cost = float(lot["cost"])
+            if left + 1e-9 >= lot_shares:
+                take = lot_shares
+                take_cost = lot_cost
+                lot["cost"] = 0.0
+                lot["shares"] = 0.0
+            else:
+                take = left
+                take_cost = round(lot_cost * (take / lot_shares), 2) if lot_shares else 0.0
+                lot["cost"] = round(lot_cost - take_cost, 2)
+                lot["shares"] = round(lot_shares - take, 6)
+            relieved_cost = round(relieved_cost + take_cost, 2)
+            left = round(left - take, 6)
         pos["lots"] = [l for l in pos.get("lots", []) if float(l["shares"]) > 1e-9]
         pos["shares"] = round(float(pos["shares"]) - qty, 6)
         if pos["shares"] <= 1e-9:
             pf["positions"].remove(pos)
         pf["cash"] = round(float(pf.get("cash", 0)) + cost, 2)
+        gross_pnl = round(cost - relieved_cost, 2)
+        pf["last_trade_pnl"] = gross_pnl
+        pf["realized_pnl"] = round(float(pf.get("realized_pnl", 0.0)) + gross_pnl, 2)
     write_json(portfolio_path, pf)
     return pf
 
@@ -634,6 +795,20 @@ def cmd_result(a):
     rec = latest(state, fp, today)
     if not rec or rec.get("status") != "approved":
         raise TicketError("order %d has no yes recorded today; a result can only follow an approval" % a.index)
+    has_fq = a.filled_qty is not None
+    has_fp = a.filled_price is not None
+    if has_fq != has_fp:
+        raise TicketError("--filled-qty and --filled-price must be supplied together")
+    if has_fq:
+        if a.status != "placed":
+            raise TicketError("--filled-qty/--filled-price only apply when --status is placed")
+        fq = float(a.filled_qty)
+        fp_price = float(a.filled_price)
+        if fq <= 0 or fp_price <= 0:
+            raise TicketError("a fill needs a positive --filled-qty and --filled-price")
+        max_qty = _f(rec.get("qty"))
+        if max_qty is not None and fq > max_qty + 1e-9:
+            raise TicketError("filled qty %s exceeds approved order qty %s" % (_str_num(fq), _str_num(max_qty)))
     new = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fp, "symbol": rec["symbol"],
            "side": rec["side"], "plain": rec["plain"], "status": a.status}
     for k in ("qty", "kind", "max_loss", "stop"):
@@ -643,18 +818,22 @@ def cmd_result(a):
         new["broker_order_id"] = a.broker_id
     if a.note:
         new["note"] = a.note
-    state["orders"].append(new)
-    write_json(a.state, state)
-    print("Recorded order %d as %s." % (a.index, a.status))
-    if a.status == "placed" and a.filled_qty and a.filled_price:
+    if a.status == "placed" and has_fq:
         apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today, market=market)
+        state["orders"].append(new)
+        write_json(a.state, state)
         log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, market=market)
+        print("Recorded order %d as %s." % (a.index, a.status))
         print("Added the fill to %s." % a.portfolio)
-    elif a.status == "placed":
-        print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
-              % (rec["symbol"], rec["side"]))
-        if rec.get("kind") == "entry" and is_bracket(order):
-            print("When the stop-loss or the take-profit fills later, record that sell the same way.")
+    else:
+        state["orders"].append(new)
+        write_json(a.state, state)
+        print("Recorded order %d as %s." % (a.index, a.status))
+        if a.status == "placed":
+            print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
+                  % (rec["symbol"], rec["side"]))
+            if rec.get("kind") == "entry" and is_bracket(order):
+                print("When the stop-loss or the take-profit fills later, record that sell the same way.")
     return 0
 
 
@@ -667,9 +846,16 @@ def cmd_fill(a):
         raise TicketError("--date wants a date like 2026-10-19")
     pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date, market=market)
     log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price, market=market)
-    print("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
-                                                                _money(a.price, market=market), date, a.portfolio,
-                                                                _money(pf["cash"], market=market)))
+    msg = ("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
+                                                                  _money(a.price, market=market), date, a.portfolio,
+                                                                  _money(pf["cash"], market=market)))
+    if a.side == "sell" and pf.get("last_trade_pnl") is not None:
+        pnl = pf["last_trade_pnl"]
+        sign = "+" if pnl >= 0 else "-"
+        msg += " Gross P&L %s%s (realized %s%s, before charges)." % (
+            sign, _money(abs(pnl), market=market),
+            "+" if pf["realized_pnl"] >= 0 else "-", _money(abs(pf["realized_pnl"]), market=market))
+    print(msg)
     return 0
 
 

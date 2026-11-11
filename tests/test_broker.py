@@ -66,6 +66,49 @@ class ExplicitYes(unittest.TestCase):
         for r in ("yes 9", "yes 10 TSLA", "yes but stop at 357", "yes, stop 358.32", "yes AAPL", "sure"):
             self.assertFalse(self.yes(r, o, ["TSLA", "AAPL"]), r)
 
+    def test_ticker_side_and_qty_must_match_selected_order(self):
+        rel = {
+            "symbol": "RELIANCE", "side": "buy", "qty": "26", "type": "limit",
+            "limit_price": "1326.00", "time_in_force": "day", "order_class": "bracket",
+            "take_profit_limit_price": "1350.00", "stop_loss_stop_price": "1310.00",
+            "market": "IN", "currency": "INR",
+        }
+        # Correct symbol, side, qty and valid short forms
+        for r in ("yes", "y", "yes buy 26 RELIANCE", "yes buy 26 reliance", "yes 26 RELIANCE",
+                  "yes buy 26 RELIANCE.NS", "yes buy 26 RELIANCE at 1326.00", "yes place it", "Yes, buy it"):
+            self.assertTrue(self.yes(r, rel, ["RELIANCE"]), r)
+
+        # Wrong ticker NOT in batch must be rejected (reported bug: BUY 26 RELIANCE vs 'yes buy 26 TCS')
+        self.assertFalse(ticket.parse_yes("yes buy 26 TCS", rel)[0])
+        self.assertTrue(ticket.parse_yes("yes buy 26 RELIANCE", rel)[0])
+        for r in ("yes buy 26 TCS", "yes buy 26 tcs", "yes TCS", "yes INFY",
+                  "yes buy 26 RELIANCE and TCS", "yes buy 26 IT", "yes buy 26 ON", "yes buy 26 RELIANCE.BO"):
+            if r == "yes buy 26 RELIANCE.BO":
+                rel_ns = dict(rel, symbol="RELIANCE.NS")
+                self.assertFalse(self.yes(r, rel_ns, ["RELIANCE.NS"]), r)
+            else:
+                self.assertFalse(self.yes(r, rel, ["RELIANCE"]), r)
+
+        # Wrong ticker present in batch must be rejected for the selected order
+        for r in ("yes buy 26 TCS", "yes TCS", "yes tcs"):
+            self.assertFalse(self.yes(r, rel, ["RELIANCE", "TCS"]), r)
+
+        # Wrong side must be rejected
+        for r in ("yes sell 26 RELIANCE", "yes sell 26", "yes sell it", "yes short 26 RELIANCE",
+                  "yes buy or sell 26 RELIANCE"):
+            self.assertFalse(self.yes(r, rel, ["RELIANCE"]), r)
+        rel_sell = dict(rel, side="sell")
+        for r in ("yes buy 26 RELIANCE", "Yes, buy it", "yes bought 26 RELIANCE"):
+            self.assertFalse(self.yes(r, rel_sell, ["RELIANCE"]), r)
+        self.assertTrue(self.yes("yes sell 26 RELIANCE", rel_sell, ["RELIANCE"]))
+
+        # Wrong quantity or second mismatched number must be rejected
+        for r in ("yes buy 25 RELIANCE", "yes buy 26 RELIANCE at 1400", "yes buy 25 RELIANCE at 1326",
+                  "yes buy 1326 RELIANCE", "yes 1326 shares of RELIANCE", "yes buy -26 RELIANCE"):
+            self.assertFalse(self.yes(r, rel, ["RELIANCE"]), r)
+        self.assertFalse(self.yes("yes buy 358.32 TSLA", tsla(), ["TSLA"]))
+        self.assertFalse(self.yes("yes buy 8 TSLA limit 999", tsla(), ["TSLA"]))
+
 
 class TicketShape(unittest.TestCase):
     def test_tool_input_is_the_alpaca_call(self):
@@ -301,6 +344,213 @@ class Flow(unittest.TestCase):
                             "--portfolio", self.pf, "--config", self.cfg, "--state", self.state])
         self.assertEqual(code, 1)
         self.assertNotIn("Traceback", err)
+
+
+class IndianPortfolioAccountingTest(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cfg = os.path.join(self.d, "config.json")
+        self.pf = os.path.join(self.d, "portfolio.json")
+        self.state = os.path.join(self.d, "broker.json")
+        self.orders = os.path.join(self.d, "orders.json")
+        self.risk = os.path.join(self.d, "risk.json")
+        with open(self.cfg, "w", encoding="utf-8") as fh:
+            json.dump({"budget": 100000, "paper": True, "market": "IN", "currency": "INR",
+                       "max_position_pct": 90, "max_order_usd": 95000, "max_loss_per_trade_usd": 2000,
+                       "max_daily_loss_usd": 5000, "require_stop": True, "min_reward_risk": 1.0,
+                       "no_entries_before": "09:30", "no_entries_after": "15:00"}, fh)
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_reliance_roundtrip_buy_56_sell_56_reconciles_pnl_and_cash(self):
+        # BUY 56 RELIANCE @ Rs 1,326.00 (cost = Rs 74,256.00), then SELL 56 @ Rs 1,324.40 (proceeds = Rs 74,166.40)
+        # Gross realized P&L before charges = Rs 74,166.40 - Rs 74,256.00 = -Rs 89.60
+        # Cash = Rs 100,000 - Rs 74,256.00 + Rs 74,166.40 = Rs 99,910.40
+        code1, out1, _ = run([
+            "fill", "--symbol", "RELIANCE", "--side", "buy", "--qty", "56", "--price", "1326",
+            "--date", "2026-10-19", "--now", "2026-10-19 10:35", "--market", "IN",
+            "--portfolio", self.pf, "--config", self.cfg, "--state", self.state
+        ])
+        self.assertEqual(code1, 0)
+        with open(self.pf, encoding="utf-8") as fh:
+            pf1 = json.load(fh)
+        self.assertEqual(pf1["cash"], 25744.0)
+        self.assertEqual(pf1["positions"][0]["shares"], 56.0)
+        self.assertEqual(pf1["positions"][0]["lots"][0]["cost"], 74256.0)
+
+        code2, out2, _ = run([
+            "fill", "--symbol", "RELIANCE", "--side", "sell", "--qty", "56", "--price", "1324.40",
+            "--date", "2026-10-19", "--now", "2026-10-19 15:20", "--market", "IN",
+            "--portfolio", self.pf, "--config", self.cfg, "--state", self.state
+        ])
+        self.assertEqual(code2, 0)
+        self.assertIn("-₹89.60", out2)
+        with open(self.pf, encoding="utf-8") as fh:
+            pf2 = json.load(fh)
+        self.assertEqual(pf2["cash"], 99910.4)
+        self.assertEqual(pf2["realized_pnl"], -89.6)
+        self.assertEqual(pf2["positions"], [])
+
+    def test_partial_fills_multiple_positions_and_non_colliding_lot_ids(self):
+        # Buy two RELIANCE lots and one TCS lot; relieve first RELIANCE lot completely + partial second
+        for sym, side, qty, px, d in (
+            ("RELIANCE", "buy", "30", "1300", "2026-10-15"),
+            ("RELIANCE", "buy", "26", "1356", "2026-10-16"),
+            ("TCS", "buy", "5", "4000", "2026-10-16"),
+            ("RELIANCE", "sell", "40", "1340", "2026-10-19"),
+        ):
+            code, _, _ = run([
+                "fill", "--symbol", sym, "--side", side, "--qty", qty, "--price", px,
+                "--date", d, "--now", d + " 11:00", "--market", "IN",
+                "--portfolio", self.pf, "--config", self.cfg, "--state", self.state
+            ])
+            self.assertEqual(code, 0)
+
+        # Next RELIANCE buy must receive ID RELIANCE-3, not collide with RELIANCE-2
+        code_b3, _, _ = run([
+            "fill", "--symbol", "RELIANCE", "--side", "buy", "--qty", "4", " --price".strip(), "1350",
+            "--date", "2026-10-19", "--now", "2026-10-19 12:00", "--market", "IN",
+            "--portfolio", self.pf, "--config", self.cfg, "--state", self.state
+        ])
+        self.assertEqual(code_b3, 0)
+        with open(self.pf, encoding="utf-8") as fh:
+            pf = json.load(fh)
+        pos_map = {p["ticker"]: p for p in pf["positions"]}
+        self.assertEqual(set(pos_map.keys()), {"RELIANCE", "TCS"})
+        self.assertEqual(pos_map["RELIANCE"]["shares"], 20.0)
+        self.assertEqual([l["id"] for l in pos_map["RELIANCE"]["lots"]], ["RELIANCE-2", "RELIANCE-3"])
+        self.assertEqual(pos_map["TCS"]["shares"], 5.0)
+        # Cash: 100000 - (30*1300 + 26*1356 + 5*4000) + 40*1340 - 4*1350
+        # = 100000 - (39000 + 35256 + 20000) + 53600 - 5400 = 53944.0
+        self.assertEqual(pf["cash"], 53944.0)
+
+    def test_duplicate_result_and_atomic_fill_validation(self):
+        order = {
+            "symbol": "RELIANCE", "side": "buy", "qty": "56", "type": "market", "time_in_force": "day",
+            "order_class": "bracket", "take_profit_limit_price": "1350.00", "stop_loss_stop_price": "1310.00",
+            "market": "IN", "currency": "INR",
+            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1350.0,
+                     "risk_per_share": 16.0, "reward_risk": 1.5, "max_loss": 896.0}
+        }
+        with open(self.orders, "w", encoding="utf-8") as fh:
+            json.dump({"orders": [order]}, fh)
+        with redirect_stdout(io.StringIO()):
+            r_code = check.main(["--orders", self.orders, "--config", self.cfg, "--portfolio", self.pf,
+                                 "--prices", os.path.join(self.d, "none"), "--state", self.state,
+                                 "--now", "2026-10-19 10:35", "--market", "IN", "--out", self.risk])
+        self.assertEqual(r_code, 0)
+        c_app, _, _ = run(["approve", "--index", "1", "--reply", "yes", "--orders", self.orders,
+                           "--config", self.cfg, "--risk", self.risk, "--state", self.state,
+                           "--now", "2026-10-19 10:35", "--market", "IN"])
+        self.assertEqual(c_app, 0)
+
+        # Reject over-fill (> approved qty 56) before mutating state
+        c_over, _, err_over = run(["result", "--index", "1", "--status", "placed", "--filled-qty", "60",
+                                   "--filled-price", "1326", "--orders", self.orders, "--config", self.cfg,
+                                   "--risk", self.risk, "--state", self.state, "--portfolio", self.pf,
+                                   "--now", "2026-10-19 10:36", "--market", "IN"])
+        self.assertEqual(c_over, 1)
+        self.assertIn("exceeds approved order qty", err_over)
+
+        # Record valid placement + fill
+        c_ok, _, _ = run(["result", "--index", "1", "--status", "placed", "--filled-qty", "56",
+                          "--filled-price", "1326", "--orders", self.orders, "--config", self.cfg,
+                          "--risk", self.risk, "--state", self.state, "--portfolio", self.pf,
+                          "--now", "2026-10-19 10:36", "--market", "IN"])
+        self.assertEqual(c_ok, 0)
+
+        # Duplicate result call for the same approved order must be rejected
+        c_dup, _, err_dup = run(["result", "--index", "1", "--status", "placed", "--filled-qty", "56",
+                                 "--filled-price", "1326", "--orders", self.orders, "--config", self.cfg,
+                                 "--risk", self.risk, "--state", self.state, "--portfolio", self.pf,
+                                 "--now", "2026-10-19 10:37", "--market", "IN"])
+        self.assertEqual(c_dup, 1)
+        self.assertIn("no yes recorded today", err_dup)
+        with open(self.pf, encoding="utf-8") as fh:
+            pf_after = json.load(fh)
+        self.assertEqual(pf_after["cash"], 25744.0)
+
+    def test_multi_order_batch_confirmation_and_fingerprint_gates(self):
+        rel = {
+            "symbol": "RELIANCE", "side": "buy", "qty": "26", "type": "market", "time_in_force": "day",
+            "order_class": "bracket", "take_profit_limit_price": "1350.00", "stop_loss_stop_price": "1310.00",
+            "market": "IN", "currency": "INR",
+            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1350.0,
+                     "risk_per_share": 16.0, "reward_risk": 1.5, "max_loss": 416.0},
+        }
+        tcs = {
+            "symbol": "TCS", "side": "buy", "qty": "10", "type": "market", "time_in_force": "day",
+            "order_class": "bracket", "take_profit_limit_price": "3960.00", "stop_loss_stop_price": "3880.00",
+            "market": "IN", "currency": "INR",
+            "plan": {"symbol": "TCS", "entry": 3900.0, "stop": 3880.0, "target": 3960.0,
+                     "risk_per_share": 20.0, "reward_risk": 3.0, "max_loss": 200.0},
+        }
+        with open(self.orders, "w", encoding="utf-8") as fh:
+            json.dump({"orders": [rel, tcs]}, fh)
+
+        # 1. Missing risk verdict must still block approval
+        c_norisk, _, err_norisk = run(["approve", "--index", "1", "--reply", "yes buy 26 RELIANCE",
+                                       "--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                                       "--state", self.state, "--now", "2026-10-19 10:35", "--market", "IN"])
+        self.assertEqual(c_norisk, 1)
+        self.assertIn("not ready", err_norisk)
+
+        # Run trader-risk over both orders
+        with redirect_stdout(io.StringIO()):
+            r_code = check.main(["--orders", self.orders, "--config", self.cfg, "--portfolio", self.pf,
+                                 "--prices", os.path.join(self.d, "none"), "--state", self.state,
+                                 "--now", "2026-10-19 10:35", "--market", "IN", "--out", self.risk])
+        self.assertEqual(r_code, 0)
+
+        # 2. Tampered order fingerprint must still be rejected
+        tampered = [dict(rel, symbol="TCS"), tcs]
+        with open(self.orders, "w", encoding="utf-8") as fh:
+            json.dump({"orders": tampered}, fh)
+        c_tamp, _, err_tamp = run(["approve", "--index", "1", "--reply", "yes buy 26 TCS",
+                                   "--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                                   "--state", self.state, "--now", "2026-10-19 10:35", "--market", "IN"])
+        self.assertEqual(c_tamp, 1)
+        self.assertIn("was not in the last risk check", err_tamp)
+        with open(self.orders, "w", encoding="utf-8") as fh:
+            json.dump({"orders": [rel, tcs]}, fh)
+
+        # 3. Wrong ticker / side / qty on selected order #1 must be rejected without mutating state
+        for bad_reply in ("yes buy 26 INFY", "yes buy 26 TCS", "yes sell 26 RELIANCE", "yes buy 25 RELIANCE"):
+            c_bad, out_bad, _ = run(["approve", "--index", "1", "--reply", bad_reply,
+                                     "--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                                     "--state", self.state, "--now", "2026-10-19 10:35", "--market", "IN"])
+            self.assertEqual(c_bad, 1, bad_reply)
+            self.assertIn("Not recorded", out_bad)
+        self.assertFalse(os.path.exists(self.state))
+
+        # 4. Approving order #1 approves ONLY order #1, leaving order #2 unapproved
+        c_ok1, out_ok1, _ = run(["approve", "--index", "1", "--reply", "yes buy 26 RELIANCE",
+                                 "--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                                 "--state", self.state, "--now", "2026-10-19 10:35", "--market", "IN"])
+        self.assertEqual(c_ok1, 0)
+        self.assertIn("BUY 26 RELIANCE", out_ok1)
+
+        with open(self.state, encoding="utf-8") as fh:
+            st1 = json.load(fh)
+        self.assertEqual(len(st1["orders"]), 1)
+        self.assertEqual(st1["orders"][0]["symbol"], "RELIANCE")
+        self.assertEqual(st1["orders"][0]["fingerprint"], ticket.fingerprint(rel))
+
+        # Order #2 cannot record placement/fill yet because confirmation covered only order #1
+        c_res2, _, err_res2 = run(["result", "--index", "2", "--status", "placed", "--filled-qty", "10",
+                                   "--filled-price", "3900", "--orders", self.orders, "--config", self.cfg,
+                                   "--risk", self.risk, "--state", self.state, "--portfolio", self.pf,
+                                   "--now", "2026-10-19 10:36", "--market", "IN"])
+        self.assertEqual(c_res2, 1)
+        self.assertIn("no yes recorded today", err_res2)
+
+        # Approving order #2 explicitly covers order #2 independently
+        c_ok2, out_ok2, _ = run(["approve", "--index", "2", "--reply", "yes buy 10 TCS",
+                                 "--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                                 "--state", self.state, "--now", "2026-10-19 10:36", "--market", "IN"])
+        self.assertEqual(c_ok2, 0)
+        self.assertIn("BUY 10 TCS", out_ok2)
 
 
 if __name__ == "__main__":

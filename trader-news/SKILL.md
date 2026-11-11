@@ -27,6 +27,7 @@ Tool in this folder (standard library Python, no keys):
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers TSLA NVDA --hours 12
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE TCS INFY --hours 48  # Indian equities (IST)
+python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE --research            # include low-relevance stories
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-sec --json
 ```
 

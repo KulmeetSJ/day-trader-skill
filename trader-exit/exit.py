@@ -54,14 +54,17 @@ _alerts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tra
 if _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import calendar_in
-    import symbols_in
-    import instruments
+    import calendar_in  # type: ignore
+    import symbols_in  # type: ignore
+    import instruments  # type: ignore
+    import data_in  # type: ignore
 except ImportError:
     calendar_in = None
     symbols_in = None
     instruments = None
+    data_in = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 BACKOFF = 5.0
@@ -207,7 +210,7 @@ def parse_now(text, market="US"):
             raise PlanError('--now wants an IST time like "2026-10-19 10:15" (or ...Z for UTC)')
         if dt.tzinfo is None:
             return local_to_utc(dt, market="IN")
-        return (dt - dt.utcoffset()).replace(tzinfo=None)
+        return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
 
     if t.upper().endswith(" ET"):
         t = t[:-3].strip()
@@ -220,7 +223,7 @@ def parse_now(text, market="US"):
         raise PlanError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
-    return (dt - dt.utcoffset()).replace(tzinfo=None)
+    return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
 
 
 def parse_hhmm(text, what, market="US"):
@@ -259,7 +262,7 @@ def session(d, market="US"):
     """(open_time, close_time) in local time, or None if closed all day."""
     if market == "IN":
         if calendar_in:
-            is_trade, status, reason = calendar_in.is_trading_day_in(d)
+            is_trade, _status, _reason = calendar_in.is_trading_day_in(d)
             if not is_trade:
                 return None
             return NSE_OPEN, NSE_CLOSE
@@ -392,7 +395,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         label = "%s%% under the entry" % num(stop_param)
         detail = "%s x (1 - %s%%) = %s%s" % (money(e, market=market), num(stop_param), curr, num(raw))
     elif stop_rule == "atr":
-        if atr is None:
+        if atr is None or atr_bars is None:
             raise PlanError("an atr stop needs the session's bars")
         a = D(round(atr, 6))
         raw = e - stop_param * a
@@ -489,7 +492,10 @@ def read_text(path):
         return fh.read()
 
 
-def load_chart(sym, interval, day, offline=None, market="US"):
+_ORIG_YAHOO_GET = yahoo_get
+
+
+def load_chart(sym, interval, day, offline=None, market="US", cfg=None):
     ysym = (symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else sym.upper().replace(".", "-"))
     if offline:
         path = offline
@@ -512,6 +518,25 @@ def load_chart(sym, interval, day, offline=None, market="US"):
             text = read_text(path)
         except (OSError, ValueError) as e:
             raise PlanError("could not read %s: %s" % (path, e))
+    elif market == "IN" and data_in is not None:
+        try:
+            prov = data_in.get_provider(config=cfg)
+        except Exception as e:
+            raise PlanError("Market data provider error: %s" % e)
+        use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
+        back = (to_local(utc_now(), market=market).date() - day).days
+        rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        if prov.provider_name == "yahoo" and interval == "1m" and back > 6:
+            raise PlanError("Yahoo keeps 1-minute bars for about a week")
+        if use_legacy_mock:
+            text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (ysym, rng, interval))
+        else:
+            exch = (cfg or {}).get("exchange") or "NSE"
+            try:
+                payload = prov.get_intraday_data(sym, interval=interval, range_str=rng, exchange=exch)
+            except Exception as e:
+                raise PlanError(str(e))
+            return data_in.to_exit_chart(payload)
     else:
         back = (to_local(utc_now(), market=market).date() - day).days
         rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
@@ -729,6 +754,7 @@ def build_plan(a, now_utc):
     if market == "IN":
         inst_path = getattr(a, "instruments", "trader/state/instruments.json")
         if instruments and inst_path and os.path.exists(inst_path):
+            instr_err = instruments.InstrumentMetadataError
             try:
                 cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=info.get("date"))
                 rec = instruments.resolve_instrument(info["symbol"], cache, require_intraday=True)
@@ -738,7 +764,7 @@ def build_plan(a, now_utc):
                     lot_size = rec.get("fo_lot_size") or rec.get("lot_size") or 1
                 else:
                     lot_size = rec.get("lot_size") or 1
-            except instruments.InstrumentMetadataError as exc:
+            except instr_err as exc:
                 raise PlanError(str(exc))
         else:
             tick_size = TICK_IN
@@ -758,7 +784,6 @@ def build_plan(a, now_utc):
         stop_text = "or-mid"
     stop_rule, stop_param = parse_stop(stop_text)
     target_rule, target_param = parse_target(a.target or "2R")
-    day = None
     if info["date"]:
         try:
             day = datetime.date.fromisoformat(str(info["date"]))
@@ -768,8 +793,10 @@ def build_plan(a, now_utc):
         day = to_local(now_utc, market=market).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
     atr = atr_n = None
+    chart_provider = None
     if stop_rule == "atr":
-        chart = load_chart(info["symbol"], info["interval"], day, a.offline, market=market)
+        chart = load_chart(info["symbol"], info["interval"], day, a.offline, market=market, cfg=cfg_market)
+        chart_provider = chart.get("provider")
         bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now, market=market) if a.now else None, market=market)
         if len(bars) < 3:
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
@@ -809,9 +836,12 @@ def build_plan(a, now_utc):
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
     d = info.get("doc") or {}
-    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "last_data_timestamp", "data_status", "is_simulated"):
+    for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
+              "data_tier", "last_trading_session", "last_data_timestamp", "data_status", "is_simulated", "provider"):
         if k in d:
             plan[k] = d[k]
+    if chart_provider and "provider" not in plan:
+        plan["provider"] = chart_provider
     warnings = []
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))

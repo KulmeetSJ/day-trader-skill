@@ -587,18 +587,57 @@ Every trade sized by `/trader-budget` calculates statutory regulatory charges al
 `/trader-news` monitors company-specific news, corporate announcements, and regulatory filings across Indian equities (NSE & BSE) and US stocks:
 
 - **Symbol Normalization**: Accepts canonical symbols (`RELIANCE`, `TCS`, `INFY`, `HDFCBANK`), exchange suffixes (`.NS`, `.BO`), and prefixes (`NSE:`, `BSE:`), normalizing them automatically.
-- **Sources & Attribution**: Fetches public Google News Indian corporate query RSS feeds alongside Yahoo Finance RSS feeds. Every headline clearly identifies the original reporting publisher (e.g. Livemint, The Economic Times, Moneycontrol, Reuters, TradingView) and publisher source URL.
+- **Company Relevance & Classification**: News is categorized into five structured buckets:
+  - `corporate`: earnings, exchange filings, management changes, acquisitions, contracts, and material announcements.
+  - `business`: products, partnerships, operational expansion, and commercial developments.
+  - `analyst`: broker ratings, price targets, recommendations, and analyst estimates.
+  - `market`: share-price commentary, market flows, and technical analysis.
+  - `low_relevance`: incidental mentions, sporting/marathon sponsorships, CSR awards, or venue references.
+- **Relevance Ranking & Filtering**: Material corporate developments and business expansions are prioritized by default. Low-relevance and incidental stories are excluded from standard output and can be inspected using `--research`. Sorting can be controlled via `--sort relevance` (default for Indian tickers) or `--sort time`.
+- **Subsidiary & Group Detection**: Explicitly identifies subsidiaries and distinct business units (e.g. Reliance Consumer Products, Reliance Retail, Reliance Jio, Reliance New Energy, Reliance ADAG group, Tata Group Parent, Infosys BPM, EdgeVerve, HDFC Life/AMC/ERGO/Securities) rather than conflating them with the parent listed entity.
+- **Sources & Attribution**: Fetches public Google News Indian corporate query RSS feeds alongside Yahoo Finance RSS feeds. Every headline clearly identifies the original reporting publisher (e.g. Livemint, The Economic Times, Moneycontrol, Reuters, TradingView) and preserves direct article URLs separate from publisher homepages.
+- **Coverage Transparency**: Summarizes total relevant stories, category breakdowns, subsidiary touches, and feed status (`OK`, `EMPTY`, or `UNAVAILABLE`). An empty feed or zero stories is transparently reported and never fabricated.
 - **IST Timestamps**: Formats all publication dates and intraday price moves in Indian Standard Time (`IST`, UTC+5:30), while preserving UTC datetimes internally for precise time-window filtering.
 - **Noise Filtering (Price Trackers vs. Real News)**: Automated stock quote tracker pages (e.g. "Share Price Today - Live NSE/BSE") are distinguished from genuine corporate disclosures, earnings releases, and material developments.
 - **Cross-Feed Deduplication**: Consolidates stories syndicated across multiple news outlets by matching normalized headlines and dates, merging ticker touchlists.
 - **Multi-Ticker Support**: Supports multiple Indian and mixed US/India tickers in a single invocation (`python3 news.py --tickers RELIANCE TCS INFY`).
 - **Data Limitations & Disclosures**: Public RSS feeds are unofficial and may experience syndication latency compared to real-time exchange circulars. Empty feed responses do not confirm the absence of material developments; material actions should be cross-verified directly on official exchange portals (NSE at `nseindia.com` or BSE at `bseindia.com`).
 
-### Data Provider Reality and Transparency
+### Provider-Agnostic Indian Market-Data Architecture (trader-alerts/data_in.py)
 
-- **Yahoo Finance (`DELAYED`)**: Provides 15-minute delayed quotes and historical OHLCV candles for Indian cash equities (`.NS` and `.BO`) and major indices (`^NSEI`, `^NSEBANK`, `^BSESN`). Yahoo Finance **does not reliably provide** Indian option chains with real-time Open Interest (OI) or Greeks.
-- **Simulated Provider (`SIMULATED`)**: When evaluating options strategies without a live paid provider, the system uses `SimulatedMarketDataProvider`, which generates mathematically sound Black-Scholes option chains with analytic Greeks, IV bisection, and realistic strike spacing. All such data is explicitly tagged `tier: SIMULATED`.
-- **Live / Broker Data (`REAL_TIME`)**: Real-time tick-by-tick market data and live NSE option chains with real-time Open Interest require an authenticated broker API adapter (such as Zerodha Kite Connect, Upstox, or Dhan). The modular `MarketDataProvider` interface is designed for drop-in connectivity when a broker API key is configured.
+All Indian trading workflows (`trader-scanner`, `trader-entry`, `trader-exit`, `trader-timemachine`, `trader-alerts`, and `trader-news` intraday moves) consume a provider-agnostic interface (`MarketDataProvider`) in [`trader-alerts/data_in.py`](trader-alerts/data_in.py) rather than binding directly to Yahoo schemas.
+
+- **Standard Provider Interface**:
+  - `get_quote(symbol, exchange="NSE")`: latest quote snapshot with canonical `symbol`, `exchange`, `instrument_id`, `ltp`/`price`, `prev_close`, `ist_time`, `freshness`, `data_status`, `is_live`, and `is_simulated`.
+  - `get_ltp(symbol, exchange="NSE")` & `get_ohlc(symbol, exchange="NSE", interval="1d")`: standardized LTP and OHLC snapshots.
+  - `get_historical_data(symbol, start=None, end=None, range_str="1y", interval="1d", exchange="NSE")` & `get_intraday_data(symbol, interval="5m", range_str="60d", exchange="NSE")`: IST-aligned OHLCV candle series converted cleanly for scanners, entry/exit calculators, and Time Machine replays.
+  - `get_instruments(exchange="NSE", symbol=None)`: standardized equity/derivative instrument metadata (where supported).
+  - `get_option_chain(symbol, expiry=None, exchange="NSE")` & `get_market_status(exchange="NSE", as_of=None)`: derivative chains (where supported) and IST exchange session status.
+- **Selecting a Provider (`INDIA_MARKET_DATA_PROVIDER`)**:
+  - Set `export INDIA_MARKET_DATA_PROVIDER=yahoo` (default when unset) or configure `"india_market_data_provider": "yahoo"` in `trader/config.json` (legacy `BHARAT_DATA_PROVIDER` and `"data_provider"` remain supported).
+  - Switching to a future registered adapter (for example Groww once added) requires only changing `INDIA_MARKET_DATA_PROVIDER=groww` or updating config, without rewriting scanner, entry, exit, risk, or paper-trading logic.
+  - Providers with `requires_auth = True` validate `required_credentials` from `config["provider_credentials"][provider]` or `<PROVIDER>_<CREDENTIAL>` env vars and fail fast with `AuthenticationConfigError`.
+
+#### Provider Capability Matrix & Current Limitations
+
+| Capability | `YahooMarketDataProvider` (`yahoo`, active) | `OfflineMarketDataProvider` (`offline`) | `SimulatedMarketDataProvider` (`simulated`) | Future Broker Adapter (e.g. Groww) |
+| :--- | :--- | :--- | :--- | :--- |
+| `historical_candles` | Supported (`HISTORICAL`) | Supported (`FIXTURE`) | Delegated | Expected |
+| `intraday_candles` | Supported (`5m`/`1m`, max ~60d/7d) | Supported (`FIXTURE`) | Delegated | Expected |
+| `live_quotes` | `NOT_SUPPORTED` (`DELAYED` 15m only) | `NOT_SUPPORTED` (`FIXTURE`) | `NOT_SUPPORTED` | Expected (`CURRENT`/`REAL_TIME`) |
+| `streaming_data` | `NOT_SUPPORTED` | `NOT_SUPPORTED` | `NOT_SUPPORTED` | Expected |
+| `option_chains` / `open_interest` | `NOT_SUPPORTED` (`NotSupportedError`) | Supported if saved fixture | `SIMULATED` (Black-Scholes; OI synthetic) | Expected |
+| `instrument_masters` | `NOT_SUPPORTED` remote; local CSV cache in `instruments.py` | Local fixture / cache | Delegated / `False` | Expected |
+| `market_status` | Supported (IST calendar `calendar_in`) | Supported (`calendar_in`) | Supported (`calendar_in`) | Supported |
+
+- **Current Limitations (Yahoo Finance)**: Yahoo is free, unofficial, and ~15 minutes delayed (`data_status: DELAYED`, `is_live: False`). It does not provide real-time NSE/BSE ticks, streaming feeds, live Indian option chains/OI, or official exchange instrument masters. Failed or timed-out requests raise typed errors (`RateLimitError`, `SymbolNotFoundError`, `ProviderConnectionError`, `MissingDataError`) and never fabricate prices or treat outages as empty setup scans.
+- **Simulated Options Safety**: Analytical Black-Scholes option pricing and chains remain isolated inside `SimulatedMarketDataProvider` and are always tagged `data_status: SIMULATED`, `is_simulated: True`, `is_live: False`.
+
+#### Adding a Future Adapter (e.g. Groww, Zerodha, Dhan)
+
+1. Subclass `data_in.MarketDataProvider`, set `provider_name`, `requires_auth = True`, `required_credentials`, and `CAPABILITIES`.
+2. Implement `get_quote`, `get_daily_bars`, `get_intraday_bars`, and optionally `get_instruments` / `get_option_chain`, returning `_standardize_payload(...)` with IST timestamps and explicit `data_status` / `is_live` flags.
+3. Register via `data_in.register_provider("groww", GrowwMarketDataProvider)` and activate with `INDIA_MARKET_DATA_PROVIDER=groww`.
 
 ## Files
 

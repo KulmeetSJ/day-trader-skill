@@ -65,11 +65,12 @@ _alerts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tra
 if _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import calendar_in
-    import symbols_in
-    import instruments
-    import data_in
+    import calendar_in  # type: ignore
+    import symbols_in  # type: ignore
+    import instruments  # type: ignore
+    import data_in  # type: ignore
 except ImportError:
     calendar_in = None
     symbols_in = None
@@ -229,7 +230,7 @@ def parse_now(text, market="US"):
             raise EntryError('--now wants an IST time like "2026-10-19 10:15" (or ...Z for UTC)')
         if dt.tzinfo is None:
             return local_to_utc(dt, market="IN")
-        return (dt - dt.utcoffset()).replace(tzinfo=None)
+        return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
 
     if t.upper().endswith(" ET"):
         t = t[:-3].strip()
@@ -242,7 +243,7 @@ def parse_now(text, market="US"):
         raise EntryError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
-    return (dt - dt.utcoffset()).replace(tzinfo=None)
+    return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
 
 
 def parse_hhmm(text, what, market="US"):
@@ -272,7 +273,7 @@ def trading_day(d, market="US"):
     """(is_trading_day, reason). Weekends and the market holiday list."""
     if market == "IN":
         if calendar_in:
-            is_trade, status, reason = calendar_in.is_trading_day_in(d)
+            is_trade, _status, reason = calendar_in.is_trading_day_in(d)
             if not is_trade:
                 return False, reason
             return True, ""
@@ -293,6 +294,11 @@ def session(d, market="US"):
     if not ok:
         return None
     if market == "IN":
+        if calendar_in:
+            sp = calendar_in.get_special_session(d.isoformat(), exchange="NSE")
+            if sp and sp.get("open_time") and sp.get("close_time"):
+                return (parse_hhmm(sp["open_time"], "special open", market="IN"),
+                        parse_hhmm(sp["close_time"], "special close", market="IN"))
         return NSE_OPEN, NSE_CLOSE
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
 
@@ -305,6 +311,18 @@ def next_open(d, market="US"):
             return "%s %s" % (nd.isoformat(), open_time)
         nd += datetime.timedelta(days=1)
     return None
+
+
+def last_trading_session_date(local_dt, market="US"):
+    """Most recent active or completed trading day for local_dt per exchange calendar."""
+    if market == "IN" and calendar_in:
+        return calendar_in.get_last_trading_day(local_dt, exchange="NSE")
+    d = local_dt.date() if isinstance(local_dt, datetime.datetime) else local_dt
+    for _ in range(30):
+        if trading_day(d, market=market)[0]:
+            return d
+        d -= datetime.timedelta(days=1)
+    return d
 
 
 # ---------------------------------------------------------------- Yahoo
@@ -444,8 +462,20 @@ def offline_file(path, sym, market="US"):
     return path
 
 
-def get_chart(sym, interval, day=None, offline=None, today=None, market="US"):
-    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file."""
+_ORIG_YAHOO_GET = yahoo_get
+
+
+def _to_ist_aware(now_utc):
+    if now_utc is None:
+        return None
+    ist_tz = calendar_in.IST if calendar_in is not None else datetime.timezone(datetime.timedelta(hours=5, minutes=30), "IST")
+    if getattr(now_utc, "tzinfo", None) is None:
+        return now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(ist_tz)
+    return now_utc.astimezone(ist_tz)
+
+
+def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cfg=None, now=None):
+    """Bars for one ticker, from active Indian provider (or Yahoo) or a saved offline file."""
     sym = sym.upper()
     if offline:
         f = offline_file(offline, sym, market=market)
@@ -453,11 +483,64 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US"):
             text = read_text(f)
         except (OSError, ValueError) as e:
             raise EntryError("could not read %s: %s" % (f, e))
+        ch = parse_chart(text, sym)
+        ch["is_offline"] = True
+        ch["provider"] = "offline"
+        ch["source"] = "offline"
+        ch["data_tier"] = "FIXTURE"
+        ch["is_live"] = False
+        ch["is_live_capable"] = False
+    elif market == "IN" and data_in is not None:
+        try:
+            prov = data_in.get_provider(config=cfg)
+        except Exception as e:
+            raise EntryError("Market data provider error: %s" % e)
+        use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
+        today = today or to_local(utc_now(), market=market).date()
+        if prov.provider_name == "yahoo":
+            rng = chart_range(day or today, today, interval)
+        else:
+            back = (today - (day or today)).days
+            rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        if use_legacy_mock:
+            fetch_sym = symbols_in.to_yahoo_symbol(sym) if symbols_in else yahoo_symbol(sym)
+            text = yahoo_get(chart_path(fetch_sym, rng, interval))
+            ch = parse_chart(text, sym)
+            ch["is_offline"] = False
+            ch["provider"] = "yahoo"
+            ch["source"] = "yahoo"
+            ch["data_tier"] = "DELAYED"
+            ch["is_live"] = False
+            ch["is_live_capable"] = False
+        else:
+            exch = (cfg or {}).get("exchange") or "NSE"
+            try:
+                payload = prov.get_intraday_data(
+                    sym,
+                    interval=interval,
+                    range_str=rng,
+                    exchange=exch,
+                    now=_to_ist_aware(now),
+                )
+            except Exception as e:
+                raise EntryError(str(e))
+            ch = data_in.to_entry_chart(payload)
+            ch["is_live_capable"] = bool(
+                prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
+                and prov.provider_name not in ("yahoo", "offline", "simulated")
+            )
     else:
         today = today or to_local(utc_now(), market=market).date()
         fetch_sym = symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else yahoo_symbol(sym)
         text = yahoo_get(chart_path(fetch_sym, chart_range(day or today, today, interval), interval))
-    ch = parse_chart(text, sym)
+        ch = parse_chart(text, sym)
+        ch["is_offline"] = False
+        ch["provider"] = "yahoo"
+        ch["source"] = "yahoo"
+        ch["data_tier"] = "DELAYED"
+        ch["is_live"] = False
+        ch["is_live_capable"] = False
+
     matched = False
     ch_sym = ch["symbol"]
     if market == "IN" and symbols_in:
@@ -525,6 +608,88 @@ def rsi_val(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
+def _classify_market_data(chart, market, day, eval_day, local, open_dt, close_dt, now_ts, dt,
+                          step, by_slot, ok, session_is_open, is_historical, replay_full_session,
+                          is_fixture):
+    """Determine data_tier, data_status, and is_live_data from provider capability and freshness."""
+    is_simulated = bool(chart.get("is_simulated", False))
+    provider_name = str(chart.get("provider") or ("offline" if is_fixture else "yahoo"))
+    prov_lower = provider_name.lower()
+    prov_status = str(chart.get("provider_data_status") or "").upper()
+    prov_tier = str(chart.get("data_tier") or "").upper()
+    provider_live_capable = (
+        bool(chart.get("is_live_capable"))
+        if "is_live_capable" in chart
+        else (prov_lower not in ("yahoo", "offline", "simulated") and bool(chart.get("is_live")))
+    ) and prov_lower not in ("yahoo", "offline", "simulated")
+    provider_claims_live = (
+        provider_live_capable
+        and not is_fixture
+        and not is_simulated
+        and (chart.get("is_live") is not False)
+        and prov_status in ("", "CURRENT")
+        and prov_tier in ("", "CURRENT", "REAL_TIME")
+    )
+
+    dt_day = to_local(utc_of(dt), market=market).date() if dt is not None else None
+    lag_sec = (now_ts - int(dt)) if dt is not None else None
+    dt_is_fresh = (dt is not None and dt_day == day and lag_sec is not None and -5 <= lag_sec <= 120)
+
+    received_bars = [b for b in by_slot.values() if b["t"] <= now_ts]
+    if eval_day == day and local >= open_dt + datetime.timedelta(seconds=step):
+        if received_bars:
+            latest_bar_end = max(b["t"] + step for b in received_bars)
+            bars_lag = now_ts - latest_bar_end
+            bars_are_fresh = bars_lag <= (step + 120)
+        else:
+            bars_lag = None
+            bars_are_fresh = False
+    else:
+        bars_lag = None
+        bars_are_fresh = True
+
+    if is_fixture:
+        return ("FIXTURE",
+                "stale" if ((day - eval_day).days >= 1 or not session_is_open or prov_status == "STALE") else "fixture",
+                False, provider_name, is_simulated)
+    if is_simulated:
+        return "SIMULATED", "simulated", False, provider_name, True
+    if replay_full_session or eval_day < day or not ok:
+        status = "stale" if ((day - eval_day).days >= 1 or prov_status == "STALE") else "delayed"
+        return "HISTORICAL", status, False, provider_name, False
+    if session_is_open:
+        is_live_data = bool(provider_claims_live and dt_is_fresh and bars_are_fresh)
+        if is_live_data:
+            return "CURRENT", "current", True, provider_name, False
+        stale_by_dt = (dt_day is not None and (day - dt_day).days >= 1) or (lag_sec is not None and lag_sec > 1800)
+        stale_by_bars = (bars_lag is not None and bars_lag > 1800)
+        if prov_status == "STALE" or stale_by_dt or stale_by_bars:
+            return "DELAYED", "stale", False, provider_name, False
+        return "DELAYED", "delayed", False, provider_name, False
+    if local < open_dt:
+        is_live_data = bool(provider_claims_live and dt_is_fresh)
+        if is_live_data:
+            return "CURRENT", "current", True, provider_name, False
+        prior_dt = (dt_day is not None and (day - dt_day).days >= 1)
+        return ("HISTORICAL" if prior_dt else "DELAYED",
+                "stale" if (prior_dt or prov_status == "STALE") else "delayed",
+                False, provider_name, False)
+    prior_dt = (dt_day is not None and (day - dt_day).days >= 1)
+    return ("HISTORICAL",
+            "stale" if (prior_dt or prov_status == "STALE") else "delayed",
+            False, provider_name, False)
+
+
+def _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open):
+    """Ensure missing/unavailable bar exits never claim live data or a live signal."""
+    res["is_market_open"] = bool(session_is_open)
+    res["is_live_data"] = False
+    res["is_live_signal"] = False
+    res["data_status"] = "stale" if past_bar_dates else ("simulated" if is_simulated else "unavailable")
+    res["data_tier"] = "FIXTURE" if is_fixture else ("SIMULATED" if is_simulated else "HISTORICAL")
+    return res
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
              min_volume_x=None, cfg=None, market=None, trading_style="intraday",
              option_strategy=None, strike_selection="ATM"):
@@ -546,7 +711,6 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     day = local.date()
     curr = "\u20b9" if market == "IN" else "$"
     exchange = "NSE" if market == "IN" else "NYSE"
-    tz_label = "IST" if market == "IN" else "ET"
     res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
@@ -560,47 +724,66 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     chart_bars = chart.get("bars", [])
     valid_bar_dates = sorted(list(set(to_local(utc_of(b["t"]), market=market).date()
                                       for b in chart_bars if not (b["t"] % step))))
+    past_bar_dates = [d for d in valid_bar_dates if d <= day]
+    is_fixture = bool(chart.get("is_offline"))
+    last_td = last_trading_session_date(local, market=market)
 
-    is_live_continuous = False
+    session_is_open = False
     is_historical = False
+    replay_full_session = False
     eval_day = day
+    now_ts = ts_of(now_utc)
 
-    if ok:
-        o, c = session(day, market=market)
+    s_today = session(day, market=market) if ok else None
+    if ok and s_today is not None:
+        o, c = s_today
         open_dt = datetime.datetime.combine(day, o)
         close_dt = datetime.datetime.combine(day, c)
         if open_dt <= local < close_dt:
-            is_live_continuous = True
+            session_is_open = True
         elif local < open_dt:
-            is_live_continuous = False
+            session_is_open = False
         else:
             is_historical = (market == "IN")
+            replay_full_session = (market == "IN")
     else:
-        if market == "IN" and valid_bar_dates:
-            eval_day = valid_bar_dates[-1]
+        if market == "IN" and past_bar_dates:
+            eval_day = past_bar_dates[-1]
             is_historical = True
+            replay_full_session = True
         else:
-            res.update(status="no-data", phase="closed", reason="the %s is closed today (%s)" % (exchange, why),
-                       next_open=next_open(day, market=market))
+            res.update(status="no-data", phase="closed",
+                       reason=("the %s is closed today (%s); last trading session was %s"
+                               + (" and no historical bars on or before %s were found in chart"
+                                  % (day.isoformat()) if (market == "IN" and valid_bar_dates) else ""))
+                              % (exchange, why, last_td.isoformat()) if market == "IN"
+                              else "the %s is closed today (%s)" % (exchange, why),
+                       next_open=next_open(day, market=market),
+                       is_market_open=False,
+                       is_live_data=False,
+                       is_live_signal=False,
+                       is_historical_analysis=(market == "IN" or is_fixture),
+                       is_fixture=is_fixture,
+                       last_trading_session=last_td.isoformat(),
+                       candle_session=None,
+                       last_data_timestamp=res.get("data_time"),
+                       data_status="stale" if is_fixture else "unavailable",
+                       data_tier="FIXTURE" if is_fixture else "HISTORICAL",
+                       provider=chart.get("provider", "offline" if is_fixture else "yahoo"),
+                       is_simulated=bool(chart.get("is_simulated", False)))
+            res["_market_session_open"] = False
+            res["_replay_full_session"] = True
             return res
 
-    if is_historical and eval_day != day:
+    if eval_day != day:
         s_eval = session(eval_day, market=market)
         if s_eval:
             o, c = s_eval
             open_dt = datetime.datetime.combine(eval_day, o)
             close_dt = datetime.datetime.combine(eval_day, c)
         else:
-            open_dt = datetime.datetime.combine(eval_day, datetime.time(9, 15) if market == "IN" else OPEN)
-            close_dt = datetime.datetime.combine(eval_day, datetime.time(15, 30) if market == "IN" else CLOSE)
-
-    res["date"] = eval_day.isoformat()
-    res["is_live_signal"] = is_live_continuous
-    res["is_historical_analysis"] = is_historical
-    res["last_trading_session"] = eval_day.isoformat()
-    res["last_data_timestamp"] = res.get("data_time")
-    res["data_status"] = "stale" if (day - eval_day).days >= 1 else "delayed"
-    res["is_simulated"] = False
+            open_dt = datetime.datetime.combine(eval_day, NSE_OPEN if market == "IN" else OPEN)
+            close_dt = datetime.datetime.combine(eval_day, NSE_CLOSE if market == "IN" else CLOSE)
 
     early = c != (NSE_CLOSE if market == "IN" else CLOSE)
     before = datetime.datetime.combine(eval_day, parse_hhmm(cfg["no_entries_before"], "no_entries_before", market=market))
@@ -621,14 +804,34 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             continue
         slot = int((et - open_dt).total_seconds()) // step
         by_slot[slot] = dict(b, et=et, end=et + datetime.timedelta(seconds=step), slot=slot)
+
+    data_tier, data_status, is_live_data, provider_name, is_simulated = _classify_market_data(
+        chart, market, day, eval_day, local, open_dt, close_dt, now_ts, dt,
+        step, by_slot, ok, session_is_open, is_historical, replay_full_session, is_fixture
+    )
+    res["date"] = eval_day.isoformat()
+    res["is_market_open"] = bool(session_is_open)
+    res["is_live_data"] = bool(is_live_data)
+    res["is_live_signal"] = False
+    res["is_historical_analysis"] = bool(is_historical or is_fixture)
+    res["is_fixture"] = is_fixture
+    res["data_tier"] = data_tier
+    res["last_trading_session"] = last_td.isoformat()
+    res["candle_session"] = eval_day.isoformat()
+    res["last_data_timestamp"] = res.get("data_time")
+    res["data_status"] = data_status
+    res["is_simulated"] = is_simulated
+    res["provider"] = provider_name
+    res["_market_session_open"] = bool(session_is_open)
+    res["_replay_full_session"] = replay_full_session
+
     bars, pending = [], None
-    now_ts = ts_of(now_utc)
     top = max(by_slot) if by_slot else -1
     for slot in sorted(by_slot):
         b = by_slot[slot]
         end_ts = b["t"] + step
-        if is_historical or end_ts <= now_ts:
-            if is_historical or dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
+        if replay_full_session or end_ts <= now_ts:
+            if replay_full_session or dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
                 bars.append(b)
             else:
                 pending = b
@@ -641,7 +844,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["_bars"] = bars
     res["bars_closed"] = len(bars)
 
-    if not is_historical and local < open_dt:
+    if not replay_full_session and local < open_dt:
         open_label = "9:15" if market == "IN" else "9:30"
         res.update(phase="pre-open", reason="the %s opens at %s%s" % (
             exchange, open_label, " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
@@ -652,15 +855,15 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if or_bars:
         res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
-                                "complete": (is_historical or local >= or_end), "avg_volume": int(round(avg_vol))}
+                                "complete": (replay_full_session or local >= or_end), "avg_volume": int(round(avg_vol))}
     if setup in ("orb", "options_orb"):
-        if not is_historical and local < or_end:
+        if not replay_full_session and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
             return res
         if not or_bars:
             res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
-            return res
+            return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
         lvl = max(b["h"] for b in or_bars)
     elif setup == "level":
         lvl = float(level)
@@ -725,7 +928,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
-        res.update(status="triggered", phase="open" if is_live_continuous else "after-close",
+        res.update(status="triggered", phase="open" if session_is_open else "after-close",
                    reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
@@ -775,14 +978,24 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if dt and utc_of(dt) < local_to_utc(trig["end"], market=market):
             res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
                                 % to_local(utc_of(dt), market=market).strftime("%H:%M:%S"))
+        res["is_live_signal"] = bool(
+            session_is_open
+            and is_live_data
+            and data_tier == "CURRENT"
+            and not is_fixture
+            and not bool(res.get("is_simulated"))
+            and not is_historical
+            and not replay_full_session
+            and res.get("status") == "triggered"
+        )
         return res
     if not bars:
-        res.update(status="no-data", phase="open" if is_live_continuous else "closed",
+        res.update(status="no-data", phase="open" if session_is_open else "closed",
                    reason="Yahoo sent no bars for %s yet" % eval_day.isoformat())
-        return res
+        return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
     what = ("close above the range high %s%.2f" % (curr, lvl)) if setup == "orb" else ("close above %s%.2f" % (curr, lvl))
-    if (is_historical or local >= cutoff) and not (pending and pending["end"] <= cutoff):
-        res.update(status="expired", phase="after-close" if not is_live_continuous else "after-cutoff",
+    if (replay_full_session or local >= cutoff) and not (pending and pending["end"] <= cutoff):
+        res.update(status="expired", phase="after-close" if not session_is_open else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
         return res
@@ -819,12 +1032,14 @@ def entry_doc(res, now_utc):
             pass
     elif str(sym).endswith((".NS", ".BO")):
         sym = sym.split(".")[0]
+    provider_name = res.get("provider") or "yahoo"
+    doc_source = "yahoo" if (provider_name == "offline" or res.get("market") != "IN") else provider_name
     doc = {"created_by": "trader-entry", "symbol": sym, "setup": res["setup"], "side": "buy",
            "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
            "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
            "interval": res["interval"],
            "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-           "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+           "source": doc_source, "provider": provider_name, "checked_at": iso(now_utc), "reason": res.get("reason")}
     if res.get("market"):
         doc["market"] = res["market"]
     if res.get("currency"):
@@ -834,12 +1049,22 @@ def entry_doc(res, now_utc):
         doc["asset_type"] = "OPTIONS"
     if res.get("trading_style"):
         doc["trading_style"] = res["trading_style"]
+    if res.get("is_market_open") is not None:
+        doc["is_market_open"] = bool(res.get("is_market_open", False))
+    if res.get("is_live_data") is not None:
+        doc["is_live_data"] = bool(res.get("is_live_data", False))
     if res.get("is_live_signal") is not None:
         doc["is_live_signal"] = bool(res.get("is_live_signal", False))
     if res.get("is_historical_analysis") is not None:
         doc["is_historical_analysis"] = bool(res.get("is_historical_analysis", False))
+    if res.get("is_fixture") is not None:
+        doc["is_fixture"] = bool(res.get("is_fixture", False))
+    if res.get("data_tier"):
+        doc["data_tier"] = res["data_tier"]
     if res.get("last_trading_session"):
         doc["last_trading_session"] = res["last_trading_session"]
+    if res.get("candle_session"):
+        doc["candle_session"] = res["candle_session"]
     if res.get("last_data_timestamp") or res.get("data_time"):
         doc["last_data_timestamp"] = res.get("last_data_timestamp") or res.get("data_time")
     if res.get("data_status"):
@@ -880,13 +1105,28 @@ def describe(res):
     curr = "\u20b9" if market == "IN" else "$"
     tz_label = "IST" if market == "IN" else "ET"
     is_hist = bool(res.get("is_historical_analysis"))
+    is_fix = bool(res.get("is_fixture"))
+    closed_analysis = bool(res.get("_replay_full_session") or (is_hist and not res.get("_market_session_open") and res.get("phase") not in ("pre-open", "open", "forming")))
+    tier = res.get("data_tier") or ("FIXTURE" if is_fix else ("HISTORICAL" if closed_analysis else "DELAYED"))
     sess_date = res.get("last_trading_session", res["date"])
-    if is_hist:
-        head = "%s  %s %s %s  %s on %s bars [HISTORICAL ANALYSIS -- Market CLOSED, Session: %s]" % (
-            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars, sess_date)
-    else:
-        head = "%s  %s %s %s  %s on %s bars (Yahoo, free, can lag)" % (
+    candle_sess = res.get("candle_session") or res["date"]
+    prov_name = str(res.get("provider") or ("offline" if is_fix else "yahoo"))
+    if closed_analysis:
+        head = "%s  %s %s %s  %s on %s bars [HISTORICAL ANALYSIS -- Market CLOSED, Session: %s%s]" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars,
+            sess_date, ", Fixture" if is_fix else "")
+    elif is_fix:
+        head = "%s  %s %s %s  %s on %s bars [OFFLINE FIXTURE -- historical replay, NOT live]" % (
             res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars)
+    else:
+        if res.get("is_live_data") and tier == "CURRENT":
+            prov_label = "%s live provider, CURRENT data" % prov_name
+        elif prov_name.lower() == "yahoo":
+            prov_label = "Yahoo delayed provider, free, %s data - NOT live" % tier
+        else:
+            prov_label = "%s provider, %s data - NOT live" % (prov_name, tier)
+        head = "%s  %s %s %s  %s on %s bars (%s)" % (
+            res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), tz_label, setup_name(res), bars, prov_label)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -900,13 +1140,13 @@ def describe(res):
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        if is_hist:
+        if closed_analysis:
             out.append("[HISTORICAL ANALYSIS] TRIGGERED on session %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
-                sess_date, curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+                candle_sess, curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
                 "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
                 (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
-            out.append("Market is CLOSED. Evaluated on historical candles from session %s (Data status: %s)." % (
-                sess_date, str(res.get("data_status", "stale")).upper()))
+            out.append("Market is CLOSED. Evaluated on historical candles from session %s (Data tier: %s, status: %s)." % (
+                candle_sess, tier, str(res.get("data_status", "stale")).upper()))
             out.append("NOT a live-session signal. Orders evaluated outside market hours are for research and paper trading only. Nothing was placed.")
             out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
                        "(exit.py plan --from trader/entry.json).")
@@ -922,14 +1162,27 @@ def describe(res):
                                res["minutes_since"], curr, res["last"]["close"], res["last"]["bar_start"]))
             if res.get("data_note"):
                 out.append(res["data_note"] + ".")
-            if res.get("minutes_since", 0) > step:
-                out.append("Nothing was placed.")
+            if is_fix:
+                out.append("Offline fixture replay (Data tier: %s) -- NOT a live market signal. Nothing was placed." % tier)
+            elif not res.get("is_live_signal", False):
+                d_stat = str(res.get("data_status", "delayed")).upper()
+                if res.get("is_simulated"):
+                    out.append("Simulated candidate evaluation (provider: %s, Data tier: %s, status: %s) -- NOT a live market signal. Nothing was placed." % (
+                        prov_name, tier, d_stat))
+                else:
+                    out.append("CANDIDATE DETECTED ON DELAYED DATA (provider: %s, Data tier: %s, status: %s) -- NOT a live market signal. Nothing was placed." % (
+                        prov_name, tier, d_stat))
+            elif res.get("minutes_since", 0) > step:
+                out.append("Current live signal (%s provider, Data tier: CURRENT). Nothing was placed." % prov_name)
             else:
-                out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
+                out.append("This is the moment to get in, if you take the trade (%s live provider, Data tier: CURRENT live signal). Nothing was placed." % prov_name)
             out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
                        "(exit.py plan --from trader/entry.json).")
     else:
         out.append("%s  %s." % (label, res["reason"]))
+        if not closed_analysis and not is_fix and not res.get("is_live_data", False) and res.get("phase") in ("open", "forming"):
+            out.append("Evaluated using %s data (%s provider, status: %s -- NOT current live data)." % (
+                tier, prov_name, str(res.get("data_status", "delayed")).upper()))
         f = res.get("forming")
         if res.get("lag_note") and res["status"] == "waiting":
             out.append(res["lag_note"] + ".")
@@ -1103,14 +1356,16 @@ def _opts(a, cfg):
             "option_strategy": option_strategy, "strike_selection": strike_selection}
 
 
-def _load(a, sym, now, market="US"):
+def _load(a, sym, now, market="US", cfg=None):
     """(chart, now). An offline file without --now is read as of its own time."""
+    if cfg is None and hasattr(a, "config"):
+        cfg = read_config(a.config, market=market)
     real_today = to_local(utc_now(), market=market).date()
     if a.offline and now is None:
-        ch = get_chart(sym, a.interval, offline=a.offline, market=market)
+        ch = get_chart(sym, a.interval, offline=a.offline, market=market, cfg=cfg)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market), now
+    return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market, cfg=cfg, now=now), now
 
 
 def cmd_check(a):
@@ -1119,7 +1374,7 @@ def cmd_check(a):
     cfg = read_config(a.config, market=market)
     opts = _opts(a, cfg)
     opts["market"] = market
-    chart, now = _load(a, sym, parse_now(a.now, market=market) if a.now else None, market=market)
+    chart, now = _load(a, sym, parse_now(a.now, market=market) if a.now else None, market=market, cfg=cfg)
     res = evaluate(chart, now, **opts)
     if a.write:
         write_json(a.write, entry_doc(res, now))
@@ -1144,7 +1399,7 @@ def cmd_watch(a):
     start = parse_now(a.now, market=market) if a.now else None
     if a.offline or start is not None:
         if start is None:
-            start = _load(a, sym, None, market=market)[1]
+            start = _load(a, sym, None, market=market, cfg=cfg)[1]
         clock = SimClock(start)
         now_fn, sleep_fn = clock.now, clock.sleep
     else:
@@ -1152,7 +1407,7 @@ def cmd_watch(a):
     real_today = to_local(utc_now(), market=market).date()
 
     def provider(now):
-        return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market)
+        return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market, cfg=cfg, now=now)
 
     until = None
     if a.until:
@@ -1204,7 +1459,7 @@ def cmd_watchlist(a):
                 raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
             if i and not a.offline:
                 _sleep(PAUSE)
-            chart, when = _load(a, sym, now, market=item_market)
+            chart, when = _load(a, sym, now, market=item_market, cfg=cfg)
             rows.append((sym, evaluate(chart, when, **o), None))
         except EntryError as e:
             rows.append((sym, None, str(e)))
@@ -1226,7 +1481,12 @@ def cmd_watchlist(a):
                 (curr + "%.2f" % last["close"]) if last else "-",
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
+        live_n = sum(1 for _, r, _ in rows if r and r.get("is_live_signal"))
+        non_live_n = n - live_n
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
+        if non_live_n > 0:
+            tiers = sorted(set(str(r.get("data_tier", "DELAYED")) for _, r, _ in rows if r and r["status"] == "triggered" and not r.get("is_live_signal")))
+            print("Note: %d triggered candidate(s) used non-live data (%s) -- NOT live market signals." % (non_live_n, "/".join(tiers)))
         print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
 

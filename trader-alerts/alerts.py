@@ -76,8 +76,9 @@ except ImportError:
     instruments = None
     data_in = None
 
+# Cross-skill scanner helper lives in ../trader-scanner (added to sys.path above)
 try:
-    import scan
+    import scan  # type: ignore
 except ImportError:
     scan = None
 
@@ -364,9 +365,15 @@ def write_prices(path, quotes, now_utc, source):
     detail = dict(old.get("detail", {}))
     stamp = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     for s, q in quotes.items():
+        if "price" not in q:
+            continue
         prices[s] = q["price"]
-        detail[s] = {"prev_close": q.get("prev_close"), "time": q.get("time"), "source": q.get("source"),
-                     "fetched": stamp}
+        d_entry = {"prev_close": q.get("prev_close"), "time": q.get("time"),
+                   "source": q.get("source") or q.get("provider"), "fetched": stamp}
+        for k in ("provider", "data_status", "is_live", "is_simulated"):
+            if k in q:
+                d_entry[k] = q[k]
+        detail[s] = d_entry
     doc = {"as_of": stamp, "source": source,
            "note": ("Delayed quotes for alerts and sizing checks. Your broker's price is the one that fills. "
                     "detail.fetched is when each price was read."),
@@ -788,9 +795,43 @@ def cmd_readiness(a):
 
     # Check 3: Data Provider & Tiers
     data_state = "OK"
-    provider_name = cfg.get("provider", "yahoo")
-    data_detail = "Quotes: %s (DELAYED 15m) | Options: SIMULATED (Black-Scholes)" % provider_name
-    data_note = "Free delayed Yahoo quotes for watchlists; analytical Black-Scholes engine for option chains. Paper trading only."
+    provider_caps = None
+    try:
+        import data_in as _data_in
+    except ImportError:
+        _data_in = None
+
+    if market == "IN" and _data_in is not None:
+        try:
+            active_prov = _data_in.get_provider(config=cfg)
+            provider_name = active_prov.provider_name
+            provider_caps = active_prov.capabilities()
+            if provider_caps.get("live_quotes"):
+                quote_desc = "%s (LIVE/CURRENT)" % provider_name
+                data_state = "OK"
+            else:
+                quote_desc = "%s (DELAYED 15m)" % provider_name
+            opt_desc = provider_name if provider_caps.get("option_chains") else "SIMULATED (Black-Scholes)"
+            unsupported = ", ".join(provider_caps.get("not_supported") or [])
+            data_detail = "Quotes: %s | Options: %s" % (quote_desc, opt_desc)
+            if unsupported:
+                data_detail += " | Not supported: %s" % unsupported
+            data_note = (
+                "Provider resolved via INDIA_MARKET_DATA_PROVIDER/config ('%s'). "
+                "Delayed/unofficial feeds must never be treated as real-time; paper trading only."
+                % provider_name
+            )
+        except Exception as e:
+            provider_name = str(cfg.get("india_market_data_provider") or cfg.get("data_provider") or cfg.get("provider") or "unknown")
+            data_state = "ERROR"
+            data_detail = "Provider '%s' configuration error" % provider_name
+            data_note = str(e)
+            has_block = True
+    else:
+        provider_name = cfg.get("provider", "yahoo")
+        data_detail = "Quotes: %s (DELAYED 15m) | Options: SIMULATED (Black-Scholes)" % provider_name
+        data_note = "Free delayed Yahoo quotes for watchlists; analytical Black-Scholes engine for option chains. Paper trading only."
+
     items.append({
         "check": "Data Provider & Tiers",
         "status": data_state,
@@ -923,10 +964,12 @@ def cmd_readiness(a):
         verdict_msg = "All pre-market health and risk checks passed. System is fully ready for the session."
 
     market_session = "OPEN" if is_open else "CLOSED"
-    if inst_state in ("MISSING", "ERROR"):
+    if inst_state in ("MISSING", "ERROR") or data_state == "ERROR":
         data_availability = "UNAVAILABLE"
     elif inst_state == "STALE":
         data_availability = "STALE"
+    elif provider_caps and provider_caps.get("live_quotes"):
+        data_availability = "CURRENT"
     else:
         tier_cfg = str(cfg.get("data_tier") or cfg.get("provider") or "").lower()
         data_availability = "FRESH" if "realtime" in tier_cfg else "DELAYED"
@@ -938,6 +981,7 @@ def cmd_readiness(a):
         "verdict": verdict,
         "message": verdict_msg,
         "market": market,
+        "provider": provider_name,
         "market_session": market_session,
         "data_availability": data_availability,
         "analysis_engine": analysis_engine,
@@ -946,6 +990,8 @@ def cmd_readiness(a):
         "timestamp": ts_display,
         "checks": items,
     }
+    if provider_caps:
+        doc["capabilities"] = provider_caps
 
     if a.json:
         print(json.dumps(doc, indent=2))
@@ -1050,16 +1096,33 @@ def cmd_quote_in(a):
     quotes = {}
     errors = []
 
+    cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
+    cfg = _read(cfg_path, {}) or {}
+    exch = cfg.get("exchange") or "NSE"
+    eff_source = a.source or "yahoo"
+
     if data_in:
-        provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+        try:
+            provider = (
+                data_in.OfflineMarketDataProvider(a.offline)
+                if a.offline else data_in.get_provider(source=a.source, config=cfg)
+            )
+        except Exception as e:
+            raise AlertError(str(e))
+        eff_source = provider.provider_name
         for s in raw_syms:
             try:
                 c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
-                q = provider.get_quote(c_sym, exchange="NSE")
-                quotes[c_sym] = q
+                q = provider.get_quote(c_sym, exchange=exch)
+                if "price" not in q and q.get("error"):
+                    errors.append(str(q["error"]))
+                else:
+                    quotes[c_sym] = q
             except Exception as e:
                 errors.append(str(e))
     else:
+        src = a.source or "yahoo"
+        eff_source = src
         canonical_syms = []
         for s in raw_syms:
             if symbols_in:
@@ -1070,30 +1133,30 @@ def cmd_quote_in(a):
         yahoo_map = {}
         query_syms = []
         for c_sym in canonical_syms:
-            if symbols_in and a.source == "yahoo":
-                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange="NSE")
+            if symbols_in and src == "yahoo":
+                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange=exch)
             else:
                 y_sym = c_sym
             yahoo_map[y_sym] = c_sym
             query_syms.append(y_sym)
 
-        quotes_raw, errs = get_quotes(query_syms, a.source, a.offline)
+        quotes_raw, errs = get_quotes(query_syms, src, a.offline)
         errors.extend(errs)
 
         for y_sym, q in quotes_raw.items():
             c_sym = yahoo_map.get(y_sym, y_sym)
             q_copy = dict(q)
             q_copy["symbol"] = c_sym
-            q_copy["market"] = "NSE"
+            q_copy["market"] = exch
             q_copy["tier"] = "DELAYED"
             q_copy["currency"] = "INR"
             quotes[c_sym] = q_copy
 
     if a.write and quotes:
-        write_prices(a.write, quotes, now, a.source)
+        write_prices(a.write, quotes, now, eff_source)
 
     if a.json:
-        print(json.dumps({"quotes": quotes, "errors": errors}, indent=2))
+        print(json.dumps({"provider": eff_source, "quotes": quotes, "errors": errors}, indent=2))
     else:
         for s in sorted(quotes.keys()):
             q = quotes.get(s)
@@ -1104,10 +1167,12 @@ def cmd_quote_in(a):
                     if pct is None:
                         pct = 100.0 * (q["price"] / q["prev_close"] - 1)
                     chg = " (%+.2f%% vs prev close \u20b9%.2f)" % (pct, q["prev_close"])
-                tier_label = q.get("tier", "DELAYED")
-                src_label = q.get("source", a.source)
+                tier_label = q.get("tier") or "DELAYED"
+                status_label = q.get("data_status")
+                badge = tier_label if (not status_label or status_label == tier_label) else "%s:%s" % (tier_label, status_label)
+                src_label = q.get("provider") or q.get("source") or eff_source
                 print("%-10s \u20b9%.2f%s  %s  [%s:%s]" % (
-                    s, q["price"], chg, q.get("time", ""), src_label, tier_label))
+                    s, q["price"], chg, q.get("time", ""), src_label, badge))
         for e in errors:
             print("error: " + e)
         if a.write and quotes:
@@ -1124,18 +1189,27 @@ def cmd_history_in(a):
     except ImportError:
         raise AlertError("data_in module unavailable")
 
+    cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
+    cfg = _read(cfg_path, {}) or {}
+    exch = cfg.get("exchange") or "NSE"
     c_sym = symbols_in.normalize_symbol(a.symbol) if symbols_in else a.symbol.upper()
-    provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+    try:
+        provider = (
+            data_in.OfflineMarketDataProvider(a.offline)
+            if a.offline else data_in.get_provider(source=a.source, config=cfg)
+        )
+    except Exception as e:
+        raise AlertError(str(e))
 
     interval = getattr(a, "interval", "5m")
     range_str = getattr(a, "range_str", "5d")
 
     try:
         if interval == "1d":
-            data = provider.get_daily_bars(c_sym, range_str=range_str, exchange="NSE", now=a.now)
+            data = provider.get_historical_data(c_sym, range_str=range_str, interval="1d", exchange=exch, now=a.now)
         else:
-            data = provider.get_intraday_bars(c_sym, interval=interval, range_str=range_str,
-                                              exchange="NSE", now=a.now)
+            data = provider.get_intraday_data(c_sym, interval=interval, range_str=range_str,
+                                              exchange=exch, now=a.now)
     except Exception as e:
         raise AlertError("Failed to fetch historical bars for %s: %s" % (c_sym, e))
 
@@ -1196,13 +1270,16 @@ def cmd_clock(a):
 def cmd_quote(a):
     if get_market_profile(a) == "IN":
         return cmd_quote_in(a)
+    src = a.source or "yahoo"
+    if src not in ("yahoo", "stooq"):
+        raise AlertError("US quotes support --source yahoo or stooq, got %r" % src)
     syms = _dedupe([s.upper() for s in a.symbols] + (holdings(a) if a.holdings else []))
     if not syms:
         raise AlertError("which tickers? alerts.py quote TSLA KO, or --holdings")
     now = parse_now(a.now)
-    quotes, errors = get_quotes(syms, a.source, a.offline)
+    quotes, errors = get_quotes(syms, src, a.offline)
     if a.write and quotes:
-        write_prices(a.write, quotes, now, a.source)
+        write_prices(a.write, quotes, now, src)
     if a.json:
         print(json.dumps({"quotes": quotes, "errors": errors}, indent=2))
     else:
@@ -1250,28 +1327,44 @@ def cmd_check_in(a, rules):
     raw_syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
     quotes = {}
     errors = []
+    cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
+    cfg = _read(cfg_path, {}) or {}
+    exch = cfg.get("exchange") or "NSE"
+    eff_source = a.source or "yahoo"
 
     if raw_syms:
         if data_in:
-            provider = data_in.OfflineMarketDataProvider(a.offline) if a.offline else data_in.get_provider(source=a.source)
+            try:
+                provider = (
+                    data_in.OfflineMarketDataProvider(a.offline)
+                    if a.offline else data_in.get_provider(source=a.source, config=cfg)
+                )
+            except Exception as e:
+                raise AlertError(str(e))
+            eff_source = provider.provider_name
             for s in raw_syms:
                 try:
                     c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
-                    q = provider.get_quote(c_sym, exchange="NSE")
-                    quotes[c_sym] = q
-                    if s != c_sym:
-                        quotes[s] = q
+                    q = provider.get_quote(c_sym, exchange=exch)
+                    if "price" not in q and q.get("error"):
+                        errors.append(str(q["error"]))
+                    else:
+                        quotes[c_sym] = q
+                        if s != c_sym:
+                            quotes[s] = q
                 except Exception as e:
                     errors.append(str(e))
         else:
+            src = a.source or "yahoo"
+            eff_source = src
             canonical_syms = [symbols_in.normalize_symbol(s) if symbols_in else s for s in raw_syms]
             yahoo_map = {}
             query_syms = []
             for c_sym in canonical_syms:
-                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange="NSE") if symbols_in else c_sym
+                y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange=exch) if symbols_in else c_sym
                 yahoo_map[y_sym] = c_sym
                 query_syms.append(y_sym)
-            raw_q, errs = get_quotes(query_syms, a.source, a.offline)
+            raw_q, errs = get_quotes(query_syms, src, a.offline)
             errors.extend(errs)
             for y_s, q in raw_q.items():
                 c_s = yahoo_map.get(y_s, y_s)
@@ -1286,10 +1379,10 @@ def cmd_check_in(a, rules):
     if not a.no_write:
         _write(a.state, state)
         if quotes:
-            write_prices(a.prices_out, quotes, now, a.source)
+            write_prices(a.prices_out, quotes, now, eff_source)
 
     if a.json:
-        print(json.dumps({"market": status, "rings": rings, "errors": errors,
+        print(json.dumps({"provider": eff_source, "market": status, "rings": rings, "errors": errors,
                           "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2))
     else:
         print("NSE %s (%s IST, %s)." % ("OPEN" if status["open"] else "closed", now.strftime("%H:%M"), status["phase"]))
@@ -1319,13 +1412,16 @@ def cmd_check(a):
     status = market_status(now)
     watched = [r for r in rules if active(r, status["date"])]
     syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
-    quotes, errors = (get_quotes(syms, a.source, a.offline) if syms else ({}, []))
+    src = a.source or "yahoo"
+    if src not in ("yahoo", "stooq"):
+        raise AlertError("US quotes support --source yahoo or stooq, got %r" % src)
+    quotes, errors = (get_quotes(syms, src, a.offline) if syms else ({}, []))
     state = _read(a.state, {})
     rings, state = evaluate(rules, quotes, status, state, now)
     if not a.no_write:
         _write(a.state, state)
         if quotes:
-            write_prices(a.prices_out, quotes, now, a.source)
+            write_prices(a.prices_out, quotes, now, src)
     if a.json:
         print(json.dumps({"market": status, "rings": rings, "errors": errors,
                           "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2))
@@ -1448,7 +1544,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
-        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq"])
+        p.add_argument("--source", default=None, help="quote provider override (US: yahoo/stooq; IN: INDIA_MARKET_DATA_PROVIDER/config or yahoo)")
+        p.add_argument("--config", default="trader/config.json", help="optional trader config JSON")
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
         p.add_argument("--now", help="pretend it is this time (no offset = New York time for US, IST for IN)")
         p.add_argument("--json", action="store_true")

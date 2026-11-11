@@ -211,9 +211,10 @@ def is_weekend(dt_or_date_str):
 def get_last_trading_day(as_of_date=None, exchange="NSE"):
     """Return the date of the most recent completed or active trading session.
 
-    If as_of_date is during or after pre-market on a trading day (>= 09:00 IST),
-    returns that day. If before 09:00 IST, on a weekend, or on an exchange holiday,
-    walks backward to the preceding trading day.
+    If as_of_date is during or after pre-market on a trading day (>= 09:00 IST,
+    or pre_open_start for an official special session), returns that day.
+    If before pre-open, on a weekend, or on an exchange holiday, walks
+    backward to the preceding trading day.
     """
     if as_of_date is None:
         dt = now_ist()
@@ -224,7 +225,17 @@ def get_last_trading_day(as_of_date=None, exchange="NSE"):
     is_td, _, _ = is_trading_day_in(cur_d, exchange=exchange)
     # If dt has time information (datetime), check if pre-open has begun
     has_time = isinstance(dt, datetime.datetime) and (dt.hour != 0 or dt.minute != 0 or dt.second != 0)
-    if is_td and (not has_time or (dt.hour * 60 + dt.minute >= 9 * 60)):
+    session_start_mins = 9 * 60
+    if is_td:
+        special = get_special_session(cur_d.strftime("%Y-%m-%d"), exchange=exchange)
+        if special:
+            start_str = special.get("pre_open_start") or special.get("open_time") or "09:00"
+            try:
+                hh, mm = [int(x) for x in start_str.split(":")[:2]]
+                session_start_mins = hh * 60 + mm
+            except (ValueError, TypeError):
+                pass
+    if is_td and (not has_time or (dt.hour * 60 + dt.minute >= session_start_mins)):
         return cur_d
 
     cur_d -= datetime.timedelta(days=1)

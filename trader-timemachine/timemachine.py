@@ -83,12 +83,15 @@ _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import symbols_in
-    import calendar_in
+    import symbols_in  # type: ignore
+    import calendar_in  # type: ignore
+    import data_in  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
+    data_in = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 PAUSE = 0.5          # seconds between requests: be polite to free endpoints
@@ -754,8 +757,51 @@ def verdict_notes(mc):
     return notes
 
 
+def _bars_from_provider_payload(payload, sym, now_utc, market="IN"):
+    """Convert standardized data_in intraday payload into (meta, bars, dropped) for time_machine."""
+    meta = dict(payload.get("meta") or {})
+    if payload.get("symbol") and "symbol" not in meta:
+        meta["symbol"] = payload["symbol"]
+    if payload.get("timestamp") and "regularMarketTime" not in meta:
+        meta["regularMarketTime"] = payload["timestamp"]
+    open_min = OPEN_MIN_IN if market == "IN" else OPEN_MIN
+    sess_bars = SESSION_BARS_IN if market == "IN" else SESSION_BARS
+    as_of = now_utc
+    rmt = meta.get("regularMarketTime")
+    if isinstance(rmt, (int, float)) and utc_of(rmt) < as_of:
+        as_of = utc_of(rmt)
+    dropped = dict(payload.get("dropped") or {"no_price": 0, "off_grid": 0, "not_complete": 0, "outside_hours": 0})
+    bars = {}
+    for b in payload.get("bars") or []:
+        ts = b.get("ts") if b.get("ts") is not None else b.get("t")
+        o, h, l, c = b.get("o"), b.get("h"), b.get("l"), b.get("c")
+        if ts is None or None in (o, h, l, c):
+            continue
+        ts = int(ts)
+        if ts % INTERVAL:
+            continue
+        start = utc_of(ts)
+        local = to_local(start, market=market)
+        mins = local.hour * 60 + local.minute - open_min
+        if mins < 0 or mins >= sess_bars * 5:
+            continue
+        if start + datetime.timedelta(seconds=INTERVAL) > as_of:
+            continue
+        bars[ts] = {
+            "date": b.get("date") or local.date().isoformat(),
+            "slot": mins // 5,
+            "start": b.get("start") or local.strftime("%H:%M"),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": float(c),
+            "v": int(b.get("v") or 0),
+        }
+    return meta, [bars[t] for t in sorted(bars)], dropped
+
+
 def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
-    """Chart JSON text + a normalized plan -> the timemachine.json document."""
+    """Chart JSON text (or normalized data_in payload) + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
     if not 0 <= window <= 10:
@@ -766,8 +812,14 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     close_min = CLOSE_MIN_IN if market == "IN" else CLOSE_MIN
     sess_bars = SESSION_BARS_IN if market == "IN" else SESSION_BARS
     tz_label = "IST" if market == "IN" else "ET"
-    result = chart_result(text, sym)
-    meta, bars, dropped = parse_bars(result, now_utc, market=market)
+    if isinstance(text, dict) and "bars" in text:
+        meta, bars, dropped = _bars_from_provider_payload(text, sym, now_utc, market=market)
+        source = text.get("provider") or source
+        provider_status = text.get("data_status")
+    else:
+        result = chart_result(text, sym)
+        meta, bars, dropped = parse_bars(result, now_utc, market=market)
+        provider_status = None
     msym = str(meta.get("symbol") or "").upper()
     msym_clean = msym.split(".")[0] if market == "IN" else msym
     if msym and msym != sym.replace(".", "-") and msym != sym and msym_clean != sym:
@@ -819,10 +871,11 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
                            "this plan's setup is %r" % plan["setup"]}
     last_bar = bars[-1]
-    return {
+    out = {
         "created_by": "trader-timemachine",
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
+        "provider": source,
         "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
                  "last_bar": "%s %s %s" % (last_bar["date"], last_bar["start"], tz_label),
                  "dropped": dropped, "short_sessions_left_out": short},
@@ -835,6 +888,9 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
     }
+    if provider_status:
+        out["data_status"] = provider_status
+    return out
 
 
 # ---------------------------------------------------------------- output
@@ -951,6 +1007,28 @@ def _write(path, doc):
         fh.write("\n")
 
 
+_ORIG_FETCH_CHART = fetch_chart
+
+
+def _to_ist_aware(now_utc):
+    if now_utc is None or data_in is None:
+        return None
+    if getattr(now_utc, "tzinfo", None) is None:
+        return now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(data_in.calendar_in.IST)
+    return now_utc.astimezone(data_in.calendar_in.IST)
+
+
+def _read_cfg_dict(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 def compute(a):
     market = getattr(a, "market", None)
     if not market and getattr(a, "symbol", None):
@@ -960,8 +1038,30 @@ def compute(a):
     market = market or "US"
     now = parse_now(a.now, market=market)
     plan = load_plan(a, now)
+    plan_market = plan.get("market") or market
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
+    elif plan_market == "IN" and data_in is not None:
+        cfg = _read_cfg_dict(getattr(a, "config", "trader/config.json"))
+        try:
+            prov = data_in.get_provider(config=cfg)
+        except Exception as e:
+            raise TMError("Market data provider error: %s" % e)
+        if prov.provider_name == "yahoo" and fetch_chart is not _ORIG_FETCH_CHART:
+            text, source = fetch_chart(plan["symbol"]), "yahoo"
+        else:
+            exch = cfg.get("exchange") or "NSE"
+            try:
+                text = prov.get_intraday_data(
+                    plan["symbol"],
+                    interval="5m",
+                    range_str="60d",
+                    exchange=exch,
+                    now=_to_ist_aware(now),
+                )
+            except Exception as e:
+                raise TMError(str(e))
+            source = prov.provider_name
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
@@ -1020,6 +1120,7 @@ def main(argv=None):
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
+        p.add_argument("--config", default="trader/config.json", help="optional trader config JSON")
         p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 

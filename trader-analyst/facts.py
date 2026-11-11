@@ -49,15 +49,15 @@ import time
 import urllib.error
 import urllib.request
 
-# Sibling path resolution for Indian market symbols
+# Sibling path resolution for Indian market symbols (../trader-alerts)
 try:
-    import symbols_in
+    import symbols_in  # type: ignore
 except ImportError:
     try:
         _alerts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trader-alerts")
         if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
             sys.path.insert(0, _alerts_dir)
-        import symbols_in
+        import symbols_in  # type: ignore
     except ImportError:
         symbols_in = None
 

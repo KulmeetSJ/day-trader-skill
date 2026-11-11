@@ -63,10 +63,11 @@ _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import symbols_in
-    import calendar_in
-    import instruments
+    import symbols_in  # type: ignore
+    import calendar_in  # type: ignore
+    import instruments  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
@@ -236,6 +237,7 @@ def calculate_indian_transaction_charges(
         return {
             "brokerage": 0.0, "stt": 0.0, "exchange_charges": 0.0,
             "sebi_charges": 0.0, "stamp_duty": 0.0, "gst": 0.0, "total": 0.0,
+            "buy_value": 0.0, "sell_value": 0.0, "turnover": 0.0, "is_estimate": True,
             "effective_date": eff_date,
             "statutory": empty_statutory,
             "brokerage_estimate": empty_brokerage,
@@ -348,6 +350,10 @@ def calculate_indian_transaction_charges(
         "stamp_duty": stamp,
         "gst": gst,
         "total": total_charges,
+        "buy_value": round(entry_val, 2),
+        "sell_value": round(exit_val, 2),
+        "turnover": round(turnover, 2),
+        "is_estimate": True,
         "effective_date": eff_date,
         "statutory": statutory,
         "brokerage_estimate": brokerage_estimate,
@@ -445,7 +451,7 @@ def parse_now(text, market="US"):
         raise SizeError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % lbl)
     if dt.tzinfo is None:
         return local_to_utc(dt, market=market)
-    return (dt - dt.utcoffset()).replace(tzinfo=None)
+    return (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
 
 
 def parse_utc(text):
@@ -457,7 +463,7 @@ def parse_utc(text):
     except ValueError:
         return None
     if dt.tzinfo is not None:
-        dt = (dt - dt.utcoffset()).replace(tzinfo=None)
+        dt = (dt - (dt.utcoffset() or datetime.timedelta(0))).replace(tzinfo=None)
     return dt
 
 
@@ -617,7 +623,7 @@ def money(x, market="US"):
 
 # ---------------------------------------------------------------- plan mode (the default)
 
-def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None):
+def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None, instruments_path=None):
     """Pure function: one plan + your rules -> the sizing (a dict). qty may be 0.
 
     limit  the limit price for a limit order (None = market)
@@ -648,7 +654,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             asset_type = "OPTIONS"
         elif symbols_in and symbols_in.is_derivative_symbol(sym):
             deriv_meta = symbols_in.parse_derivative_symbol(sym)
-            asset_type = "OPTIONS" if deriv_meta.get("instrument_type") == "OPT" else "FUTURES"
+            if deriv_meta:
+                asset_type = "OPTIONS" if deriv_meta.get("instrument_type") == "OPT" else "FUTURES"
         else:
             asset_type = "EQUITY"
 
@@ -736,7 +743,9 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     series = plan.get("series", "")
     if not is_t2t and market == "IN" and instruments:
         try:
-            inst = instruments.get_instrument(sym)
+            inst_path = instruments_path or getattr(instruments, "DEFAULT_CACHE_PATH", None)
+            cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=today) if inst_path else None
+            inst = instruments.resolve_instrument(sym, cache_payload=cache, require_intraday=False)
             if inst:
                 if inst.get("is_trade_to_trade"):
                     is_t2t = True
@@ -784,8 +793,9 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     loss = round(qty * risk_c / 100.0, 2)
 
     if not is_t2t:
+        min_rr = _f(c.get("min_reward_risk"))
         if qty == 0:
-            if bound[0] == "max loss":
+            if bound[0] == "max loss" and max_loss is not None:
                 if lot_size > 1:
                     one_lot_risk = risk * lot_size
                     refusal = ("the risk of one lot of %s (%d shares) is %s, more than your %s max loss per trade. "
@@ -799,7 +809,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
                 unit_lbl = ("one lot of %s (%d shares)" % (sym, lot_size)) if lot_size > 1 else ("one share of %s" % sym)
                 refusal = ("%s costs %s, more than your %s limit (%s). No order."
                            % (unit_lbl, money(ref, market=market), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
-        elif _f(c.get("min_reward_risk")) and reward_c < _f(c["min_reward_risk"]) * risk_c - EPS:
+        elif min_rr and reward_c < min_rr * risk_c - EPS:
             refusal = ("reward:risk %.2f (target %s, entry %s, stop %s) is under your minimum %s, so trader-risk "
                        "would block it. No order. Skip it, or make a new plan with trader-exit."
                        % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
@@ -840,7 +850,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             trading_style=trading_style,
             as_of_date=today,
         )
-    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "data_status", "is_simulated"):
+    for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
+              "data_tier", "last_trading_session", "data_status", "is_simulated", "provider"):
         if k in plan:
             res[k] = plan[k]
     return res
@@ -892,7 +903,8 @@ def bracket_order(s):
         o["market"] = "IN"
         o["currency"] = "INR"
         o["plan"]["market"] = "IN"
-    for k in ("is_historical_analysis", "is_live_signal", "last_trading_session", "data_status", "is_simulated"):
+    for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
+              "data_tier", "last_trading_session", "data_status", "is_simulated", "provider"):
         if k in s:
             o[k] = s[k]
             o["plan"][k] = s[k]
@@ -940,9 +952,10 @@ def plan_report(s, order, notes=()):
         lines.append("DATA NOTICE: Simulated option pricing (Black-Scholes model). NOT live market quotes.")
     if s.get("transaction_costs"):
         tc = s["transaction_costs"]
-        lines.append("Est transaction charges: %s (STT %s, Exch %s, GST %s, Brokerage %s)"
+        lines.append("Est transaction charges: %s (STT %s, Exch %s, Stamp %s, SEBI %s, GST %s, Brokerage est %s; excl. DP/actual broker tariff)"
                      % (money(tc["total"], market=market), money(tc["stt"], market=market),
-                        money(tc["exchange_charges"], market=market), money(tc["gst"], market=market),
+                        money(tc["exchange_charges"], market=market), money(tc["stamp_duty"], market=market),
+                        money(tc["sebi_charges"], market=market), money(tc["gst"], market=market),
                         money(tc["brokerage"], market=market)))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
@@ -1144,7 +1157,7 @@ def size(rows, cfg, budget=None, prices=None, whole=None, cents=False, top=None)
              "capped": t in capped}
         if prices.get(t):
             p["price"] = prices[t]
-            p["shares"] = shares[t] if whole else round(dollars[t] / prices[t], 4)
+            p["shares"] = shares[t] if (whole and shares is not None) else round(dollars[t] / prices[t], 4)
         positions.append(p)
     invested = round(sum(p["dollars"] for p in positions), 2)
     return {
@@ -1282,7 +1295,7 @@ def run_plan(a, cfg):
     if a.portfolio and os.path.exists(a.portfolio):
         pf = read_json(a.portfolio, "portfolio")
         cash = _f(pf.get("cash")) if isinstance(pf, dict) else None
-    s = size_trade(plan, cfg, a.budget, limit, price, cash, today, market=market)
+    s = size_trade(plan, cfg, a.budget, limit, price, cash, today, market=market, instruments_path=getattr(a, "instruments", None))
     order = bracket_order(s)
     if order and a.write:
         src = "trader/plan.json (%s %s %s)" % (s["symbol"], s["setup"] or "plan", s["date"] or today)

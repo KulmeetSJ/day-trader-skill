@@ -72,10 +72,11 @@ _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
 
+# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
-    import symbols_in
-    import calendar_in
-    import instruments
+    import symbols_in  # type: ignore
+    import calendar_in  # type: ignore
+    import instruments  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None

@@ -333,6 +333,116 @@ class IndianNews(unittest.TestCase):
         self.assertIn("ET", out)
         self.assertIn("IST", out)
 
+    def test_incidental_mentions_and_low_relevance(self):
+        # Incidental mentions, marathon sponsorships, and peripheral coverage should be classified as low_relevance
+        item1 = {"title": "Environmentalists criticise choice of Earthshot prize venue owned by fossil fuel firm - The Guardian", "summary": "", "kind": "headline"}
+        cat1, sub1, score1 = news.classify_news_item(item1, "RELIANCE")
+        self.assertEqual(cat1, "low_relevance")
+
+        item2 = {"title": "TCS drove a 38.6% media surge via AI activations at the marathon - The Drum", "summary": "", "kind": "headline"}
+        cat2, sub2, score2 = news.classify_news_item(item2, "TCS")
+        self.assertEqual(cat2, "low_relevance")
+
+        item3 = {"title": "TCS-Partnered Marathons Generate US$3.2 Billion for Host Cities and Raise US$315 Million for Charity", "summary": "", "kind": "headline"}
+        cat3, sub3, score3 = news.classify_news_item(item3, "TCS")
+        self.assertEqual(cat3, "low_relevance")
+
+        item4 = {"title": "Buy, Sell Or Hold: Divi's Labs, Tata Power, Kalyan Jewellers, Reliance Industries, L&T And Shriram Finance - Ask Profit", "summary": "", "kind": "headline"}
+        cat4, sub4, score4 = news.classify_news_item(item4, "RELIANCE")
+        self.assertEqual(cat4, "low_relevance")
+
+    def test_subsidiary_and_group_company_detection(self):
+        # Reliance Consumer Products FMCG subsidiary
+        item1 = {"title": "Why Britannia isn't losing sleep over Reliance's entry into biscuits - Fortune India", "summary": "", "kind": "headline"}
+        cat1, sub1, _ = news.classify_news_item(item1, "RELIANCE")
+        self.assertEqual(sub1, "Reliance Consumer Products")
+        self.assertEqual(cat1, "business")
+
+        # Reliance New Energy / Clean Energy subsidiary
+        item2 = {"title": "ALMM-II: Reliance Revises HJT Solar Cell Production, Gets Enlistment For 3.4 GW Capacity - Saur Energy", "summary": "", "kind": "headline"}
+        cat2, sub2, _ = news.classify_news_item(item2, "RELIANCE")
+        self.assertEqual(sub2, "Reliance New Energy")
+        self.assertEqual(cat2, "corporate")
+
+        # Reliance Jio / Jio Platforms subsidiary
+        item3 = {"title": "AMFI Rejig: Reliance's Jio Platforms, NSE, Lenskart, LG among 7 stocks set for large cap upgrade - Livemint", "summary": "", "kind": "headline"}
+        cat3, sub3, _ = news.classify_news_item(item3, "RELIANCE")
+        self.assertEqual(sub3, "Jio Platforms / Reliance Jio")
+
+        # Reliance ADAG (separate listed group entity) flagged as low_relevance for RIL
+        item4 = {"title": "5 Reliance Group Stocks Trading at Discounts of Up to 50% From Their 52-Week Highs - Trade Brains", "summary": "", "kind": "headline"}
+        cat4, sub4, _ = news.classify_news_item(item4, "RELIANCE")
+        self.assertEqual(cat4, "low_relevance")
+        self.assertIn("ADAG", sub4)
+
+    def test_analyst_opinions_categorization(self):
+        # Brokerage ratings and price targets
+        item1 = {"title": "Jefferies sees largecaps benefiting from FPI revival; Reliance, HDFC Bank, Axis Bank among potential benef - The Economic Times", "summary": "", "kind": "headline"}
+        cat1, _, _ = news.classify_news_item(item1, "RELIANCE")
+        self.assertEqual(cat1, "analyst")
+
+        item2 = {"title": "Tata Consultancy Services Limited: 29 of 48 analysts buy - Multibagg AI", "summary": "", "kind": "headline"}
+        cat2, _, _ = news.classify_news_item(item2, "TCS")
+        self.assertEqual(cat2, "analyst")
+
+        item3 = {"title": "Analysts Have Made A Financial Statement On Tata Consultancy Services Limited's (NSE:TCS) Second-Quarter Report", "summary": "", "kind": "headline"}
+        cat3, _, _ = news.classify_news_item(item3, "TCS")
+        self.assertEqual(cat3, "analyst")
+
+    def test_corporate_announcements_categorization(self):
+        # Regulatory/tax tribunal orders, capital investments, contract wins, earnings calls
+        item1 = {"title": "GSTAT Rajkot Dismisses 8 Revenue Appeals, Upholds ITC Refund Relief To Reliance Industries - LiveLawBiz", "summary": "", "kind": "headline"}
+        cat1, _, _ = news.classify_news_item(item1, "RELIANCE")
+        self.assertEqual(cat1, "corporate")
+
+        item2 = {"title": "India's TCS unit to invest up to $7.4 billion in AI data center campus - Reuters", "summary": "", "kind": "headline"}
+        cat2, _, _ = news.classify_news_item(item2, "TCS")
+        self.assertEqual(cat2, "corporate")
+
+        item3 = {"title": "TCS schedules analyst meetings in Mumbai and Singapore for November 2026 - scanx.trade", "summary": "", "kind": "headline"}
+        cat3, _, _ = news.classify_news_item(item3, "TCS")
+        self.assertEqual(cat3, "corporate")
+
+        item4 = {"title": "What Infosys (INFY) Said on Its Q2 Earnings Call - TradingView", "summary": "", "kind": "headline"}
+        cat4, _, _ = news.classify_news_item(item4, "INFY")
+        self.assertEqual(cat4, "corporate")
+
+    def test_relevance_ranking_and_research_flag(self):
+        # Verify corporate > business > analyst > market ranking, and research flag inclusion
+        code, out_default, err = run(["--tickers", "RELIANCE", "--hours", "72", "--dry-run"] + self.base)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Environmentalists criticise", out_default)
+        self.assertIn("low-relevance excluded (pass --research to view)", out_default)
+
+        # When --research is provided, low relevance stories appear
+        code, out_research, err = run(["--tickers", "RELIANCE", "--hours", "72", "--dry-run", "--research"] + self.base)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Environmentalists criticise", out_research)
+        self.assertIn("[LOW_RELEVANCE]", out_research)
+
+    def test_coverage_transparency(self):
+        watch = {"RELIANCE": None, "TCS": None, "XYZ": None}
+        sample_items = [
+            {"ticker": "RELIANCE", "touches": ["RELIANCE"], "category": "corporate", "subsidiary": None},
+            {"ticker": "RELIANCE", "touches": ["RELIANCE"], "category": "business", "subsidiary": "Reliance Consumer Products"},
+            {"ticker": "TCS", "touches": ["TCS"], "category": "corporate", "subsidiary": None},
+        ]
+        cov = news.compute_coverage(watch, sample_items, ["price for XYZ: HTTP 404"])
+        self.assertEqual(cov["RELIANCE"]["relevant"], 2)
+        self.assertEqual(cov["RELIANCE"]["subsidiaries"], ["Reliance Consumer Products"])
+        self.assertEqual(cov["RELIANCE"]["status"], "OK")
+        self.assertEqual(cov["TCS"]["relevant"], 1)
+        self.assertEqual(cov["XYZ"]["status"], "UNAVAILABLE")
+
+    def test_publisher_attribution_and_url_preservation(self):
+        items = news.parse_rss(raw("google-RELIANCE.xml"), "RELIANCE", default_source="Google News")
+        item = next(i for i in items if "Livemint" in i["title"])
+        self.assertEqual(item["publisher"], "Livemint")
+        self.assertNotEqual(item["publisher"], "Google News")
+        self.assertEqual(item["publisher_url"], "https://www.livemint.com")
+        self.assertTrue(item["link"].startswith("https://news.google.com/rss/articles/"))
+        self.assertEqual(item["article_url"], item["link"])
+
 
 if __name__ == "__main__":
     unittest.main()

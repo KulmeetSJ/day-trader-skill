@@ -14,6 +14,7 @@
   "trading_style": "intraday",
   "strategy": "orb",
   "timeframe": "5m",
+  "india_market_data_provider": "yahoo",
   "data_provider": "yahoo",
   "budget": 100000,
   "cash_buffer_pct": 10,
