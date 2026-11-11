@@ -172,6 +172,7 @@ python3 trader-scanner/scan.py universe --market IN --index NIFTY50   # NIFTY 50
 python3 trader-scanner/scan.py orb --market IN --at 10:35             # Indian ORB scan
 python3 trader-news/news.py --tickers RELIANCE TCS INFY --hours 48    # Indian corporate news in IST
 python3 trader-entry/entry.py check RELIANCE --setup orb --market IN   # IST bar-by-bar entry timer
+python3 trader-entry/entry.py check RELIANCE --setup breakout_20d --market IN  # 20d breakout + intraday confirmation
 python3 trader-exit/exit.py plan --from trader/entry.json --market IN  # Tick size ₹0.05, flat_by 15:20 IST
 python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market IN  # 10k IST replays
 python3 trader-budget/size.py --plan trader/plan.json --config trader/config.json --market IN  # INR sizing
@@ -381,6 +382,11 @@ python3 trader-scanner/scan.py orb --market IN --at 10:15
 # Equity ORB check
 python3 trader-entry/entry.py check RELIANCE --setup orb --market IN
 
+# Daily 20-day closing-high breakout with completed-candle intraday confirmation
+python3 trader-entry/entry.py check RELIANCE --setup breakout_20d --market IN
+python3 trader-entry/entry.py check INFY --setup breakout_20d --offline tests/fixtures/data_dir --now "2026-10-19 10:35" --market IN
+python3 trader-entry/entry.py watchlist --setup breakout_20d --market IN --watchlist trader/watchlist.json
+
 # Options ORB check: Triggers breakout on NIFTY index and selects ATM Call option
 python3 trader-entry/entry.py check NIFTY --setup options_orb --strike-selection ATM --market IN
 
@@ -398,6 +404,7 @@ python3 trader-exit/exit.py plan --symbol RELIANCE --entry 2850.00 --stop or-mid
 python3 trader-exit/exit.py plan --symbol NIFTY26OCT24000CE --entry 125.00 --stop pct:20 --target 2R --market IN --write trader/plan.json
 
 # Positional trade plan: multi-day hold permitted (no 15:20 intraday cutoff)
+# Inherited breakout_20d invalidation stops report stop_label="breakout invalidation"
 python3 trader-exit/exit.py plan --symbol INFY --entry 1920.00 --stop pct:2 --target 2R --trading-style positional --market IN --write trader/plan.json
 python3 trader-exit/exit.py show --plan trader/plan.json
 ```
@@ -409,11 +416,17 @@ python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market I
 python3 trader-timemachine/timemachine.py chart --plan trader/plan.json --market IN
 ```
 
-10. Position sizing and capital allocation in INR with lot sizing, statutory charges, and Trade-to-Trade checks:
+10. Position sizing and capital allocation in INR with lot sizing, statutory charges, Trade-to-Trade checks, and style-aware order semantics:
+
+- **Intraday orders (`--trading-style intraday`, e.g. `orb`)**: emit `time_in_force: "day"`, `order_class: "bracket"`, `product: "MIS"`, intraday `flat_by: "15:20"`, and intraday transaction charges.
+- **Positional orders (`--trading-style positional`, e.g. `breakout_20d`)**: emit `time_in_force: "gtc"`, `order_class: "gtt_oco"`, `product: "CNC"` (`"NRML"` for F&O), `flat_by: "positional"`, delivery transaction charges (0.1% STT on both legs, 0.015% stamp, Rs 40 per buy/sell order / Rs 80 round-trip delivery brokerage), and explicit `multi_session_protection` (`persists_across_sessions: true`) so stop-loss and target triggers stay armed across sessions under Indian paper trading (`broker: "paper"`, `paper: true`). If the configured broker or schema cannot safely represent multi-session GTT OCO protection (for example `broker: "alpaca"`, `broker: "ibkr"`, live `paper: false`, or `broker_supports_multi_session: false`), `size.py`, `check.py`, and `ticket.py` fail clearly instead of issuing an expiring intraday order.
 
 ```bash
 # Equity position sizing (single shares, T2T protection, statutory STT/GST calculation)
 python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --market IN --write trader/orders.json
+
+# Explicit positional override (CNC + GTC + GTT OCO multi-session protection + delivery charges)
+python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --trading-style positional --market IN --write trader/orders.json
 
 # Option position sizing (sizes in whole lots e.g. 25 shares/contract, caps max loss to premium outlay)
 python3 trader-budget/size.py trade --plan trader/plan.json --config trader/config.json --market IN --write trader/orders.json
@@ -425,7 +438,16 @@ python3 trader-budget/size.py trade --plan trader/plan.json --config trader/conf
 python3 trader-risk/check.py trader/orders.json --config trader/config.json --market IN
 ```
 
-12. Use the Python market data API:
+12. Broker ticket provenance and historical/delayed signal warnings (`ticket.py show` & `show --json`):
+    - Signal provenance (`data_tier`, `is_historical_analysis`, `is_live_signal`, `provider`, `last_trading_session`, `signal_freshness`, `last_data_timestamp`, `simulated_at`) is propagated from `trader-entry` -> `trader-exit` -> `trader-budget` -> `trader-risk` -> `trader-broker`.
+    - `ticket.py show` clearly distinguishes **HISTORICAL**, **DELAYED**, **FIXTURE**, **SIMULATED**, **LIVE**, and **UNVERIFIED** (missing/partial metadata) signals, printing prominent warnings such as `WARNING: HISTORICAL SIGNAL -- NOT A CURRENT ENTRY RECOMMENDATION` for historical analysis while still allowing valid paper workflows and keeping fingerprint + three-gate approvals intact.
+    - Yahoo signals (even with missing/conflicting tier flags) and incomplete metadata are conservatively classified as non-live (`is_live_signal: false`).
+
+```bash
+python3 trader-broker/ticket.py show --orders trader/orders.json --risk trader/state/risk.json --config trader/config.json --market IN --json
+```
+
+13. Use the Python market data API:
 
 ```python
 from data_in import fetch_quote, fetch_intraday_bars, fetch_option_chain, calculate_bs_greeks
@@ -444,7 +466,7 @@ atm = chain.atm_strike
 print("ATM Strike:", atm, "Call Premium:", chain.calls[atm]["ltp"], "Delta:", chain.calls[atm]["delta"])
 ```
 
-13. Fundamental analysis for Indian-listed companies (NSE & BSE):
+14. Fundamental analysis for Indian-listed companies (NSE & BSE):
 
 ```bash
 # Analyze single Indian company (quarterly statements, margins, publication dates, TTM)
@@ -571,7 +593,7 @@ Every trade sized by `/trader-budget` calculates statutory regulatory charges al
 | **NSE Exchange Charges** | Statutory Verified (Eff. 2026-03-01) | Rs 307 / cr (0.00307%) per side | Rs 307 / cr (0.00307%) per side | Rs 183 / cr (0.00183%) per side | Rs 3,553 / cr (0.03553%) per side of premium | Rs 3,553 / cr per side of premium |
 | **SEBI Turnover Fees** | Statutory Verified | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) | Rs 10 per crore (0.0001%) |
 | **GST** | Statutory Verified | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) | 18% on (Statutory Exch + SEBI) |
-| **Brokerage (Estimate)** | Estimated Tariff | min(Rs 20, 0.03%) per order | Rs 0 (standard delivery model) | min(Rs 20, 0.03%) per order | Rs 20 flat per order (Rs 40 round-trip) | Rs 20 flat per order |
+| **Brokerage (Estimate)** | Estimated Tariff | min(Rs 20, 0.03%) per order | Rs 40 flat per buy/sell order (Rs 80 round-trip) | min(Rs 20, 0.03%) per order | Rs 20 flat per order (Rs 40 round-trip) | Rs 20 flat per order |
 
 > [!NOTE]
 > **Brokerage Separation & Trade Profitability Impact**:

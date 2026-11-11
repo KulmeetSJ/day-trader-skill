@@ -12,7 +12,7 @@ description: >-
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER] [--setup orb|level|breakout_20d] [--interval 5m|1m]"
 ---
 
 # trader-entry
@@ -30,6 +30,7 @@ people money, and a clean signal does not change that.
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA                  # 15-minute opening range, 5-minute bars
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --write          # also save trader/entry.json
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --level 371.20
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check RELIANCE --market IN --setup breakout_20d
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch TSLA --until 15:30    # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
@@ -37,7 +38,8 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit i
 
 Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
 saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
-`<TICKER>.json`), `--now "2026-10-19 10:15"` (market local time) to replay a day,
+`<TICKER>.json`), `--daily PATH` (saved `1d` daily history JSON or folder
+containing `<TICKER>-daily.json` for `--setup breakout_20d`), `--now "2026-10-19 10:15"` (market local time) to replay a day,
 and `--market US|IN`. `watch` with `--now` or `--offline` runs on a simulated
 clock and replays the day bar by bar without waiting.
 
@@ -56,6 +58,12 @@ clock and replays the day bar by bar without waiting.
   9:30, 9:35 and 9:40 five-minute bars, or fifteen 1-minute bars. The level
   to beat is the range high.
 - **Level.** A price you give, like a 20-day high from `/trader-scanner`.
+- **20-day breakout (`breakout_20d`).** Derives the prior 20-day closing high from
+  completed daily sessions before the evaluation date (using `/trader-scanner`
+  logic) and requires price confirmation via a completed intraday candle
+  closing strictly above that breakout level. A prior daily scanner match alone
+  never triggers without intraday confirmation, and stale or insufficient daily
+  history returns `no-data`.
 - **The trigger** is the first completed bar after the range that CLOSES
   above the level. A wick above is not a trigger. A close exactly at the
   level is not above it.

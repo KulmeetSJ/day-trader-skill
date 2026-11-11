@@ -93,6 +93,10 @@ ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions")
+FINGERPRINT_FIELDS = ALPACA_FIELDS + (
+    "market", "currency", "trading_style", "product", "multi_session_protection",
+)
+PAPER_MULTI_SESSION_BROKERS = ("paper", "paper_in", "simulated", "mock")
 PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_limit_price",
                 "stop_loss_stop_price", "stop_loss_limit_price")
 TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
@@ -414,9 +418,54 @@ def read_json(path, what, required=True):
 
 def fingerprint(order):
     """Same function in trader-broker/ticket.py: the exact order that was checked."""
-    core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    core = {k: order[k] for k in FINGERPRINT_FIELDS if k in order and order[k] is not None}
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def positional_order_issues(order, plan, cfg, market):
+    """Validate positional order semantics and multi-session broker/schema capability."""
+    issues = []
+    style = str(order.get("trading_style") or plan.get("trading_style") or "").strip().lower()
+    oc = str(order.get("order_class") or "").strip().lower()
+    tif = str(order.get("time_in_force") or "").strip().lower()
+    flat_p = str(plan.get("flat_by") or "").strip().lower()
+    is_pos = (style == "positional" or oc == "gtt_oco" or flat_p == "positional")
+    if not is_pos:
+        return issues
+    if tif == "day":
+        issues.append("positional: positional order must not use intraday time_in_force='day'; use 'gtc' with gtt_oco")
+    elif tif != "gtc":
+        issues.append("positional: multi-session order requires time_in_force='gtc', got %r" % tif)
+    if oc == "bracket":
+        issues.append("positional: positional order must not inherit intraday order_class='bracket'; use 'gtt_oco'")
+    elif oc != "gtt_oco":
+        issues.append("positional: positional order requires order_class='gtt_oco' for multi-session protection, got %r" % (oc or None))
+    if flat_p and flat_p != "positional":
+        issues.append("positional: order has trading_style='positional' but intraday plan flat_by=%r" % plan.get("flat_by"))
+    eff_market = str(market or "US").upper()
+    if eff_market != "IN":
+        issues.append("positional: multi-session GTT OCO orders are supported only in Indian paper mode (market='IN')")
+    c = cfg or {}
+    if not bool(c.get("paper", True)):
+        issues.append("positional: multi-session GTT OCO orders are supported in paper mode only (paper=true)")
+    if c.get("broker_supports_multi_session") is False or c.get("supports_multi_session_protection") is False:
+        issues.append("positional: configured broker/schema disables multi-session protection")
+    default_broker = "paper" if eff_market == "IN" else "alpaca"
+    broker = str(c.get("broker") or default_broker).strip().lower()
+    if broker not in PAPER_MULTI_SESSION_BROKERS:
+        issues.append("positional: broker %r cannot safely represent multi-session GTT OCO protection; use broker='paper'" % broker)
+    product = str(order.get("product") or "").strip().upper()
+    if product not in ("CNC", "NRML"):
+        issues.append("positional: expected delivery/carryforward product 'CNC' or 'NRML', got %r" % (order.get("product")))
+    prot = order.get("multi_session_protection")
+    if not isinstance(prot, dict) or prot.get("persists_across_sessions") is not True:
+        issues.append("positional: order must declare multi_session_protection with persists_across_sessions=true")
+    elif str(prot.get("time_in_force") or "").strip().lower() != "gtc":
+        issues.append("positional: multi_session_protection must specify time_in_force='gtc'")
+    if order.get("take_profit_limit_price") is None or order.get("stop_loss_stop_price") is None:
+        issues.append("positional: GTT OCO order requires both stop_loss_stop_price and take_profit_limit_price")
+    return issues
 
 
 def _f(x):
@@ -649,6 +698,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if o_lts_utc is not None and o_lts_utc <= now_utc:
                 permitted_data_times.append(o_lts_utc)
         oc = str(o.get("order_class") or "").strip().lower()
+        is_gtt_oco = (oc == "gtt_oco")
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
         value = None
@@ -682,16 +732,17 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: extended hours needs a limit order with time_in_force day or gtc")
         if o.get("stop_loss_limit_price") is not None and o.get("stop_loss_stop_price") is None:
             reasons.append("format: stop_loss_limit_price needs a stop_loss_stop_price")
-        if bracket:
+        if bracket or is_gtt_oco:
+            order_kind = "gtt_oco" if is_gtt_oco else "bracket"
             if notional is not None:
-                reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
+                reasons.append("format: a %s order needs a whole-share qty, not a notional amount" % order_kind)
             elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
-                reasons.append("format: a bracket order takes whole shares only, got qty %r" % qty)
+                reasons.append("format: a %s order takes whole shares only, got qty %r" % (order_kind, qty))
             if tif not in ("day", "gtc"):
-                reasons.append("format: a bracket order needs time_in_force day or gtc, got %r" % tif)
+                reasons.append("format: a %s order needs time_in_force day or gtc, got %r" % (order_kind, tif))
             if o.get("take_profit_limit_price") is None or o.get("stop_loss_stop_price") is None:
-                reasons.append("format: a bracket order needs both take_profit_limit_price and "
-                               "stop_loss_stop_price")
+                reasons.append("format: a %s order needs both take_profit_limit_price and "
+                               "stop_loss_stop_price" % order_kind)
         elif oc or o.get("advanced_instructions"):
             warns.append("advanced order (%s): check every leg before you say yes"
                          % (oc or "advanced_instructions"))
@@ -793,6 +844,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         elif side == "buy" and held < -1e-9 and q is not None:
             exiting = q <= -held + 1e-9
         kind = "exit" if exiting else "entry"
+        if kind == "entry":
+            reasons.extend(positional_order_issues(o, plan, c, market))
         if kind == "entry" and value is None and q:
             later.append("price: no price for %s to size a %s-share order; add it to "
                          "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
@@ -1032,6 +1085,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         }
         if market != "IN":
             res_item["value_usd"] = round(value, 2) if value is not None else None
+        for pk in ("provider", "data_tier", "data_status", "is_historical_analysis", "is_live_signal",
+                   "is_live_data", "is_fixture", "is_simulated", "is_market_open",
+                   "last_trading_session", "last_data_timestamp", "signal_freshness",
+                   "simulated_at", "candle_session"):
+            if pk in o and o[pk] is not None:
+                res_item[pk] = o[pk]
+            elif isinstance(plan, dict) and pk in plan and plan[pk] is not None:
+                res_item[pk] = plan[pk]
         results.append(res_item)
 
     res = {

@@ -382,6 +382,8 @@ def parse_stop(text):
         return "or_mid", None
     if t in ("or-low", "or_low", "low"):
         return "or_low", None
+    if t in ("breakout-invalidation", "breakout_invalidation", "invalidation"):
+        return "breakout_invalidation", None
     m = re.match(r"^(price|pct|atr):\s*(?:\$|\u20b9|rs\.?\s*)?([0-9][0-9,]*\.?[0-9]*)$", t)
     if not m:
         raise PlanError("--stop is or-mid, or-low, price:X, pct:X or atr:K (got %r)" % text)
@@ -435,6 +437,11 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             raw, label = ol, "opening-range low"
     elif stop_rule == "price":
         raw, label = stop_param, "your price"
+    elif stop_rule == "breakout_invalidation":
+        if stop_param is None:
+            raise PlanError("a breakout-invalidation stop requires an invalidation level from a breakout_20d entry")
+        raw, label = stop_param, "breakout invalidation"
+        detail = "inherited breakout_20d invalidation level %s%s" % (curr, num(D(stop_param)))
     elif stop_rule == "pct":
         raw = e * (1 - stop_param / 100)
         label = "%s%% under the entry" % num(stop_param)
@@ -845,11 +852,19 @@ def build_plan(a, now_utc=None):
 
     stop_text = a.stop
     if not stop_text:
-        if info["setup"] != "orb":
+        if info["setup"] == "orb":
+            stop_text = "or-mid"
+        elif info["setup"] == "breakout_20d" and (info.get("doc") or {}).get("invalidation_level") is not None:
+            stop_text = "breakout-invalidation"
+        else:
             raise PlanError("a %s setup has no opening-range stop to default to: give --stop price:X, pct:X or atr:K"
                             % info["setup"])
-        stop_text = "or-mid"
     stop_rule, stop_param = parse_stop(stop_text)
+    if stop_rule == "breakout_invalidation":
+        inv = (info.get("doc") or {}).get("invalidation_level")
+        if inv is None:
+            raise PlanError("breakout-invalidation stop requires a breakout_20d entry with invalidation_level")
+        stop_param = D(str(inv))
     target_rule, target_param = parse_target(a.target or "2R")
     if info["date"]:
         try:
@@ -936,7 +951,9 @@ def build_plan(a, now_utc=None):
         plan["atr_bars"] = atr_n
     d = info.get("doc") or {}
     for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
-              "data_tier", "last_trading_session", "last_data_timestamp", "data_status", "is_simulated", "provider"):
+              "is_fixture", "data_tier", "last_trading_session", "last_data_timestamp",
+              "data_status", "is_simulated", "provider", "signal_freshness",
+              "simulated_at", "candle_session"):
         if k in d:
             plan[k] = d[k]
     if chart_last_ts_iso is not None and not plan.get("last_data_timestamp"):
@@ -945,6 +962,16 @@ def build_plan(a, now_utc=None):
         plan["simulated_at"] = _market_iso(now_utc, market=market)
     if chart_provider and "provider" not in plan:
         plan["provider"] = chart_provider
+    if str(plan.get("provider") or "").lower() == "yahoo":
+        plan["is_live_signal"] = False
+        plan["is_live_data"] = False
+        if "data_tier" not in plan or str(plan.get("data_tier") or "").upper() == "CURRENT":
+            plan["data_tier"] = "HISTORICAL" if (simulated or plan.get("is_historical_analysis")) else "DELAYED"
+    elif str(plan.get("provider") or "").lower() == "offline":
+        plan["is_live_signal"] = False
+        plan["is_live_data"] = False
+        plan.setdefault("is_fixture", True)
+        plan.setdefault("data_tier", "FIXTURE")
     warnings = []
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
@@ -963,7 +990,8 @@ def build_plan(a, now_utc=None):
 
 def describe(plan):
     day = datetime.date.fromisoformat(plan["date"])
-    setup = {"orb": "opening-range breakout", "level": "close above a level"}.get(plan["setup"], plan["setup"])
+    setup = {"orb": "opening-range breakout", "level": "close above a level",
+             "breakout_20d": "20-day breakout"}.get(plan["setup"], plan["setup"])
     market = plan.get("market", "US")
     tz_label = "IST" if market == "IN" else "ET"
     e = D(plan["entry"])
@@ -1054,7 +1082,7 @@ def main(argv=None):
     p.add_argument("--or-high", type=float)
     p.add_argument("--or-low", type=float)
     p.add_argument("--or-minutes", type=int, default=15)
-    p.add_argument("--setup", choices=["orb", "level"])
+    p.add_argument("--setup", choices=["orb", "level", "breakout_20d"])
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")
     p.add_argument("--entry-bar", type=int)

@@ -264,7 +264,9 @@ class TestBharatRules2026(unittest.TestCase):
         self.assertEqual(c_pos["stt"], 149.31)
         # Delivery Stamp Duty = 0.015% * 74256.00 (buy leg only) = 11.14
         self.assertEqual(c_pos["stamp_duty"], 11.14)
-        self.assertEqual(c_pos["brokerage"], 0.00)
+        self.assertEqual(c_pos["brokerage"], 80.00)
+        self.assertEqual(c_pos["brokerage_estimate"]["gst"], 14.40)
+        self.assertEqual(c_pos["brokerage_estimate"]["total"], 94.40)
 
         # Verify plan_report displays all components (including Stamp Duty & SEBI) and estimate notice
         plan = {

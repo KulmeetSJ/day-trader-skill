@@ -243,18 +243,28 @@ class TestBharatOptionsRisk(unittest.TestCase):
 
     def test_risk_positional_trading_style_bypasses_intraday_cutoff(self):
         # Positional order placed at 15:10 IST (when intraday no_entries_after is 15:00)
+        # using multi-session GTT OCO delivery semantics rather than intraday day/bracket.
         order = {
             "symbol": "RELIANCE",
             "side": "buy",
             "qty": "10",
             "type": "limit",
             "limit_price": "2850.00",
-            "order_class": "bracket",
+            "order_class": "gtt_oco",
+            "product": "CNC",
             "take_profit_limit_price": "2950.00",
             "stop_loss_stop_price": "2800.00",
             "trading_style": "positional",
-            "time_in_force": "day",
+            "time_in_force": "gtc",
+            "multi_session_protection": {
+                "type": "gtt_oco",
+                "product": "CNC",
+                "time_in_force": "gtc",
+                "persists_across_sessions": True,
+                "triggers": {"stop_loss": "2800.00", "take_profit": "2950.00"},
+            },
             "market": "IN",
+            "currency": "INR",
         }
         cfg = {
             "budget": 100000,
@@ -262,11 +272,19 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "max_loss_per_trade_inr": 1000,
             "max_daily_loss_inr": 2000,
             "no_entries_after": "15:00",  # Intraday cutoff
+            "broker": "paper",
+            "paper": True,
             "market": "IN",
         }
         at_now = risk_mod.parse_now("2026-10-19 15:10", market="IN")
         res = risk_mod.check([order], cfg, now=at_now)
-        self.assertEqual(res["results"][0]["verdict"], "PASS")
+        self.assertEqual(res["results"][0]["verdict"], "PASS", res["results"][0])
+
+        # Inheriting intraday day/bracket semantics on a positional order must be blocked
+        bad_order = dict(order, order_class="bracket", time_in_force="day")
+        bad_res = risk_mod.check([bad_order], cfg, now=at_now)
+        self.assertEqual(bad_res["results"][0]["verdict"], "BLOCK")
+        self.assertTrue(any("positional" in r for r in bad_res["results"][0]["reasons"]))
 
 
 if __name__ == "__main__":

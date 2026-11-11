@@ -64,8 +64,11 @@ import urllib.request
 _alerts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trader-alerts"))
 if _alerts_dir not in sys.path:
     sys.path.insert(0, _alerts_dir)
+_scanner_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trader-scanner"))
+if _scanner_dir not in sys.path:
+    sys.path.insert(0, _scanner_dir)
 
-# Cross-skill helpers live in ../trader-alerts (added to sys.path above)
+# Cross-skill helpers live in ../trader-alerts and ../trader-scanner
 try:
     import calendar_in  # type: ignore
     import symbols_in  # type: ignore
@@ -76,6 +79,11 @@ except ImportError:
     symbols_in = None
     instruments = None
     data_in = None
+
+try:
+    import scan as scanner_mod  # type: ignore
+except ImportError:
+    scanner_mod = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 PAUSE = 0.5      # seconds between requests to the free endpoint
@@ -462,6 +470,59 @@ def offline_file(path, sym, market="US"):
     return path
 
 
+def offline_daily_file(path, sym, market="US"):
+    """Find an offline 1d daily history file for sym, or None if absent."""
+    if not path:
+        return None
+    if os.path.isdir(path):
+        names = [
+            sym + "-daily.json", sym + "-daily.json.gz",
+            yahoo_symbol(sym) + "-daily.json", yahoo_symbol(sym) + "-daily.json.gz",
+        ]
+        if market == "IN" and symbols_in:
+            ysym = symbols_in.to_yahoo_symbol(sym)
+            names.extend([ysym + "-daily.json", ysym + "-daily.json.gz"])
+        for name in names:
+            p = os.path.join(path, name)
+            if os.path.exists(p):
+                return p
+        return None
+    if os.path.exists(path):
+        return path
+    return None
+
+
+def _is_daily_chart(ch):
+    """Detect whether a parsed chart JSON holds daily (1d+) bars rather than intraday bars."""
+    meta = (ch or {}).get("meta") or {}
+    gran = str(meta.get("dataGranularity") or "").lower()
+    if gran in ("1d", "1wk", "1mo", "d", "daily"):
+        return True
+    if gran in ("1m", "2m", "5m", "15m", "30m", "60m", "1h"):
+        return False
+    bars = (ch or {}).get("bars") or []
+    diffs = [
+        int(bars[i]["t"]) - int(bars[i - 1]["t"])
+        for i in range(1, len(bars))
+        if bars[i].get("t") is not None and bars[i - 1].get("t") is not None
+        and int(bars[i]["t"]) > int(bars[i - 1]["t"])
+    ]
+    if diffs:
+        diffs_sorted = sorted(diffs)
+        if diffs_sorted[len(diffs_sorted) // 2] >= 43200:
+            return True
+    return False
+
+
+def _chart_symbol_matches(ch_sym, sym, market="US"):
+    if market == "IN" and symbols_in:
+        try:
+            return symbols_in.normalize_symbol(ch_sym) == symbols_in.normalize_symbol(sym)
+        except Exception:
+            return ch_sym == yahoo_symbol(sym)
+    return ch_sym == yahoo_symbol(sym)
+
+
 _ORIG_YAHOO_GET = yahoo_get
 
 
@@ -536,11 +597,186 @@ def _truncate_chart_as_of(ch, now_utc, interval, market="US"):
     return ch
 
 
-def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cfg=None, now=None):
+def _truncate_daily_chart_as_of(dch, now_utc, market="US"):
+    """Truncate daily bars and metadata so no future or unfinished today daily bar leaks past now_utc."""
+    if dch is None or now_utc is None:
+        return dch
+    cutoff_ts = ts_of(now_utc)
+    local_now = to_local(now_utc, market=market)
+    today_d = local_now.date()
+    s_today = session(today_d, market=market)
+    today_done = (s_today is None) or (local_now.time() >= s_today[1])
+    kept = []
+    for b in (dch.get("bars") or []):
+        t = b.get("t")
+        c = b.get("c")
+        if t is None or c is None:
+            continue
+        ts = int(t)
+        if ts > cutoff_ts:
+            continue
+        bd = to_local(utc_of(ts), market=market).date()
+        if bd > today_d or (bd == today_d and not today_done):
+            continue
+        kept.append(b)
+    dch["bars"] = kept
+    dt = dch.get("data_time")
+    if dt is not None and int(dt) > cutoff_ts:
+        dt = max((int(b["t"]) for b in kept), default=None)
+    elif dt is None and kept:
+        dt = int(kept[-1]["t"])
+    dch["data_time"] = dt
+    meta = dch.get("meta")
+    if isinstance(meta, dict):
+        if kept and dt is not None:
+            meta["regularMarketTime"] = dt
+            meta["regularMarketPrice"] = kept[-1]["c"]
+        else:
+            for k in ("regularMarketTime", "regularMarketPrice", "regularMarketDayHigh",
+                      "regularMarketDayLow", "regularMarketVolume", "regularMarketOpen"):
+                meta.pop(k, None)
+    dch["last_data_timestamp"] = _market_iso(utc_of(dt), market=market) if dt is not None else None
+    dch["simulated_at"] = _market_iso(now_utc, market=market)
+    return dch
+
+
+def _parse_daily_file(path, sym):
+    text = read_text(path)
+    try:
+        raw = json.loads(text)
+    except (ValueError, TypeError) as e:
+        raise EntryError("could not parse daily file %s: %s" % (path, e))
+    if isinstance(raw, dict) and "chart" in raw:
+        dch = parse_chart(text, sym)
+    elif isinstance(raw, dict) and "bars" in raw:
+        dch = dict(raw)
+        dch.setdefault("symbol", sym)
+        dch.setdefault("meta", {})
+    else:
+        raise EntryError("daily file %s has unexpected format" % path)
+    dch["is_offline"] = True
+    dch["provider"] = "offline"
+    dch["source"] = "offline"
+    dch["data_tier"] = "FIXTURE"
+    dch["is_live"] = False
+    dch["is_live_capable"] = False
+    dch.setdefault("provider_data_status", "HISTORICAL")
+    return dch
+
+
+def _load_daily_chart(sym, offline=None, daily_path=None, market="US", cfg=None, now=None):
+    """Return (daily_chart_dict, error_message) with look-ahead cutoff applied."""
+    sym = sym.upper()
+    dch = None
+    if daily_path:
+        dp = offline_daily_file(daily_path, sym, market=market)
+        if not dp:
+            return None, "no daily file for %s in %s" % (sym, daily_path)
+        try:
+            dch = _parse_daily_file(dp, sym)
+        except EntryError as e:
+            return None, str(e)
+    elif offline:
+        dp = offline_daily_file(offline, sym, market=market)
+        if not dp:
+            return None, "no offline daily file for %s in %s (want %s-daily.json)" % (sym, offline, sym)
+        try:
+            dch = _parse_daily_file(dp, sym)
+        except EntryError as e:
+            return None, str(e)
+    elif market == "IN" and data_in is not None:
+        try:
+            prov = data_in.get_provider(config=cfg)
+        except Exception as e:
+            return None, "Market data provider error: %s" % e
+        use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
+        if use_legacy_mock:
+            fetch_sym = symbols_in.to_yahoo_symbol(sym) if symbols_in else yahoo_symbol(sym)
+            try:
+                text = yahoo_get(chart_path(fetch_sym, "3mo", "1d"))
+                dch = parse_chart(text, sym)
+            except EntryError as e:
+                return None, str(e)
+            dch["is_offline"] = False
+            dch["provider"] = "yahoo"
+            dch["source"] = "yahoo"
+            dch["data_tier"] = "DELAYED"
+            dch["is_live"] = False
+            dch["is_live_capable"] = False
+        else:
+            exch = (cfg or {}).get("exchange") or "NSE"
+            try:
+                payload = prov.get_historical_data(
+                    sym,
+                    range_str="3mo",
+                    interval="1d",
+                    exchange=exch,
+                    now=_to_ist_aware(now),
+                )
+            except Exception as e:
+                return None, str(e)
+            if isinstance(payload, str):
+                dch = parse_chart(payload, sym)
+                dch["provider"] = prov.provider_name
+                dch["source"] = prov.provider_name
+                dch["data_tier"] = "DELAYED" if prov.provider_name == "yahoo" else "HISTORICAL"
+                dch["is_live"] = False
+            elif isinstance(payload, dict) and "chart" in payload:
+                dch = parse_chart(json.dumps(payload), sym)
+                dch["provider"] = prov.provider_name
+                dch["source"] = prov.provider_name
+                dch["data_tier"] = "DELAYED" if prov.provider_name == "yahoo" else "HISTORICAL"
+                dch["is_live"] = False
+            else:
+                dch = data_in.to_entry_chart(payload)
+            if prov.provider_name == "yahoo":
+                dch["data_tier"] = "DELAYED"
+                dch["is_live"] = False
+                dch["is_live_capable"] = False
+            else:
+                dch["is_live_capable"] = bool(
+                    prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
+                    and prov.provider_name not in ("yahoo", "offline", "simulated")
+                )
+    else:
+        fetch_sym = symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else yahoo_symbol(sym)
+        try:
+            text = yahoo_get(chart_path(fetch_sym, "3mo", "1d"))
+            dch = parse_chart(text, sym)
+        except EntryError as e:
+            return None, str(e)
+        dch["is_offline"] = False
+        dch["provider"] = "yahoo"
+        dch["source"] = "yahoo"
+        dch["data_tier"] = "DELAYED"
+        dch["is_live"] = False
+        dch["is_live_capable"] = False
+
+    if dch and not _chart_symbol_matches(dch.get("symbol") or sym, sym, market=market):
+        return None, "the daily chart holds %s, not %s" % (dch.get("symbol"), sym)
+    if dch and now is not None:
+        _truncate_daily_chart_as_of(dch, now, market=market)
+    return dch, None
+
+
+def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cfg=None, now=None,
+              setup="orb", daily=None):
     """Bars for one ticker, from active Indian provider (or Yahoo) or a saved offline file."""
     sym = sym.upper()
+    daily_only_file = False
     if offline:
-        f = offline_file(offline, sym, market=market)
+        try:
+            f = offline_file(offline, sym, market=market)
+        except EntryError:
+            if setup == "breakout_20d" and os.path.isdir(offline):
+                df = offline_daily_file(offline, sym, market=market)
+                if df:
+                    f = df
+                    daily_only_file = True
+                else:
+                    raise
+            else:
+                raise
         try:
             text = read_text(f)
         except (OSError, ValueError) as e:
@@ -552,6 +788,29 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
         ch["data_tier"] = "FIXTURE"
         ch["is_live"] = False
         ch["is_live_capable"] = False
+        if setup == "breakout_20d" and (daily_only_file or _is_daily_chart(ch)):
+            dch = dict(ch)
+            dch["bars"] = list(ch.get("bars") or [])
+            dch["meta"] = dict(ch.get("meta") or {})
+            if now is not None:
+                _truncate_daily_chart_as_of(dch, now, market=market)
+            ch["daily_bars"] = dch["bars"]
+            ch["daily_meta"] = dch.get("meta")
+            ch["daily_provider"] = "offline"
+            ch["daily_data_tier"] = "FIXTURE"
+            ch["daily_data_status"] = "HISTORICAL"
+            ch["daily_is_live"] = False
+            ch["daily_is_simulated"] = False
+            ch["daily_last_data_timestamp"] = dch.get("last_data_timestamp")
+            ch["daily_error"] = None
+            ch["bars"] = []
+            ch["data_time"] = None
+            ch["last_data_timestamp"] = dch.get("last_data_timestamp")
+            if now is not None:
+                ch["simulated_at"] = _market_iso(now, market=market)
+            if not _chart_symbol_matches(ch["symbol"], sym, market=market):
+                raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
+            return ch
         if market == "IN" and now is not None:
             _truncate_chart_as_of(ch, now, interval, market=market)
     elif market == "IN" and data_in is not None:
@@ -589,12 +848,32 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
                     now=_to_ist_aware(now),
                 )
             except Exception as e:
-                raise EntryError(str(e))
-            ch = data_in.to_entry_chart(payload)
-            ch["is_live_capable"] = bool(
-                prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
-                and prov.provider_name not in ("yahoo", "offline", "simulated")
-            )
+                if setup == "breakout_20d":
+                    ch = {
+                        "symbol": sym,
+                        "meta": {},
+                        "bars": [],
+                        "prev_close": None,
+                        "data_time": None,
+                        "is_offline": (prov.provider_name == "offline"),
+                        "provider": prov.provider_name,
+                        "source": prov.provider_name,
+                        "data_tier": "DELAYED" if prov.provider_name == "yahoo" else "HISTORICAL",
+                        "provider_data_status": "UNAVAILABLE",
+                        "is_live": False,
+                        "is_live_capable": False,
+                        "is_simulated": (prov.provider_name == "simulated"),
+                        "intraday_error": str(e),
+                    }
+                    payload = None
+                else:
+                    raise EntryError(str(e))
+            if payload is not None:
+                ch = data_in.to_entry_chart(payload)
+                ch["is_live_capable"] = bool(
+                    prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
+                    and prov.provider_name not in ("yahoo", "offline", "simulated")
+                )
     else:
         today = today or to_local(utc_now(), market=market).date()
         fetch_sym = symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else yahoo_symbol(sym)
@@ -609,22 +888,27 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
         if market == "IN" and now is not None:
             _truncate_chart_as_of(ch, now, interval, market=market)
 
-    matched = False
-    ch_sym = ch["symbol"]
-    if market == "IN" and symbols_in:
-        try:
-            norm_ch = symbols_in.normalize_symbol(ch_sym)
-            norm_sym = symbols_in.normalize_symbol(sym)
-            matched = (norm_ch == norm_sym)
-        except Exception:
-            matched = (ch_sym == yahoo_symbol(sym))
-    else:
-        matched = (ch_sym == yahoo_symbol(sym))
-    if not matched:
+    if not _chart_symbol_matches(ch["symbol"], sym, market=market):
         raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
     gran = ch["meta"].get("dataGranularity")
     if gran and gran != interval:
         raise EntryError("%s has %s bars, not %s: use --interval %s" % (sym, gran, interval, gran))
+
+    if setup == "breakout_20d":
+        dch, derr = _load_daily_chart(sym, offline=offline, daily_path=daily, market=market, cfg=cfg, now=now)
+        if dch is not None:
+            ch["daily_bars"] = dch.get("bars") or []
+            ch["daily_meta"] = dch.get("meta") or {}
+            ch["daily_provider"] = dch.get("provider")
+            ch["daily_data_tier"] = dch.get("data_tier")
+            ch["daily_data_status"] = dch.get("provider_data_status")
+            ch["daily_is_live"] = bool(dch.get("is_live", False))
+            ch["daily_is_simulated"] = bool(dch.get("is_simulated", False))
+            ch["daily_last_data_timestamp"] = dch.get("last_data_timestamp")
+            ch["daily_error"] = None
+        else:
+            ch["daily_bars"] = []
+            ch["daily_error"] = derr
     return ch
 
 
@@ -674,6 +958,206 @@ def rsi_val(closes, n=14):
         ag = (ag * (n - 1) + g[i]) / n
         al = (al * (n - 1) + lo[i]) / n
     return 100 - 100 / (1 + ag / al) if al else 100.0
+
+
+def _tick_step(market="US"):
+    return 0.05 if market == "IN" else 0.01
+
+
+def _floor_tick(price, tick=0.05):
+    from decimal import Decimal, ROUND_FLOOR
+    d_price = Decimal(str(round(float(price), 4)))
+    d_tick = Decimal(str(tick))
+    floored = (d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_tick
+    return round(float(floored), 2) + 0.0
+
+
+def _compute_breakout_invalidation(breakout_level, trig_low, trig_close, market="US"):
+    """Structural invalidation stop below broken level/trigger bar low, strictly below entry."""
+    tick = _tick_step(market)
+    anchor = float(breakout_level)
+    if trig_low is not None:
+        anchor = min(anchor, float(trig_low))
+    inv = _floor_tick(anchor, tick=tick)
+    entry_r = r2(trig_close)
+    if entry_r is not None and inv >= entry_r:
+        inv = _floor_tick(entry_r - tick, tick=tick)
+    if inv <= 0:
+        return None
+    return inv
+
+
+def _expected_prev_trading_day(eval_day, market="US"):
+    d = eval_day - datetime.timedelta(days=1)
+    for _ in range(30):
+        ok_d, _ = trading_day(d, market=market)
+        if ok_d:
+            return d
+        d = d - datetime.timedelta(days=1)
+    return None
+
+
+def _count_missed_trading_days(latest_date, eval_day, market="US"):
+    if latest_date is None or latest_date >= eval_day:
+        return 0
+    missed = 0
+    cur = latest_date + datetime.timedelta(days=1)
+    steps = 0
+    while cur < eval_day and steps < 90:
+        ok_d, _ = trading_day(cur, market=market)
+        if ok_d:
+            missed += 1
+        cur = cur + datetime.timedelta(days=1)
+        steps += 1
+    return missed
+
+
+def _daily_closes_fallback(series, as_of_utc, market="US"):
+    """Fallback daily_closes identical to scan.daily_closes if scan.py is unavailable."""
+    now = to_local(as_of_utc, market=market)
+    today_d = now.date()
+    s = session(today_d, market=market)
+    today_done = s is None or now.time() >= s[1]
+    out = {}
+    for ts, c in zip(series.get("t") or [], series.get("c") or []):
+        if ts is None or c is None:
+            continue
+        d = to_local(utc_of(ts), market=market).date()
+        if d > today_d or (d == today_d and not today_done):
+            continue
+        out[d] = float(c)
+    return sorted(out.items())
+
+
+def _find_20d_fallback(closes):
+    c = closes
+    last = c[-1]
+    hi20 = max(c[-21:-1])
+    tags = ["breakout_20d"] if last > hi20 else []
+    return tags, {"high20": hi20}
+
+
+def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US"):
+    """Compute prior-session 20d closing high entering eval_day, reusing trader-scanner logic."""
+    min_daily = getattr(scanner_mod, "MIN_DAILY_BARS", 30) if scanner_mod else 30
+    daily_err = chart.get("daily_error")
+    raw_daily = chart.get("daily_bars")
+    if daily_err and not raw_daily:
+        return {"ok": False, "err_kind": "unavailable", "reason": "Insufficient historical daily data: %s" % daily_err,
+                "breakout_level": None, "ref_invalidation": None, "closes_prior": [],
+                "scanner_matched": False, "daily_close_date": None, "daily_close": None,
+                "prior_high20": None, "missed_sessions": 0}
+    raw_daily = raw_daily or []
+    now_ts = ts_of(now_utc)
+    ts_list = []
+    c_list = []
+    for b in raw_daily:
+        if b.get("t") is None or b.get("c") is None:
+            continue
+        ts_val = int(b["t"])
+        if ts_val <= now_ts:
+            ts_list.append(ts_val)
+            c_list.append(float(b["c"]))
+    before_eval_utc = local_to_utc(datetime.datetime.combine(eval_day, datetime.time(0, 0)), market=market) - datetime.timedelta(seconds=1)
+    as_of_daily = min(now_utc, before_eval_utc)
+    series = {"t": ts_list, "c": c_list}
+    if scanner_mod is not None:
+        prior_bars = scanner_mod.daily_closes(series, as_of_daily, market=market)
+    else:
+        prior_bars = _daily_closes_fallback(series, as_of_daily, market=market)
+
+    if not prior_bars:
+        return {"ok": False, "err_kind": "insufficient",
+                "reason": "Insufficient historical daily data before %s: need %d completed daily closes for breakout_20d, have 0" % (
+                    eval_day.isoformat(), min_daily),
+                "breakout_level": None, "ref_invalidation": None, "closes_prior": [],
+                "scanner_matched": False, "daily_close_date": None, "daily_close": None,
+                "prior_high20": None, "missed_sessions": 0}
+
+    latest_daily_date = prior_bars[-1][0]
+    latest_daily_close = prior_bars[-1][1]
+    if len(prior_bars) < min_daily:
+        return {"ok": False, "err_kind": "insufficient",
+                "reason": "Insufficient historical daily data before %s: need %d completed daily closes for breakout_20d, have %d" % (
+                    eval_day.isoformat(), min_daily, len(prior_bars)),
+                "breakout_level": None, "ref_invalidation": None, "closes_prior": [c for _, c in prior_bars],
+                "scanner_matched": False, "daily_close_date": latest_daily_date.isoformat(),
+                "daily_close": r2(latest_daily_close), "prior_high20": None, "missed_sessions": 0}
+
+    closes_prior = [c for _, c in prior_bars]
+    if scanner_mod is not None:
+        prior_tags, prior_nums = scanner_mod.find_setups(closes_prior)
+        _, today_nums = scanner_mod.find_setups(closes_prior + [closes_prior[-1]])
+    else:
+        prior_tags, prior_nums = _find_20d_fallback(closes_prior)
+        _, today_nums = _find_20d_fallback(closes_prior + [closes_prior[-1]])
+
+    breakout_level = float(today_nums["high20"])
+    tick = _tick_step(market)
+    ref_inv = _floor_tick(breakout_level - tick, tick=tick)
+    if ref_inv <= 0:
+        ref_inv = r2(breakout_level)
+
+    expected_prev = _expected_prev_trading_day(eval_day, market=market)
+    missed = _count_missed_trading_days(latest_daily_date, eval_day, market=market)
+    daily_prov_stale = (str(chart.get("daily_data_status") or "").upper() == "STALE")
+    if (expected_prev is not None and latest_daily_date < expected_prev) or daily_prov_stale:
+        return {"ok": False, "err_kind": "stale",
+                "reason": "Stale daily history for breakout_20d: latest completed daily close is %s (%d trading session(s) missing before %s)" % (
+                    latest_daily_date.isoformat(), max(1, missed), eval_day.isoformat()),
+                "breakout_level": breakout_level, "ref_invalidation": ref_inv,
+                "closes_prior": closes_prior,
+                "scanner_matched": ("breakout_20d" in prior_tags),
+                "daily_close_date": latest_daily_date.isoformat(),
+                "daily_close": r2(latest_daily_close),
+                "prior_high20": r2(prior_nums["high20"]),
+                "missed_sessions": missed}
+
+    return {"ok": True, "err_kind": None, "reason": "",
+            "breakout_level": breakout_level, "ref_invalidation": ref_inv,
+            "closes_prior": closes_prior,
+            "scanner_matched": ("breakout_20d" in prior_tags),
+            "daily_close_date": latest_daily_date.isoformat(),
+            "daily_close": r2(latest_daily_close),
+            "prior_high20": r2(prior_nums["high20"]),
+            "missed_sessions": 0}
+
+
+def _bar_confirms_breakout_20d(closes_prior, close_price, breakout_level):
+    """Confirm an intraday bar close using scan.find_setups' breakout_20d rule."""
+    if scanner_mod is not None and len(closes_prior) >= 21:
+        tags, _ = scanner_mod.find_setups(closes_prior + [float(close_price)])
+        return "breakout_20d" in tags
+    return float(close_price) > float(breakout_level)
+
+
+def _breakout_signal_freshness(status, data_tier, data_status, is_live_data, is_fixture,
+                               is_simulated, is_historical, replay_full_session,
+                               eval_day, day, minutes_since=None, phase=None):
+    """Return explicit signal_freshness label for breakout_20d evaluations."""
+    if status == "no-data":
+        return "stale" if data_status == "stale" else "unavailable"
+    if data_status == "stale":
+        return "stale"
+    if replay_full_session or eval_day < day or data_tier == "HISTORICAL":
+        if status == "triggered":
+            return "historical"
+        return "expired" if status == "expired" else "historical"
+    if status == "triggered" and minutes_since is not None and minutes_since > 30:
+        return "stale"
+    if status == "expired":
+        return "fixture" if is_fixture else ("simulated" if is_simulated else "expired")
+    if phase == "pre-open":
+        return "fixture" if is_fixture else ("simulated" if is_simulated else "pending")
+    if is_fixture:
+        return "fixture"
+    if is_simulated:
+        return "simulated"
+    if data_tier == "CURRENT" and is_live_data:
+        return "current"
+    if data_tier == "DELAYED":
+        return "delayed"
+    return str(data_status or "delayed").lower()
 
 
 def _classify_market_data(chart, market, day, eval_day, local, open_dt, close_dt, now_ts, dt,
@@ -770,9 +1254,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    valid_setups = ("orb", "level", "ma_crossover", "trend", "rsi_momentum", "options_orb")
+    valid_setups = ("orb", "level", "breakout_20d", "ma_crossover", "trend", "rsi_momentum", "options_orb")
     if setup not in valid_setups:
-        raise EntryError("--setup is orb, level, ma_crossover, trend, rsi_momentum, or options_orb")
+        raise EntryError("--setup is orb, level, breakout_20d, ma_crossover, trend, rsi_momentum, or options_orb")
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
     n_or = or_minutes * 60 // step
@@ -871,6 +1355,19 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                        is_simulated=bool(chart.get("is_simulated", False)))
             res["_market_session_open"] = False
             res["_replay_full_session"] = True
+            if setup == "breakout_20d":
+                b20_ref = _analyze_breakout_20d_baseline(chart, now_utc, last_td, market=market)
+                res["breakout_level"] = r2(b20_ref["breakout_level"]) if b20_ref.get("breakout_level") is not None else None
+                res["level"] = res["breakout_level"]
+                res["confirmation_price"] = None
+                res["timestamp"] = None
+                res["invalidation_level"] = b20_ref.get("ref_invalidation") if b20_ref.get("breakout_level") is not None else None
+                res["scanner_breakout_matched"] = bool(b20_ref.get("scanner_matched"))
+                if b20_ref.get("daily_close_date") is not None:
+                    res["daily_close_date"] = b20_ref["daily_close_date"]
+                if b20_ref.get("daily_close") is not None:
+                    res["daily_close"] = b20_ref["daily_close"]
+                res["signal_freshness"] = "stale" if (b20_ref.get("err_kind") == "stale" or is_fixture) else "unavailable"
             return res
 
     if eval_day != day:
@@ -923,6 +1420,47 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["_market_session_open"] = bool(session_is_open)
     res["_replay_full_session"] = replay_full_session
 
+    b20 = None
+    if setup == "breakout_20d":
+        b20 = _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market=market)
+        res["breakout_level"] = r2(b20["breakout_level"]) if b20.get("breakout_level") is not None else None
+        res["level"] = res["breakout_level"]
+        res["confirmation_price"] = None
+        res["timestamp"] = None
+        res["invalidation_level"] = b20.get("ref_invalidation") if b20.get("breakout_level") is not None else None
+        res["scanner_breakout_matched"] = bool(b20.get("scanner_matched"))
+        if b20.get("daily_close_date") is not None:
+            res["daily_close_date"] = b20["daily_close_date"]
+        if b20.get("daily_close") is not None:
+            res["daily_close"] = b20["daily_close"]
+        if b20.get("prior_high20") is not None:
+            res["prior_20d_high"] = b20["prior_high20"]
+        if chart.get("intraday_error") and not by_slot:
+            res.update(status="no-data", phase="open" if session_is_open else "closed",
+                       reason="Insufficient intraday data for breakout_20d confirmation: %s" % chart["intraday_error"])
+            _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+            res["signal_freshness"] = "unavailable"
+            return res
+        if not b20["ok"]:
+            if b20["err_kind"] == "stale":
+                res.update(status="no-data", phase="open" if session_is_open else "closed", reason=b20["reason"])
+                res["is_market_open"] = bool(session_is_open)
+                res["is_live_data"] = False
+                res["is_live_signal"] = False
+                res["data_status"] = "stale"
+                res["data_tier"] = "FIXTURE" if is_fixture else ("SIMULATED" if is_simulated else (
+                    "HISTORICAL" if (replay_full_session or eval_day < day or data_tier == "HISTORICAL") else "DELAYED"
+                ))
+                res["signal_freshness"] = "stale"
+                return res
+            res.update(status="no-data", phase="open" if session_is_open else "closed", reason=b20["reason"])
+            res["breakout_level"] = None
+            res["level"] = None
+            res["invalidation_level"] = None
+            _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+            res["signal_freshness"] = "unavailable"
+            return res
+
     bars, pending = [], None
     top = max(by_slot) if by_slot else -1
     for slot in sorted(by_slot):
@@ -944,6 +1482,23 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if not replay_full_session and local < open_dt:
         open_label = "9:15" if market == "IN" else "9:30"
+        if setup == "breakout_20d" and b20 is not None:
+            res["signal_freshness"] = _breakout_signal_freshness(
+                "waiting", data_tier, data_status, is_live_data, is_fixture, is_simulated,
+                is_historical, replay_full_session, eval_day, day, phase="pre-open"
+            )
+            if b20.get("scanner_matched"):
+                res.update(phase="pre-open", reason=(
+                    "the %s opens at %s; prior daily close %s%.2f (%s) matched breakout_20d - "
+                    "awaiting completed intraday bar close above %s%.2f to confirm"
+                    % (exchange, open_label, curr, b20["daily_close"], b20["daily_close_date"], curr, b20["breakout_level"])
+                ))
+            else:
+                res.update(phase="pre-open", reason=(
+                    "the %s opens at %s; awaiting completed intraday bar close above 20-day breakout level %s%.2f"
+                    % (exchange, open_label, curr, b20["breakout_level"])
+                ))
+            return res
         res.update(phase="pre-open", reason="the %s opens at %s%s" % (
             exchange, open_label, " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
         return res
@@ -969,6 +1524,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         lvl = max(b["h"] for b in or_bars)
     elif setup == "level":
         lvl = float(level)
+    elif setup == "breakout_20d":
+        lvl = float(b20["breakout_level"])
     else:
         lvl = float(chart.get("prev_close") or (bars[0]["c"] if bars else 100.0))
     res["level"] = r2(lvl)
@@ -982,6 +1539,21 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 continue
             if b["c"] > lvl:
                 vx = (b["v"] / avg_vol) if avg_vol else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                break
+    elif setup == "breakout_20d":
+        closes_prior = b20["closes_prior"]
+        for i, b in enumerate(bars):
+            if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
+                continue
+            if _bar_confirms_breakout_20d(closes_prior, b["c"], lvl):
+                ref_avg_vol = avg_vol
+                if ref_avg_vol is None and i > 0:
+                    ref_avg_vol = sum(x["v"] for x in bars[:i]) / float(i)
+                vx = (b["v"] / ref_avg_vol) if ref_avg_vol else None
                 if min_volume_x and (vx is None or vx < min_volume_x):
                     thin.append(b)
                     continue
@@ -1030,12 +1602,28 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
+        trig_reason = (
+            "the %s bar closed above 20-day breakout level %s%.2f at %s%.2f"
+            % (short(trig["et"]), curr, lvl, curr, trig["c"])
+            if setup == "breakout_20d"
+            else "the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level")
+        )
         res.update(status="triggered", phase="open" if session_is_open else "after-close",
-                   reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
+                   reason=trig_reason)
+        conf_iso = _market_iso(local_to_utc(trig["end"], market=market), market=market)
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
+        if setup == "breakout_20d":
+            res["confirmation_price"] = r2(trig["c"])
+            res["timestamp"] = conf_iso
+            res["invalidation_level"] = _compute_breakout_invalidation(lvl, trig.get("l"), trig["c"], market=market)
+            res["signal_freshness"] = _breakout_signal_freshness(
+                "triggered", data_tier, data_status, is_live_data, is_fixture, is_simulated,
+                is_historical, replay_full_session, eval_day, day,
+                minutes_since=res["minutes_since"], phase=res["phase"],
+            )
 
         # Options-specific enrichment
         if setup == "options_orb" and data_in:
@@ -1099,16 +1687,34 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             and not is_historical
             and not replay_full_session
             and res.get("status") == "triggered"
+            and not (setup == "breakout_20d" and res.get("signal_freshness") == "stale")
         )
         return res
     if not bars:
+        if (setup == "breakout_20d" and not replay_full_session and session_is_open
+                and local < open_dt + datetime.timedelta(seconds=step)
+                and not chart.get("intraday_error")):
+            res.update(
+                status="waiting",
+                phase="forming",
+                reason="market open, awaiting first completed %s bar close above breakout level %s%.2f" % (
+                    interval, curr, lvl),
+            )
+            res["signal_freshness"] = _breakout_signal_freshness(
+                "waiting", data_tier, data_status, is_live_data, is_fixture, is_simulated,
+                is_historical, replay_full_session, eval_day, day, phase="forming",
+            )
+            return res
         no_bars_msg = (
             "Insufficient historical data before cutoff (%s): 0 closed bars for %s"
             % (res["now"], eval_day.isoformat())
             if market == "IN" else ("Yahoo sent no bars for %s yet" % eval_day.isoformat())
         )
         res.update(status="no-data", phase="open" if session_is_open else "closed", reason=no_bars_msg)
-        return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+        _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+        if setup == "breakout_20d":
+            res["signal_freshness"] = "stale" if data_status == "stale" else "unavailable"
+        return res
     min_ind_bars = 22 if setup in ("ma_crossover", "trend") else (16 if setup == "rsi_momentum" else 0)
     if market == "IN" and min_ind_bars and len(bars) < min_ind_bars:
         res.update(
@@ -1118,25 +1724,55 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                    % (res["now"], min_ind_bars, setup, len(bars)),
         )
         return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
-    what = ("close above the range high %s%.2f" % (curr, lvl)) if setup == "orb" else ("close above %s%.2f" % (curr, lvl))
+    if setup == "orb":
+        what = "close above the range high %s%.2f" % (curr, lvl)
+    elif setup == "breakout_20d":
+        what = "confirm breakout_20d with a completed close above %s%.2f" % (curr, lvl)
+    else:
+        what = "close above %s%.2f" % (curr, lvl)
     if (replay_full_session or local >= cutoff) and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if not session_is_open else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
+        if setup == "breakout_20d":
+            res["signal_freshness"] = _breakout_signal_freshness(
+                "expired", data_tier, data_status, is_live_data, is_fixture, is_simulated,
+                is_historical, replay_full_session, eval_day, day, phase=res["phase"],
+            )
         return res
     res["phase"] = "open"
     if last["c"] > lvl and last in thin:
-        res["reason"] = ("the %s bar closed above at %s%.2f but on %.2fx the range's volume, under your %.2fx" % (
-            short(last["et"]), curr, last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x))
+        res["reason"] = ("the %s bar closed above at %s%.2f but on %.2fx the %s volume, under your %.2fx" % (
+            short(last["et"]), curr, last["c"], last["v"] / avg_vol if avg_vol else 0,
+            "baseline" if setup == "breakout_20d" else "range's", min_volume_x))
     elif last["c"] > lvl and last["end"] < before:
         res["reason"] = ("the %s bar closed above at %s%.2f, but no entries before %s (config)" % (
             short(last["et"]), curr, last["c"], short(before)))
+    elif setup == "breakout_20d":
+        gap = lvl - last["c"]
+        if b20 and b20.get("scanner_matched"):
+            res["reason"] = (
+                "prior daily close %s%.2f (%s) matched breakout_20d, awaiting completed intraday close above %s%.2f "
+                "(last close %s%.2f at %s, %s%.2f %s, %+.2f%%)"
+                % (curr, b20["daily_close"], b20["daily_close_date"], curr, lvl,
+                   curr, last["c"], short(last["et"]), curr, abs(gap),
+                   "under" if gap >= 0 else "over", 100.0 * (last["c"] / lvl - 1))
+            )
+        else:
+            res["reason"] = ("last close %s%.2f (%s bar), %s%.2f %s 20-day breakout level %s%.2f (%+.2f%%)" % (
+                curr, last["c"], short(last["et"]), curr, abs(gap), "under" if gap >= 0 else "over",
+                curr, lvl, 100.0 * (last["c"] / lvl - 1)))
     else:
         gap = lvl - last["c"]
         res["reason"] = ("last close %s%.2f (%s bar), %s%.2f %s %s (%+.2f%%)" % (
             curr, last["c"], short(last["et"]), curr, abs(gap), "under" if gap >= 0 else "over",
             ("the range high %s%.2f" % (curr, lvl)) if setup == "orb" else ("the level %s%.2f" % (curr, lvl)),
             100.0 * (last["c"] / lvl - 1)))
+    if setup == "breakout_20d":
+        res["signal_freshness"] = _breakout_signal_freshness(
+            "waiting", data_tier, data_status, is_live_data, is_fixture, is_simulated,
+            is_historical, replay_full_session, eval_day, day, phase=res["phase"],
+        )
     return res
 
 
@@ -1197,6 +1833,16 @@ def entry_doc(res, now_utc):
         doc["data_status"] = res["data_status"]
     if res.get("is_simulated") is not None:
         doc["is_simulated"] = bool(res.get("is_simulated", False))
+    if res.get("setup") == "breakout_20d" or "breakout_level" in res:
+        doc["breakout_level"] = res.get("breakout_level")
+        doc["confirmation_price"] = res.get("confirmation_price")
+        doc["timestamp"] = res.get("timestamp")
+        doc["invalidation_level"] = res.get("invalidation_level")
+        doc["signal_freshness"] = res.get("signal_freshness")
+        if res.get("daily_close_date") is not None:
+            doc["daily_close_date"] = res["daily_close_date"]
+        if res.get("scanner_breakout_matched") is not None:
+            doc["scanner_breakout_matched"] = bool(res["scanner_breakout_matched"])
     return doc
 
 
@@ -1220,6 +1866,10 @@ def setup_name(res):
     curr = "\u20b9" if res.get("market") == "IN" else "$"
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
+    if res["setup"] == "breakout_20d":
+        if res.get("breakout_level") is not None:
+            return "20-day breakout (close above %s%.2f)" % (curr, res["breakout_level"])
+        return "20-day breakout"
     return ("close above %s%.2f" % (curr, res["level"])) if res["level"] is not None else "close above a level"
 
 
@@ -1322,6 +1972,23 @@ def describe(res):
     if res.get("early_close"):
         out.append("Early close today at 1:00 p.m. (%s): no new entries after %s." % (
             res["early_close"], res["no_entries_after"]))
+    if res.get("setup") == "breakout_20d":
+        bl = res.get("breakout_level")
+        cp = res.get("confirmation_price")
+        ts_val = res.get("timestamp")
+        inv = res.get("invalidation_level")
+        fresh = res.get("signal_freshness") or "unavailable"
+        bl_text = ("%s%.2f" % (curr, bl)) if bl is not None else "unavailable"
+        if res.get("daily_close_date"):
+            bl_text += " (as of %s%s)" % (
+                res["daily_close_date"],
+                "; scanner breakout match" if res.get("scanner_breakout_matched") else "",
+            )
+        cp_text = ("%s%.2f" % (curr, cp)) if cp is not None else "none (unconfirmed)"
+        ts_text = ts_val if ts_val else "none"
+        inv_text = ("%s%.2f" % (curr, inv)) if inv is not None else "none"
+        out.append("Breakout level: %s | Confirmation price: %s | Timestamp: %s" % (bl_text, cp_text, ts_text))
+        out.append("Invalidation / stop level: %s | Signal freshness: %s" % (inv_text, fresh))
     if not res.get("calendar_known"):
         out.append("Holiday list covers %s only: check nyse.com for this date." % " and ".join(map(str, CALENDAR_YEARS)))
     return out
@@ -1347,11 +2014,11 @@ def bar_line(b, res):
         note = ""
     elif b["c"] > lvl:
         note = "above %s%.2f" % (curr, lvl)
-        if res["setup"] == "level" or b["slot"] >= n_or:
+        if res["setup"] in ("level", "breakout_20d") or b["slot"] >= n_or:
             avg = orr.get("avg_volume")
             if res.get("min_volume_x") and avg:
                 note += ", but volume %.2fx is under %.2fx" % (b["v"] / float(avg), res["min_volume_x"])
-            elif b["end"] < datetime.datetime.combine(b["et"].date(), parse_hhmm(res["no_entries_before"], "x")):
+            elif b["end"] < datetime.datetime.combine(b["et"].date(), parse_hhmm(res["no_entries_before"], "x", market=res.get("market", "US"))):
                 note += ", but no entries before %s" % res["no_entries_before"]
     else:
         note = "%s%.2f under %s%.2f" % (curr, lvl - b["c"], curr, lvl)
@@ -1468,7 +2135,9 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 def _opts(a, cfg):
     if a.side in ("sell", "short"):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup in ("orb", "options_orb") and a.level is not None:
+    if a.setup in ("orb", "options_orb", "breakout_20d") and a.level is not None:
+        if a.setup == "breakout_20d":
+            raise EntryError("--level is for --setup level (breakout_20d derives its level from 20-day daily closes)")
         raise EntryError("--level is for --setup level (an orb's level is its range high)")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
@@ -1482,16 +2151,19 @@ def _opts(a, cfg):
             "option_strategy": option_strategy, "strike_selection": strike_selection}
 
 
-def _load(a, sym, now, market="US", cfg=None):
+def _load(a, sym, now, market="US", cfg=None, setup=None):
     """(chart, now). An offline file without --now is read as of its own time."""
     if cfg is None and hasattr(a, "config"):
         cfg = read_config(a.config, market=market)
+    setup = setup or getattr(a, "setup", "orb")
+    daily = getattr(a, "daily", None)
     real_today = to_local(utc_now(), market=market).date()
     if a.offline and now is None:
-        ch = get_chart(sym, a.interval, offline=a.offline, market=market, cfg=cfg)
+        ch = get_chart(sym, a.interval, offline=a.offline, market=market, cfg=cfg, setup=setup, daily=daily)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market, cfg=cfg, now=now), now
+    return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
+                     market=market, cfg=cfg, now=now, setup=setup, daily=daily), now
 
 
 def cmd_check(a):
@@ -1500,7 +2172,7 @@ def cmd_check(a):
     cfg = read_config(a.config, market=market)
     opts = _opts(a, cfg)
     opts["market"] = market
-    chart, now = _load(a, sym, parse_now(a.now, market=market) if a.now else None, market=market, cfg=cfg)
+    chart, now = _load(a, sym, parse_now(a.now, market=market) if a.now else None, market=market, cfg=cfg, setup=a.setup)
     opts["simulated"] = bool(a.now)
     res = evaluate(chart, now, **opts)
     if a.write:
@@ -1527,15 +2199,17 @@ def cmd_watch(a):
     start = parse_now(a.now, market=market) if a.now else None
     if a.offline or start is not None:
         if start is None:
-            start = _load(a, sym, None, market=market, cfg=cfg)[1]
+            start = _load(a, sym, None, market=market, cfg=cfg, setup=a.setup)[1]
         clock = SimClock(start)
         now_fn, sleep_fn = clock.now, clock.sleep
     else:
         now_fn, sleep_fn = utc_now, _sleep
     real_today = to_local(utc_now(), market=market).date()
+    daily = getattr(a, "daily", None)
 
     def provider(now):
-        return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today, market=market, cfg=cfg, now=now)
+        return get_chart(sym, a.interval, to_local(now, market=market).date(), a.offline, real_today,
+                         market=market, cfg=cfg, now=now, setup=a.setup, daily=daily)
 
     until = None
     if a.until:
@@ -1587,7 +2261,7 @@ def cmd_watchlist(a):
                 raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
             if i and not a.offline:
                 _sleep(PAUSE)
-            chart, when = _load(a, sym, now, market=item_market, cfg=cfg)
+            chart, when = _load(a, sym, now, market=item_market, cfg=cfg, setup=a.setup)
             o["simulated"] = bool(a.now)
             rows.append((sym, evaluate(chart, when, **o), None))
         except EntryError as e:
@@ -1626,7 +2300,7 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", default="orb",
-                       help="entry setup: orb, level, ma_crossover, trend, rsi_momentum, or options_orb")
+                       help="entry setup: orb, level, breakout_20d, ma_crossover, trend, rsi_momentum, or options_orb")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
@@ -1634,6 +2308,7 @@ def main(argv=None):
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this market time, e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
+        p.add_argument("--daily", metavar="PATH", help="saved 1d daily history JSON (.json/.json.gz) or folder (--setup breakout_20d)")
         p.add_argument("--config", default="trader/config.json")
         p.add_argument("--market", choices=["US", "IN"], help="market profile (US or IN)")
         p.add_argument("--trading-style", choices=["intraday", "positional"], default=None,

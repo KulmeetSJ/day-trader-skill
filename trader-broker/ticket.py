@@ -60,6 +60,10 @@ ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions")
+FINGERPRINT_FIELDS = ALPACA_FIELDS + (
+    "market", "currency", "trading_style", "product", "multi_session_protection",
+)
+PAPER_MULTI_SESSION_BROKERS = ("paper", "paper_in", "simulated", "mock")
 STRING_FIELDS = ("qty", "notional", "limit_price", "stop_price", "trail_price", "trail_percent",
                  "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price")
 TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at the open",
@@ -319,9 +323,56 @@ def rec_day(rec):
 
 def fingerprint(order):
     """Same function as trader-risk/check.py: identifies the exact order."""
-    core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    core = {k: order[k] for k in FINGERPRINT_FIELDS if k in order and order[k] is not None}
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def is_positional_gtt(order):
+    return str(order.get("order_class") or "").strip().lower() == "gtt_oco"
+
+
+def positional_order_issue(order, cfg=None, market=None):
+    """Return an explicit reason if a positional entry order violates multi-session safety rules."""
+    side = str(order.get("side") or "").strip().lower()
+    oc = str(order.get("order_class") or "").strip().lower()
+    plan = order.get("plan") or {}
+    style = str(order.get("trading_style") or plan.get("trading_style") or "").strip().lower()
+    flat_p = str(plan.get("flat_by") or "").strip().lower()
+    is_pos = (style == "positional" or oc == "gtt_oco" or (flat_p == "positional" and side != "sell"))
+    if not is_pos:
+        return None
+    if side == "sell" and oc != "gtt_oco":
+        return None
+    tif = str(order.get("time_in_force") or "").strip().lower()
+    if tif == "day":
+        return "positional order must not use intraday time_in_force='day'; use 'gtc' with gtt_oco"
+    if tif != "gtc":
+        return "positional order requires time_in_force='gtc', got %r" % tif
+    if oc == "bracket":
+        return "positional order must not inherit intraday order_class='bracket'; use 'gtt_oco'"
+    if oc != "gtt_oco":
+        return "positional order requires order_class='gtt_oco', got %r" % (oc or None)
+    eff_market = str(market or order.get("market") or (cfg or {}).get("market") or "US").upper()
+    if eff_market != "IN":
+        return "positional GTT OCO orders are supported only in Indian paper mode (market='IN')"
+    c = cfg or {}
+    if not bool(c.get("paper", True)):
+        return "positional GTT OCO orders are supported in paper mode only (paper=true)"
+    if c.get("broker_supports_multi_session") is False or c.get("supports_multi_session_protection") is False:
+        return "configured broker/schema disables multi-session protection"
+    broker = str(c.get("broker") or ("paper" if eff_market == "IN" else "alpaca")).strip().lower()
+    if broker not in PAPER_MULTI_SESSION_BROKERS:
+        return "broker %r cannot safely represent multi-session GTT OCO protection; use broker='paper'" % broker
+    product = str(order.get("product") or "").strip().upper()
+    if product not in ("CNC", "NRML"):
+        return "positional order must declare product 'CNC' or 'NRML', got %r" % order.get("product")
+    prot = order.get("multi_session_protection")
+    if not isinstance(prot, dict) or prot.get("persists_across_sessions") is not True:
+        return "positional order is missing multi_session_protection with persists_across_sessions=true"
+    if order.get("take_profit_limit_price") is None or order.get("stop_loss_stop_price") is None:
+        return "positional GTT OCO order requires both stop_loss_stop_price and take_profit_limit_price"
+    return None
 
 
 def _str_num(v):
@@ -341,11 +392,10 @@ def _f(x):
 
 
 def tool_input(order):
-    """The exact arguments for place_stock_order: Alpaca's parameter names,
-    numbers as strings (its signature types qty, notional and prices as str).
-    "why" and "plan" are ours and are never sent."""
+    """The exact arguments for place_stock_order (or paper GTT OCO payload for positional Indian orders)."""
     out = {}
-    for k in ALPACA_FIELDS:
+    fields = FINGERPRINT_FIELDS if is_positional_gtt(order) else ALPACA_FIELDS
+    for k in fields:
         if k in order and order[k] is not None:
             out[k] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
     return out
@@ -396,13 +446,17 @@ def plain_parts(order, market=None):
     typ = str(order.get("type", "market"))
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
     contracts = order.get("contracts")
-    if is_bracket(order):
+    if is_bracket(order) or is_positional_gtt(order):
         how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
         if contracts:
             qty_desc = "%s (%s contract%s)" % (_str_num(order.get("qty")), contracts, "" if contracts == 1 else "s")
         else:
             qty_desc = _str_num(order.get("qty"))
-        parts = ["%s %s %s, %s, %s" % (side, qty_desc, sym, how, tif)]
+        if is_positional_gtt(order):
+            prod = order.get("product", "CNC")
+            parts = ["%s %s %s, %s, %s, %s delivery (GTT OCO across sessions)" % (side, qty_desc, sym, how, tif, prod)]
+        else:
+            parts = ["%s %s %s, %s, %s" % (side, qty_desc, sym, how, tif)]
         if order.get("stop_loss_stop_price") is not None:
             leg = "stop-loss %s" % _p(order["stop_loss_stop_price"])
             if order.get("stop_loss_limit_price") is not None:
@@ -630,8 +684,11 @@ def risk_verdict(risk, fp, today):
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
-def status_of(order, risk, state, today):
+def status_of(order, risk, state, today, cfg=None, market=None):
     """(ready, label, risk_result)"""
+    issue = positional_order_issue(order, cfg=cfg, market=market)
+    if issue:
+        return False, "BLOCKED positional check: " + issue, None
     fp = fingerprint(order)
     rv, why = risk_verdict(risk, fp, today)
     if rv is None:
@@ -654,15 +711,192 @@ def kind_of(order, rv):
     return "entry" if str(order.get("side", "")).lower() == "buy" else "exit"
 
 
+# ---------------------------------------------------------------- signal provenance
+
+SIGNAL_PROVENANCE_KEYS = (
+    "provider", "data_tier", "data_status", "is_historical_analysis",
+    "is_live_signal", "is_live_data", "is_fixture", "is_simulated",
+    "is_market_open", "last_trading_session", "last_data_timestamp",
+    "signal_freshness", "candle_session", "simulated_at",
+)
+
+
+def _meta_sources(order, doc=None, risk=None, rv=None):
+    sources = []
+    if isinstance(order, dict):
+        sources.append(order)
+        if isinstance(order.get("plan"), dict):
+            sources.append(order["plan"])
+    for extra in (rv, doc, risk):
+        if isinstance(extra, dict):
+            sources.append(extra)
+    return sources
+
+
+def _first_meta(key, sources):
+    for src in sources:
+        if key in src and src[key] is not None:
+            return src[key]
+    return None
+
+
+def signal_provenance(order, doc=None, risk=None, rv=None, today=None, simulated_at=None, last_data_timestamp=None):
+    """Extract and safely classify signal provenance (historical, delayed, fixture, simulated, live, or unverified).
+
+    Delayed/Yahoo, historical, fixture, simulated, and missing/incomplete metadata are NEVER marked as live.
+    """
+    sources = _meta_sources(order, doc=doc, risk=risk, rv=rv)
+    provider = _first_meta("provider", sources)
+    if provider in (None, ""):
+        for src in sources:
+            src_val = src.get("source")
+            if isinstance(src_val, str) and src_val.strip().lower() in ("yahoo", "offline", "simulated", "fixture"):
+                src_l = src_val.strip().lower()
+                provider = "offline" if src_l == "fixture" else src_l
+                break
+    provider = str(provider).strip() if provider not in (None, "") else None
+    prov_l = provider.lower() if provider else ""
+
+    raw_tier = _first_meta("data_tier", sources)
+    tier_u = str(raw_tier).strip().upper() if raw_tier not in (None, "") else ""
+    raw_status = _first_meta("data_status", sources)
+    status_l = str(raw_status).strip().lower() if raw_status not in (None, "") else ""
+    raw_hist = _first_meta("is_historical_analysis", sources)
+    raw_live_sig = _first_meta("is_live_signal", sources)
+    raw_live_data = _first_meta("is_live_data", sources)
+    raw_fixture = _first_meta("is_fixture", sources)
+    raw_sim = _first_meta("is_simulated", sources)
+    opt_c = _first_meta("option_contract", sources)
+    raw_market_open = _first_meta("is_market_open", sources)
+    last_session = _first_meta("last_trading_session", sources)
+    freshness = _first_meta("signal_freshness", sources)
+    candle_session = _first_meta("candle_session", sources)
+    sim_val = simulated_at or _first_meta("simulated_at", sources)
+    lts_val = last_data_timestamp or _first_meta("last_data_timestamp", sources)
+
+    fresh_l = str(freshness or "").strip().lower()
+    is_yahoo = (prov_l == "yahoo")
+    is_fixture = bool(raw_fixture) or (tier_u == "FIXTURE") or (prov_l == "offline")
+    opt_sim = isinstance(opt_c, dict) and (
+        bool(opt_c.get("is_simulated")) or str(opt_c.get("tier") or "").strip().upper() == "SIMULATED"
+    )
+    order_sim = isinstance(order, dict) and str(order.get("tier") or "").strip().upper() == "SIMULATED"
+    is_simulated = bool(raw_sim) or (tier_u == "SIMULATED") or (prov_l == "simulated") or opt_sim or order_sim
+    is_historical = bool(raw_hist) or (tier_u == "HISTORICAL") or (status_l == "historical") or (fresh_l == "historical")
+
+    session_date = str(candle_session or last_session or (str(lts_val)[:10] if lts_val else "") or "").strip()
+    is_prior_session = bool(today and re.match(r"^\d{4}-\d{2}-\d{2}$", session_date) and session_date < today)
+
+    is_live_data_out = bool(raw_live_data) if raw_live_data is not None else None
+    is_fixture_out = True if is_fixture else (bool(raw_fixture) if raw_fixture is not None else None)
+    is_sim_out = True if is_simulated else (bool(raw_sim) if raw_sim is not None else None)
+
+    if is_fixture:
+        classification = "FIXTURE"
+        data_tier = "FIXTURE"
+        is_hist_out = bool(is_historical)
+        is_live_sig = False
+        if is_live_data_out is not None or raw_live_data:
+            is_live_data_out = False
+        warning = "FIXTURE SIGNAL (OFFLINE REPLAY) -- NOT A CURRENT ENTRY RECOMMENDATION"
+    elif is_simulated:
+        classification = "SIMULATED"
+        data_tier = "SIMULATED"
+        is_hist_out = bool(is_historical)
+        is_live_sig = False
+        if is_live_data_out is not None or raw_live_data:
+            is_live_data_out = False
+        warning = "SIMULATED SIGNAL -- SYNTHETIC / ANALYTICAL DATA ONLY, NOT A CURRENT ENTRY RECOMMENDATION"
+    elif is_historical or (is_prior_session and (tier_u == "CURRENT" or raw_live_sig is True)):
+        classification = "HISTORICAL"
+        data_tier = "HISTORICAL"
+        is_hist_out = True
+        is_live_sig = False
+        is_live_data_out = False
+        warning = "HISTORICAL SIGNAL -- NOT A CURRENT ENTRY RECOMMENDATION"
+    elif is_yahoo or tier_u == "DELAYED" or status_l == "delayed":
+        classification = "DELAYED"
+        data_tier = "DELAYED"
+        is_hist_out = False
+        is_live_sig = False
+        is_live_data_out = False
+        warning = "DELAYED SIGNAL (%s) -- DELAYED MARKET DATA, NOT A LIVE REAL-TIME ENTRY" % (provider or "delayed feed")
+    elif (
+        tier_u == "CURRENT"
+        and raw_live_sig is True
+        and prov_l not in ("", "unknown", "none", "yahoo", "offline", "simulated", "fixture")
+        and raw_live_data is not False
+        and raw_market_open is not False
+        and not is_prior_session
+    ):
+        classification = "LIVE"
+        data_tier = "CURRENT"
+        is_hist_out = False
+        is_live_sig = True
+        if is_live_data_out is None:
+            is_live_data_out = True
+        warning = None
+    else:
+        classification = "UNVERIFIED"
+        data_tier = tier_u if (tier_u and tier_u != "CURRENT") else "UNKNOWN"
+        is_hist_out = bool(is_historical)
+        is_live_sig = False
+        if tier_u == "CURRENT" or is_yahoo:
+            is_live_data_out = False
+        warning = "UNVERIFIED SIGNAL PROVENANCE -- MISSING OR INCOMPLETE METADATA; NOT TREATED AS LIVE"
+
+    return {
+        "provider": provider,
+        "data_tier": data_tier,
+        "is_historical_analysis": is_hist_out,
+        "is_live_signal": is_live_sig,
+        "is_live_data": is_live_data_out,
+        "is_fixture": is_fixture_out,
+        "is_simulated": is_sim_out,
+        "is_market_open": bool(raw_market_open) if raw_market_open is not None else None,
+        "data_status": raw_status,
+        "last_trading_session": last_session,
+        "signal_freshness": freshness,
+        "candle_session": candle_session,
+        "simulated_at": sim_val,
+        "last_data_timestamp": lts_val,
+        "signal_classification": classification,
+        "signal_warning": warning,
+    }
+
+
+def _signal_summary_line(prov):
+    details = [
+        "tier=%s" % prov["data_tier"],
+        "provider=%s" % (prov["provider"] or "unknown"),
+        "live_signal=%s" % ("yes" if prov["is_live_signal"] else "no"),
+    ]
+    if prov.get("signal_freshness"):
+        details.append("freshness=%s" % prov["signal_freshness"])
+    if prov.get("last_trading_session"):
+        details.append("session=%s" % prov["last_trading_session"])
+    if prov.get("last_data_timestamp"):
+        details.append("last_data=%s" % prov["last_data_timestamp"])
+    if prov.get("simulated_at"):
+        details.append("simulated_at=%s" % prov["simulated_at"])
+    return "  signal [%s]: %s" % (prov["signal_classification"], ", ".join(details))
+
+
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today, market="US"):
-    ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+def render(order, idx, total, cfg, risk, state, today, market="US", doc=None, simulated_at=None, last_data_timestamp=None):
+    ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
+    prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
+                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp)
+    default_broker = "paper" if market == "IN" else "alpaca"
+    broker = str(cfg.get("broker", default_broker)).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
     broker_name = "Interactive Brokers" if broker == "ibkr" else ("Paper Broker (NSE/BSE)" if market == "IN" else "Alpaca")
     lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, broker_name)]
+    if prov.get("signal_warning"):
+        lines.append("  WARNING: " + prov["signal_warning"])
+    lines.append(_signal_summary_line(prov))
     for part in plain_parts(order, market=market):
         lines.append("  " + part)
     if order.get("why"):
@@ -673,6 +907,13 @@ def render(order, idx, total, cfg, risk, state, today, market="US"):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    elif is_positional_gtt(order):
+        lines.append("  Paper broker positional GTT OCO payload (simulated CNC/NRML delivery; persists across sessions):")
+        for l in json.dumps(tool_input(order), indent=2).splitlines():
+            lines.append("    " + l)
+        lines.append("  Paper broker arms GTT OCO stop-loss (%s) and take-profit (%s) across sessions under product %s."
+                     % (order.get("stop_loss_stop_price"), order.get("take_profit_limit_price"),
+                        order.get("product", "CNC")))
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -684,20 +925,39 @@ def render(order, idx, total, cfg, risk, state, today, market="US"):
                 lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
                 lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
-        lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
-        if broker != "ibkr":
-            lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
+        if is_positional_gtt(order):
+            lines.append("  Reply \"yes\" to record paper approval for this positional GTT OCO order, or \"no\" to skip it.")
+            lines.append("  Simulated paper mode only: no live broker execution occurs.")
+        else:
+            lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
+            if broker != "ibkr":
+                lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today, market="US", simulated_at=None, last_data_timestamp=None):
-    ready, label, rv = status_of(order, risk, state, today)
+def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None, simulated_at=None, last_data_timestamp=None):
+    ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
+    prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
+                             simulated_at=simulated_at, last_data_timestamp=last_data_timestamp)
     loss, stop = max_loss(order)
+    default_broker = "paper" if market == "IN" else "alpaca"
     res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
            "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-           "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+           "broker": cfg.get("broker", default_broker),
+           "tool": "paper_gtt_oco" if is_positional_gtt(order) else "place_stock_order",
            "tool_input": tool_input(order), "why": order.get("why", ""),
-           "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+           "bracket": is_bracket(order), "max_loss": loss, "stop": stop,
+           "data_tier": prov["data_tier"],
+           "is_historical_analysis": prov["is_historical_analysis"],
+           "is_live_signal": prov["is_live_signal"],
+           "provider": prov["provider"],
+           "signal_classification": prov["signal_classification"],
+           "signal_warning": prov["signal_warning"]}
+    if is_positional_gtt(order):
+        res["positional"] = True
+        res["trading_style"] = order.get("trading_style", "positional")
+        res["product"] = order.get("product")
+        res["multi_session_protection"] = order.get("multi_session_protection")
     if market == "IN":
         res["market"] = "IN"
         res["currency"] = "INR"
@@ -709,14 +969,14 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US", simulated_at=N
         res["lot_size"] = order["lot_size"]
     if order.get("transaction_costs"):
         res["transaction_costs"] = order["transaction_costs"]
-    sim_val = simulated_at or order.get("simulated_at")
-    if sim_val:
-        res["simulated_at"] = sim_val
-    lts_val = last_data_timestamp or order.get("last_data_timestamp") or (
-        order.get("plan").get("last_data_timestamp") if isinstance(order.get("plan"), dict) else None
-    )
-    if lts_val:
-        res["last_data_timestamp"] = lts_val
+    for pk in ("is_live_data", "is_fixture", "is_simulated", "is_market_open",
+               "data_status", "last_trading_session", "signal_freshness", "candle_session"):
+        if prov.get(pk) is not None:
+            res[pk] = prov[pk]
+    if prov.get("simulated_at"):
+        res["simulated_at"] = prov["simulated_at"]
+    if prov.get("last_data_timestamp"):
+        res["last_data_timestamp"] = prov["last_data_timestamp"]
     return res
 
 
@@ -885,12 +1145,15 @@ def cmd_show(a):
         out = []
         for i, o in picks:
             sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
-            out.append(ticket_json(o, i, cfg, risk, state, today, market=market, simulated_at=sim_at, last_data_timestamp=lts))
+            out.append(ticket_json(o, i, cfg, risk, state, today, market=market, doc=doc,
+                                   simulated_at=sim_at, last_data_timestamp=lts))
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
     for i, o in picks:
-        text, ready = render(o, i, len(orders), cfg, risk, state, today, market=market)
+        sim_at, lts = _meta_context(doc, orders, o, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
+        text, ready = render(o, i, len(orders), cfg, risk, state, today, market=market, doc=doc,
+                             simulated_at=sim_at, last_data_timestamp=lts)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -904,7 +1167,7 @@ def cmd_approve(a):
     order = _pick(orders, a.index)
     doc = read_json(a.orders, "orders file", required=False)
     sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
@@ -912,11 +1175,19 @@ def cmd_approve(a):
         print("Not recorded: %s. Ask the user again with the ticket for order %d." % (why, a.index))
         return 1
     loss, stop = max_loss(order)
+    prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
+                             simulated_at=sim_at, last_data_timestamp=lts)
+    default_broker = "paper" if market == "IN" else "alpaca"
     rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fingerprint(order),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order, market=market), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", default_broker),
+           "data_tier": prov["data_tier"],
+           "is_historical_analysis": prov["is_historical_analysis"],
+           "is_live_signal": prov["is_live_signal"],
+           "provider": prov["provider"],
+           "signal_classification": prov["signal_classification"]}
     if market == "IN":
         rec["market"] = "IN"
         rec["currency"] = "INR"
@@ -930,6 +1201,10 @@ def cmd_approve(a):
     print("Recorded your yes for order %d: %s." % (a.index, plain(order, market=market)))
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    elif is_positional_gtt(order):
+        print("Positional paper GTT OCO payload (stop-loss and target remain active across sessions):")
+        print(json.dumps(tool_input(order), indent=2))
+        print("Then record fill/status: ticket.py result --index %d --status placed|denied|failed" % a.index)
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -1012,8 +1287,11 @@ def cmd_result(a):
         if a.status == "placed":
             print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
                   % (rec["symbol"], rec["side"]))
-            if rec.get("kind") == "entry" and is_bracket(order):
-                print("When the stop-loss or the take-profit fills later, record that sell the same way.")
+            if rec.get("kind") == "entry" and (is_bracket(order) or is_positional_gtt(order)):
+                if is_positional_gtt(order):
+                    print("GTT OCO stop-loss and target triggers remain armed across sessions; record any exit sell fill with ticket.py fill.")
+                else:
+                    print("When the stop-loss or the take-profit fills later, record that sell the same way.")
     return 0
 
 
@@ -1068,9 +1346,14 @@ def cmd_flatten(a):
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     default_flat = "15:20" if market == "IN" else "15:55"
     time_label = "IST" if market == "IN" else "New York"
-    flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or default_flat
-    why_text = "flat by %s %s: closes the %s day trade before the close (qty from %s)" % (flat_by, time_label, sym, source)
+    plan_for_sym = plan if (isinstance(plan, dict) and str(plan.get("symbol", "")).upper() == sym) else {}
+    flat_by = plan_for_sym.get("flat_by") or cfg.get("flat_by") or default_flat
+    is_positional_plan = (str(plan_for_sym.get("trading_style") or "").lower() == "positional"
+                          or str(flat_by).lower() == "positional")
+    if is_positional_plan:
+        why_text = "closes the %s positional position at market (cancel any open GTT OCO triggers first; qty from %s)" % (sym, source)
+    else:
+        why_text = "flat by %s %s: closes the %s day trade before the close (qty from %s)" % (flat_by, time_label, sym, source)
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
              "why": why_text}
     if market == "IN":
@@ -1093,7 +1376,10 @@ def cmd_flatten(a):
     if lts:
         doc["last_data_timestamp"] = lts
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order, market=market), flat_by, time_label))
+    if is_positional_plan:
+        print("Close %s: %s (positional exit)." % (sym, plain(order, market=market)))
+    else:
+        print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order, market=market), flat_by, time_label))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:

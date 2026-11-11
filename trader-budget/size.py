@@ -103,6 +103,13 @@ DEFAULTS = {
     "pdt_guard": False,
 }
 
+PROVENANCE_KEYS = (
+    "is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
+    "is_fixture", "data_tier", "last_trading_session", "last_data_timestamp",
+    "data_status", "is_simulated", "provider", "signal_freshness",
+    "simulated_at", "candle_session",
+)
+
 
 REGULATORY_SCHEDULES = {
     # Key is effective start date (YYYY-MM-DD)
@@ -211,7 +218,7 @@ def calculate_indian_transaction_charges(
     - GST: 18% on (Exchange Charges + SEBI Charges + Brokerage)
     
     Brokerage Estimate (Segregated from statutory levies):
-    - Discount broker model: min(Rs 20, 0.03%) per order for intraday/futures, Rs 20 flat for options, Rs 0 delivery.
+    - Discount broker model: min(Rs 20, 0.03%) per order for intraday/futures, Rs 20 flat per order for options, Rs 40 per buy/sell order (Rs 80 round-trip) for positional/delivery equity.
     """
     entry_val = float(entry_price or 0.0) * float(qty or 0)
     exit_val = float(exit_price or entry_price or 0.0) * float(qty or 0)
@@ -246,11 +253,11 @@ def calculate_indian_transaction_charges(
             "profitability_impact": empty_pnl,
         }
 
-    # Brokerage (Estimated discount broker tariff, not official exchange charge)
+    # Brokerage (Estimated tariff, not official exchange charge)
     if asset == "OPTIONS":
         brokerage = 40.0  # Rs 20 on buy + Rs 20 on sell
     elif style == "positional" and asset == "EQUITY":
-        brokerage = 0.0   # Free delivery brokerage standard model
+        brokerage = 80.0  # Rs 40 on buy + Rs 40 on sell (positional/delivery equity)
     else:
         brokerage = min(20.0, round(0.0003 * entry_val, 2)) + min(20.0, round(0.0003 * exit_val, 2))
 
@@ -325,12 +332,19 @@ def calculate_indian_transaction_charges(
         "rates_source": "Statutory levies: STT (Finance Act), NSE Txn (Circular 2026), Stamp Duty, SEBI",
     }
 
+    if style == "positional" and asset == "EQUITY":
+        brokerage_model = "Positional/Delivery equity tariff (Rs 40 per buy/sell order)"
+    elif asset == "OPTIONS":
+        brokerage_model = "Standard discount broker model (Rs 20 flat per order)"
+    else:
+        brokerage_model = "Standard discount broker model (Rs 20 flat / max 0.03%)"
+
     brokerage_estimate = {
         "brokerage": brokerage,
         "gst": gst_brokerage,
         "total": brokerage_total,
         "is_estimate": True,
-        "model": "Standard discount broker model (Rs 20 flat / max 0.03%)",
+        "model": brokerage_model,
         "disclaimer": "Brokerage is an estimate and varies by broker. Not an official exchange charge.",
     }
 
@@ -689,7 +703,54 @@ def money(x, market="US"):
 
 # ---------------------------------------------------------------- plan mode (the default)
 
-def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None, instruments_path=None):
+PAPER_MULTI_SESSION_BROKERS = ("paper", "paper_in", "simulated", "mock")
+
+
+def validate_positional_support(cfg, market="IN", asset_type="EQUITY", stop=None, target=None):
+    """Validate that configured paper broker/schema safely supports cross-session protection.
+
+    Raises SizeError when the broker/schema cannot represent multi-session stop-loss and
+    take-profit protection rather than generating a misleading intraday day/bracket order.
+    """
+    raw = cfg or {}
+    eff_market = str(market or "US").upper()
+    if eff_market != "IN":
+        raise SizeError(
+            "positional multi-session protection is currently supported only in Indian paper mode "
+            "(market='IN', broker='paper'); %s %r broker schema cannot safely represent cross-session GTT OCO"
+            % (eff_market, raw.get("broker", "alpaca"))
+        )
+    if not bool(raw.get("paper", True)):
+        raise SizeError(
+            "positional multi-session GTT OCO orders are supported in paper mode only (paper=true); "
+            "refusing to generate a live positional order"
+        )
+    if raw.get("broker_supports_multi_session") is False or raw.get("supports_multi_session_protection") is False:
+        raise SizeError(
+            "configured broker/schema disables multi-session protection "
+            "(broker_supports_multi_session=false); cannot generate a misleading positional order"
+        )
+    broker = str(raw.get("broker") or "paper").strip().lower()
+    if broker not in PAPER_MULTI_SESSION_BROKERS:
+        raise SizeError(
+            "broker %r cannot safely represent Indian positional multi-session GTT OCO protection; "
+            "use broker='paper' with paper=true" % broker
+        )
+    if stop is None or target is None or float(stop) <= 0 or float(target) <= 0:
+        raise SizeError(
+            "positional orders require valid stop-loss and take-profit levels to arm multi-session GTT OCO protection"
+        )
+    product = "CNC" if str(asset_type or "EQUITY").upper() == "EQUITY" else "NRML"
+    return {
+        "broker": broker,
+        "paper": True,
+        "product": product,
+        "order_class": "gtt_oco",
+        "time_in_force": "gtc",
+    }
+
+
+def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None, instruments_path=None, trading_style=None):
     """Pure function: one plan + your rules -> the sizing (a dict). qty may be 0.
 
     limit  the limit price for a limit order (None = market)
@@ -893,7 +954,24 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
                        % (qty, "" if qty == 1 else "s", sym, money(cost, market=market), money(min_order, market=market)))
 
-    trading_style = plan.get("trading_style") or c.get("trading_style") or "intraday"
+    plan_style = str(plan.get("trading_style") or "").strip().lower()
+    plan_flat = str(plan.get("flat_by") or "").strip().lower()
+    if trading_style is None and plan_style == "intraday" and plan_flat == "positional":
+        raise SizeError(
+            "conflicting plan metadata: trading_style='intraday' conflicts with flat_by='positional'; "
+            "pass --trading-style explicitly or regenerate trader/plan.json"
+        )
+    raw_style = trading_style or plan_style or ("positional" if plan_flat == "positional" else None) or c.get("trading_style") or "intraday"
+    resolved_style = str(raw_style).strip().lower()
+    if resolved_style not in ("intraday", "positional"):
+        raise SizeError("unsupported trading_style %r; use 'intraday' or 'positional'" % raw_style)
+    if resolved_style == "positional":
+        resolved_flat_by = "positional"
+        pos_cap = validate_positional_support(c, market=market, asset_type=asset_type, stop=stop, target=target)
+    else:
+        resolved_flat_by = plan.get("flat_by") if (plan.get("flat_by") and plan_flat != "positional") else (c.get("flat_by") or ("15:20" if market == "IN" else "15:55"))
+        pos_cap = None
+    trading_style = resolved_style
     res = {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
@@ -903,10 +981,20 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "currency": "INR" if market == "IN" else "USD",
         "max_loss_per_trade": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
-        "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
+        "cost": cost, "max_loss": loss, "flat_by": resolved_flat_by,
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
         "asset_type": asset_type, "trading_style": trading_style,
     }
+    if pos_cap:
+        res["product"] = pos_cap["product"]
+        res["broker"] = pos_cap["broker"]
+        res["paper"] = pos_cap["paper"]
+    elif market == "IN":
+        res["product"] = "MIS"
+        res["broker"] = str(c.get("broker") or "paper").strip().lower()
+        res["paper"] = bool(c.get("paper", True))
+    if "broker_supports_multi_session" in c or "supports_multi_session_protection" in c:
+        res["broker_supports_multi_session"] = c.get("broker_supports_multi_session", c.get("supports_multi_session_protection"))
     if market != "IN":
         res["max_loss_per_trade_usd"] = max_loss
     if plan.get("option_contract"):
@@ -929,23 +1017,22 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             trading_style=trading_style,
             as_of_date=today,
         )
-    for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
-              "data_tier", "last_trading_session", "last_data_timestamp", "data_status",
-              "is_simulated", "provider", "simulated_at"):
+    for k in PROVENANCE_KEYS:
         if k in plan:
             res[k] = plan[k]
     return res
 
 
-def bracket_order(s):
-    """The one proposed order, Alpaca/broker place_stock_order fields (strings) plus why and plan."""
+def build_order(s, cfg=None):
+    """Build the proposed order for intraday bracket or Indian positional GTT OCO trading."""
     if s["refusal"] or s["qty"] <= 0:
         return None
     market = s.get("market", "US")
-    o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
-         "time_in_force": "day"}
-    if s["order_type"] == "limit":
-        o["limit_price"] = _price(s["entry"])
+    asset_type = str(s.get("asset_type") or "EQUITY").upper()
+    style = str(s.get("trading_style") or ("positional" if str(s.get("flat_by") or "").lower() == "positional" else "intraday")).strip().lower()
+    if style not in ("intraday", "positional"):
+        raise SizeError("unsupported trading_style %r; use 'intraday' or 'positional'" % style)
+
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
     max_loss_limit = s.get("max_loss_per_trade") if s.get("max_loss_per_trade") is not None else s.get("max_loss_per_trade_usd")
     max_loss_how = "%s max loss per trade" % money(max_loss_limit or 0, market=market)
@@ -954,15 +1041,76 @@ def bracket_order(s):
                                              "position cap": "position cap", "max order": "max order",
                                              "cash": "cash after the buffer"}.get(s["bound_by"], s["bound_by"]),
               s["qty"], _price(s["risk_per_share"]), money(s["max_loss"], market=market)))
-    o.update({
-        "order_class": "bracket",
-        "take_profit_limit_price": _price(s["target"]),
-        "stop_loss_stop_price": _price(s["stop"]),
-        "why": why,
-        "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
-                 "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
-                 "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
-    })
+
+    if style == "positional":
+        eff_cfg = cfg if cfg is not None else {
+            "broker": s.get("broker", "paper" if market == "IN" else "alpaca"),
+            "paper": s.get("paper", True),
+            "broker_supports_multi_session": s.get("broker_supports_multi_session", True),
+        }
+        pos_spec = validate_positional_support(
+            eff_cfg, market=market, asset_type=asset_type, stop=s.get("stop"), target=s.get("target")
+        )
+        product = s.get("product") or pos_spec["product"]
+        protection = {
+            "type": "gtt_oco",
+            "product": product,
+            "time_in_force": "gtc",
+            "persists_across_sessions": True,
+            "triggers": {
+                "stop_loss": _price(s["stop"]),
+                "take_profit": _price(s["target"]),
+            },
+            "note": (
+                "Paper GTT OCO (%s): stop-loss %s and take-profit %s remain active across sessions "
+                "until triggered, canceled, or manually exited."
+                % (product, _price(s["stop"]), _price(s["target"]))
+            ),
+        }
+        o = {
+            "symbol": s["symbol"],
+            "side": "buy",
+            "qty": str(int(s["qty"])),
+            "type": s["order_type"],
+            "time_in_force": "gtc",
+        }
+        if s["order_type"] == "limit":
+            o["limit_price"] = _price(s["entry"])
+        o.update({
+            "order_class": "gtt_oco",
+            "product": product,
+            "trading_style": "positional",
+            "take_profit_limit_price": _price(s["target"]),
+            "stop_loss_stop_price": _price(s["stop"]),
+            "multi_session_protection": protection,
+            "why": why,
+            "plan": {
+                "entry": s["entry"], "stop": s["stop"], "target": s["target"],
+                "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"],
+                "setup": s["setup"], "entry_time": s["entry_time"],
+                "flat_by": "positional", "trading_style": "positional", "product": product,
+            },
+        })
+    else:
+        o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
+             "time_in_force": "day"}
+        if s["order_type"] == "limit":
+            o["limit_price"] = _price(s["entry"])
+        o.update({
+            "order_class": "bracket",
+            "take_profit_limit_price": _price(s["target"]),
+            "stop_loss_stop_price": _price(s["stop"]),
+            "why": why,
+            "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
+                     "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
+                     "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
+        })
+        if market == "IN":
+            o["trading_style"] = "intraday"
+            o["product"] = s.get("product") or "MIS"
+            o["plan"]["trading_style"] = "intraday"
+            o["plan"]["product"] = o["product"]
+
     if s.get("asset_type") and s["asset_type"] != "EQUITY":
         o["asset_type"] = s["asset_type"]
         o["plan"]["asset_type"] = s["asset_type"]
@@ -974,9 +1122,6 @@ def bracket_order(s):
     if s.get("option_contract"):
         o["option_contract"] = s["option_contract"]
         o["plan"]["option_contract"] = s["option_contract"]
-    if s.get("trading_style") and s["trading_style"] != "intraday":
-        o["trading_style"] = s["trading_style"]
-        o["plan"]["trading_style"] = s["trading_style"]
     if s.get("transaction_costs"):
         o["transaction_costs"] = s["transaction_costs"]
         o["plan"]["transaction_costs"] = s["transaction_costs"]
@@ -984,13 +1129,16 @@ def bracket_order(s):
         o["market"] = "IN"
         o["currency"] = "INR"
         o["plan"]["market"] = "IN"
-    for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
-              "data_tier", "last_trading_session", "last_data_timestamp", "data_status",
-              "is_simulated", "provider", "simulated_at"):
+    for k in PROVENANCE_KEYS:
         if k in s:
             o[k] = s[k]
             o["plan"][k] = s[k]
     return o
+
+
+def bracket_order(s, cfg=None):
+    """Backward-compatible entry point returning the style-appropriate proposed order."""
+    return build_order(s, cfg=cfg)
 
 
 def plan_report(s, order, notes=()):
@@ -1041,14 +1189,30 @@ def plan_report(s, order, notes=()):
                         money(tc["brokerage"], market=market)))
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
-    lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
+    is_positional = (
+        str(order.get("trading_style") or "").lower() == "positional"
+        or str(order.get("order_class") or "").lower() == "gtt_oco"
+        or str(s.get("trading_style") or "").lower() == "positional"
+    )
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
-    lines.append("  buy %s %s, %s, day, take-profit %s, stop-loss %s"
-                 % (order["qty"], order["symbol"], how, order["take_profit_limit_price"],
-                    order["stop_loss_stop_price"]))
-    if s["flat_by"]:
-        lines.append("Flat by %s %s: anything still open then gets closed (trader-alerts rings, "
-                     "trader-broker flatten)." % (s["flat_by"], tz_label))
+    if is_positional:
+        prod = order.get("product") or s.get("product") or "CNC"
+        tif = order.get("time_in_force", "gtc")
+        lines.append("Proposed positional paper order (GTT OCO multi-session protection, nothing has been placed):")
+        lines.append("  buy %s %s, %s, %s, %s, take-profit %s, stop-loss %s (GTT OCO across sessions)"
+                     % (order["qty"], order["symbol"], how, tif, prod,
+                        order["take_profit_limit_price"], order["stop_loss_stop_price"]))
+        lines.append("Multi-session protection (%s GTT OCO): stop-loss %s and target %s remain active across "
+                     "sessions (no intraday auto-square-off)."
+                     % (prod, order["stop_loss_stop_price"], order["take_profit_limit_price"]))
+    else:
+        lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
+        lines.append("  buy %s %s, %s, %s, take-profit %s, stop-loss %s"
+                     % (order["qty"], order["symbol"], how, order.get("time_in_force", "day"),
+                        order["take_profit_limit_price"], order["stop_loss_stop_price"]))
+        if s["flat_by"] and str(s["flat_by"]).lower() != "positional":
+            lines.append("Flat by %s %s: anything still open then gets closed (trader-alerts rings, "
+                         "trader-broker flatten)." % (s["flat_by"], tz_label))
     lines.append("")
     lines.append("Next: trader-risk checks it, then trader-broker asks you yes or no.")
     lines.append("Education and tooling, not financial advice.")
@@ -1372,6 +1536,22 @@ def write_orders(path, orders, cfg, source="", now_utc=None, simulated_at=None, 
         doc["simulated_at"] = sim_at
     if lts is not None:
         doc["last_data_timestamp"] = lts
+    for k in PROVENANCE_KEYS:
+        if k in ("simulated_at", "last_data_timestamp"):
+            continue
+        vals = []
+        for o in (orders or []):
+            if not isinstance(o, dict):
+                continue
+            val = None
+            if k in o and o[k] is not None:
+                val = o[k]
+            elif isinstance(o.get("plan"), dict) and k in o["plan"] and o["plan"][k] is not None:
+                val = o["plan"][k]
+            if val is not None and all(v != val or type(v) is not type(val) for v in vals):
+                vals.append(val)
+        if len(vals) == 1:
+            doc[k] = vals[0]
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
@@ -1455,7 +1635,9 @@ def run_plan(a, cfg):
     if a.portfolio and os.path.exists(a.portfolio):
         pf = read_json(a.portfolio, "portfolio")
         cash = _f(pf.get("cash")) if isinstance(pf, dict) else None
-    s = size_trade(plan, cfg, a.budget, limit, price, cash, today, market=market, instruments_path=getattr(a, "instruments", None))
+    s = size_trade(plan, cfg, a.budget, limit, price, cash, today, market=market,
+                   instruments_path=getattr(a, "instruments", None),
+                   trading_style=getattr(a, "trading_style", None))
 
     plan_lts_utc = parse_utc(plan.get("last_data_timestamp")) if isinstance(plan, dict) else None
     latest_data_utc = plan_lts_utc
@@ -1467,7 +1649,7 @@ def run_plan(a, cfg):
     if sim_iso is not None:
         s["simulated_at"] = sim_iso
 
-    order = bracket_order(s)
+    order = build_order(s, cfg=cfg)
     if order and a.write:
         src = "trader/plan.json (%s %s %s)" % (s["symbol"], s["setup"] or "plan", s["date"] or today)
         write_orders(a.write, [order], cfg, src, now, simulated_at=sim_iso, last_data_timestamp=s.get("last_data_timestamp"))
@@ -1481,7 +1663,8 @@ def run_plan(a, cfg):
     else:
         print(plan_report(s, order, notes))
         if order and a.write:
-            print("Wrote 1 proposed bracket order to %s" % a.write)
+            kind_lbl = "positional GTT OCO order" if s.get("trading_style") == "positional" else "bracket order"
+            print("Wrote 1 proposed %s to %s" % (kind_lbl, a.write))
     return 0 if order else 1
 
 
@@ -1545,6 +1728,8 @@ def main(argv=None):
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; its cash caps the size if it exists")
     ap.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
+    ap.add_argument("--trading-style", choices=["intraday", "positional"],
+                    help="override trading style (intraday bracket/day vs positional CNC/NRML GTT OCO)")
     ap.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
     ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",

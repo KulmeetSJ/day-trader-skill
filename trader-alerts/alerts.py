@@ -664,6 +664,16 @@ def rules_from_plan(plan, cfg_flat_by=None):
     is_in = str(plan.get("market", "")).upper() in ("IN", "INDIA") or plan.get("currency") == "INR"
     default_flat = "15:20" if is_in else "15:55"
     flat = plan.get("flat_by") or cfg_flat_by or default_flat
+    is_positional = (
+        str(plan.get("trading_style") or "").strip().lower() == "positional"
+        or str(flat).strip().lower() == "positional"
+    )
+    if is_positional:
+        for r in out:
+            r["trading_style"] = "positional"
+            r["multi_session"] = True
+            r["note"] = r["note"] + " (multi-session positional)"
+        return out
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
     out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
