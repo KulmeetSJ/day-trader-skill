@@ -1080,10 +1080,15 @@ def sync_masters(dest_path=DEFAULT_CACHE_PATH, offline_dir=None, exchange="NSE")
                 continue
 
     if not eq_text:
-        fixture_p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures", "bharat", "EQUITY_L_sample.csv")
-        if os.path.isfile(fixture_p):
-            with open(fixture_p, encoding="utf-8", errors="replace") as fh:
-                eq_text = fh.read()
+        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for fixture_p in (
+            os.path.join(pkg_root, "tests", "fixtures", "bharat", "EQUITY_L_sample.csv"),
+            os.path.join(pkg_root, "fixtures", "bharat", "EQUITY_L_sample.csv"),
+        ):
+            if os.path.isfile(fixture_p):
+                with open(fixture_p, encoding="utf-8", errors="replace") as fh:
+                    eq_text = fh.read()
+                break
 
     if eq_text:
         equity_records = parse_equity_l_csv(eq_text, exchange="NSE")
@@ -1111,10 +1116,15 @@ def sync_masters(dest_path=DEFAULT_CACHE_PATH, offline_dir=None, exchange="NSE")
                 continue
 
     if not fo_text:
-        fixture_p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures", "bharat", "fo_mktlots_sample.csv")
-        if os.path.isfile(fixture_p):
-            with open(fixture_p, encoding="utf-8", errors="replace") as fh:
-                fo_text = fh.read()
+        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for fixture_p in (
+            os.path.join(pkg_root, "tests", "fixtures", "bharat", "fo_mktlots_sample.csv"),
+            os.path.join(pkg_root, "fixtures", "bharat", "fo_mktlots_sample.csv"),
+        ):
+            if os.path.isfile(fixture_p):
+                with open(fixture_p, encoding="utf-8", errors="replace") as fh:
+                    fo_text = fh.read()
+                break
 
     if fo_text:
         fo_lots = parse_fo_lots_csv(fo_text)

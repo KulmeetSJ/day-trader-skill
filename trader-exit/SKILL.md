@@ -4,15 +4,18 @@ description: >-
   Exit Planner. Sets your stop and your target before you enter, so you know
   when to get out. Reads the entry from trader-entry (or a price you give),
   puts the stop at the opening-range midpoint by default (or the range low,
-  your price, a percent, or a multiple of the ATR), rounds it down to the
-  cent, and sets the target at 2R (or 1R, or your price). Refuses a stop at or
-  above the entry, a target at or below it, or a stop too tight to survive the
-  spread, and says why. Writes trader/plan.json for the Time Machine, the
-  Budget Manager and Price Alerts. Long side only. Use when the user says
-  "where's my stop", "set my stop and target", "plan the exit", "when do I get
-  out", "stop loss", "what's my R", "risk reward", or right after
-  /trader-entry triggers, before /trader-timemachine.
-argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
+  breakout-invalidation, your price, a percent, or a multiple of ATR),
+  rounds to the exchange tick size (0.01 USD in US; authoritative NSE/BSE
+  tick size in INR including sub-paisa precision), and sets the target at 2R
+  (or 1R, 1.5R, or your price). Supports intraday flat-by cutoffs and Indian
+  positional delivery holds. Refuses a stop at or above the entry, a target
+  at or below it, or a stop too tight to survive the spread, and says why.
+  Writes trader/plan.json for the Time Machine, the Budget Manager and Price
+  Alerts. Long side only. Use when the user says "where's my stop", "set my
+  stop and target", "plan the exit", "when do I get out", "stop loss",
+  "what's my R", "risk reward", or right after /trader-entry triggers, before
+  /trader-timemachine.
+argument-hint: "[--stop or-mid|or-low|breakout-invalidation|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
 ---
 
 # trader-exit
@@ -30,22 +33,28 @@ and a neat plan does not change that.
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/entry.json: midpoint stop, 2R target
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo or --offline)
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --market IN --exchange NSE --instruments trader/state/instruments.json --entry 2950.10 --or-high 2950 --or-low 2920 --write
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --trading-style positional --market IN --exchange NSE --symbol RELIANCE --entry 2950.10 --stop pct:2 --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol TSLA --entry 364.18 --or-high 362.18 --or-low 354.47
 python3 "${CLAUDE_SKILL_DIR}/exit.py" show                          # the current trader/plan.json
 ```
 
-Other flags: `--flat-by 15:55` (ET) / `15:20` (IST), `--json`, `--now "2026-10-19 10:15"`
-(market local time), `--entry PRICE` with a waiting entry.json to plan ahead, `--setup
-level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop), `--market US|IN`.
+Other flags: `--flat-by HH:MM` (`15:55` ET / `15:20` IST), `--trading-style intraday|positional`,
+`--asset-type EQUITY|FUTURES|OPTIONS`, `--market US|IN`, `--exchange NSE|BSE`,
+`--instruments PATH`, `--setup NAME`, `--date YYYY-MM-DD`, `--time`,
+`--entry-bar N`, `--interval 5m|1m`, `--entry PRICE` (plan ahead on waiting
+entry.json), `--offline PATH` (bars for `atr:K`), `--now "2026-10-19 10:15"`,
+`--config PATH`, `--json`.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range |
-| `trader/config.json` | `flat_by` (15:55 ET / 15:20 IST) and `min_reward_risk` (1.0: a note here, trader-risk enforces it) |
-| Yahoo chart API | only for an `atr:K` stop: the session's bars up to the entry bar, free and unofficial |
-| `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by. trader-timemachine, trader-budget and trader-alerts read it |
+| `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range, exchange, `tick_size`, `invalidation_level` |
+| `trader/config.json` | `flat_by` (`15:55` ET / `15:20` IST) and `min_reward_risk` (`1.0`: noted here, trader-risk enforces it) |
+| `trader/state/instruments.json` | NSE/BSE master cache for exchange-isolated INR `tick_size` and F&O `lot_size` (India) |
+| Yahoo / India provider | only for an `atr:K` stop: session bars up to the entry bar (Yahoo is free and unofficial) |
+| `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by, `tick_size`, `lot_size`, `exchange`, `trading_style` |
 
 ## Stops and targets
 
@@ -53,32 +62,44 @@ level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop), `--market U
 | --- | --- |
 | `or-mid` | the opening-range midpoint (the default for an opening-range breakout) |
 | `or-low` | the opening-range low: wider, so fewer shares for the same max loss |
+| `breakout-invalidation` | structural invalidation level recorded by `entry.py --setup breakout_20d` (default for `breakout_20d`) |
 | `price:X` | your price |
 | `pct:X` | X percent under the entry |
-| `atr:K` | K times the 14-bar ATR under the entry, on the session's bars up to the entry bar. With fewer than 14 bars by then it averages all of them and says so |
+| `atr:K` | K times the 14-bar ATR under the entry, on the session's bars up to the entry bar |
 
 A level setup has no opening range to lean on, so it needs a stop you name.
 
-- **Rounding.** The stop rounds AWAY from the entry to the tick (`0.01` cent
-  in US mode; `0.05` rupee / 5 paise on NSE/BSE in India mode, down for a long).
-  Risk = entry minus stop. Target = entry + R x risk, rounded half up to the
-  tick (`0.01` cent or `₹0.05` tick). `2R` by default; `1R`, `1.5R` or `price:X` also work.
+- **Tick rounding and precision.** In US mode, the tick size is `$0.01`. In
+  India mode (`--market IN`), the stop rounds away from the entry (down for a
+  long) and the target rounds half-up to the symbol's authoritative INR
+  `tick_size` from the entry document or `--instruments` cache (per exchange
+  `NSE` or `BSE`; falls back to NSE `₹0.05` only if no cache or entry tick
+  is supplied on a cash equity without `--instruments`). Sub-paisa ticks such
+  as `0.0025` keep 4 decimal places in rendered reports and plan fields;
+  standard ticks such as `0.05` or `0.10` keep 2 decimals. Conflicting
+  `--exchange` or `tick_size` metadata fails closed.
 - **Refused, with the reason.** A stop at or above the entry. A target at or
   below it. A risk under 0.05% of the price: too tight to survive the
-  spread, normal wiggle would stop you out. An entry.json that has not
+  spread, normal wiggle would stop you out. An `entry.json` that has not
   triggered (unless you give `--entry`). A short: v2 plans longs only.
-- **Flat by.** 15:55 by default (or `flat_by` in the config). Out by then,
-  win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
-  12:55. An entry at or after the flat-by time is refused.
+- **Flat by and positional mode.** Intraday plans default to `15:55` ET (US,
+  moved up to `12:55` on a `1:00 p.m.` early close) or `15:20` IST (India),
+  refusing entries at or after `flat_by`. Passing `--trading-style positional`
+  sets `flat_by: "positional"` for multi-day delivery holds without an
+  end-of-day square-off cutoff.
+- **Asset types and F&O lots.** Cash equities use `lot_size: 1`. When
+  planning Indian `OPTIONS` or `FUTURES` contracts, `--instruments` resolves
+  derivative metadata and `fo_lot_size`.
 
 ## Steps
 
 1. Run it right after `/trader-entry` triggers. Before that, `--entry PRICE`
    plans ahead at the level you expect.
-2. Use the default stop for an opening-range breakout unless the user names
-   another. A level setup needs one: ask.
+2. Use the default stop for an opening-range breakout or `breakout_20d`
+   unless the user names another. A level setup needs one: ask.
 3. Run `exit.py plan --write`. Read back the entry, the stop and its rule,
-   the target and its rule, the risk a share, reward:risk and flat by.
+   the target and its rule, the risk a share, reward:risk and flat by (plus
+   exchange and tick size in India mode).
 4. If it refuses, say the reason and the fix (a wider stop, a farther
    target). Never loosen anything on your own.
 5. Say once that the stop is a plan, not a guarantee.

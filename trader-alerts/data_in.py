@@ -1434,14 +1434,14 @@ class OfflineMarketDataProvider(MarketDataProvider):
                     resolved = cand
                     break
         if resolved is None:
-            repo_fixtures = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "tests",
-                "fixtures",
-                "bharat",
-            )
-            if os.path.isdir(repo_fixtures):
-                resolved = repo_fixtures
+            pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for repo_fixtures in (
+                os.path.join(pkg_root, "tests", "fixtures", "bharat"),
+                os.path.join(pkg_root, "fixtures", "bharat"),
+            ):
+                if os.path.isdir(repo_fixtures):
+                    resolved = repo_fixtures
+                    break
         if not resolved or not os.path.exists(str(resolved)):
             raise ProviderConfigError(
                 "Offline market data provider requires an existing base_path, offline_dir, "

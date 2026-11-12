@@ -1,178 +1,91 @@
 ---
 name: trader-alerts
-description: >-
-  Price Alerts. Rings when a price, a stop or the opening bell hits. Turns
-  the trade plan into three alerts in one go (the stop, the target and "flat
-  by close" at your flat-by time), plus above / below / stop / target levels,
-  percent moves from the previous close, any time of day, and the NYSE
-  opening bell, each ringing once so you are not spammed. Knows NYSE hours
-  with the 2026 and 2027 holidays and 1:00 p.m. early closes, works out New
-  York time itself, fetches free delayed quotes (Yahoo chart JSON, Stooq
-  CSV) one ticker at a time, and writes trader/prices.json for sizing and the
-  risk check. Use when the user says "alert me when", "tell me if TSLA hits",
-  "watch my stop", "watch my trade", "remind me to close by 3:55", "is the
-  market open", "when does the market open", "get me a price", or right
-  after /trader-exit writes a plan.
-argument-hint: "[ticker] [price]"
+description: Market Clock, Data, Instrument Master, Readiness, and Price Alerts. Handles US NYSE hours/holidays/early closes and Indian NSE/BSE/CAS trading sessions in ET or IST, checks readiness, syncs and inspects the Indian NSE/BSE/F&O instrument master with canonical INR tick sizes and exchange isolation, fetches quotes and history (Yahoo, Stooq, or read-only Upstox/offline providers), writes trader/prices.json, and evaluates one-shot price/time/plan alerts.
 ---
 
-# trader-alerts
+# trader-alerts (Market Clock, Indian Data, Instruments & Alerts)
 
-Price Alerts watches the numbers so the user does not have to stare at a
-chart. An alert is information, never an order: when a stop alert rings,
-nothing is sold by this skill. With a bracket order the stop-loss and the
-take-profit already sit at the broker and do the work; the alerts tell the
-user what happened and when it is time to be flat.
+Runs `alerts.py` and `instruments.py`, plus the shared Indian market infrastructure (`calendar_in.py`, `symbols_in.py`, `data_in.py`, `upstox_feed.py`, `env_loader.py`). Pure Python standard library.
 
-`${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
+Notice that in addition to monitoring stops/targets and writing `trader/prices.json`, `trader-alerts` houses the canonical market clock (`--market US|IN`), pre-flight readiness check, NSE/BSE/F&O instrument master cache, and read-only quote/history providers.
 
-```bash
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NYSE open or closed, next open
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by close from trader/plan.json
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --opening-bell
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol TSLA --stop 358.32
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol TSLA --target 370.04
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --at 15:55 --label "flat by close" --before-close
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol KO --pct 3
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" check                          # exit 0 = something rang
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote TSLA --write             # -> trader/prices.json
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --holdings --write       # portfolio + plan tickers
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" list
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset tsla-plan-stop
-```
-
-`--now "2026-10-19 15:55"` pins the clock (market time: New York ET for US,
-IST for `--market IN`); `--offline DIR` reads saved quote files instead of the network.
-
-## What it reads and writes
-
-| file | what |
-| --- | --- |
-| `trader/plan.json` | the trade from trader-exit, for `add --from-plan` |
-| `trader/alerts.json` | the rules (`alerts.example.json` in this folder) |
-| `trader/state/alerts.json` | which rules rang and when, so each rings once |
-| `trader/prices.json` | the latest quotes, merged in, for trader-budget and trader-risk |
-| `trader/portfolio.json` | the tickers held, for `quote --holdings` |
-
-## Rule types
-
-| type | rings when | rings again |
-| --- | --- | --- |
-| `above` / `target` | price at or above `price` | after `reset`, or on its own if `"rearm": true` and the price fell back |
-| `below` / `stop` | price at or below `price` | same |
-| `pct_move` | moved `pct` percent from the previous close (or `ref`), optional `direction` up or down | once per day at most |
-| `time` | the market clock passed `at` on a trading day (New York ET for US, IST for IN) | once per trading day |
-| `opening_bell` | the NYSE (or NSE/BSE with `--market IN`) is open | once per trading day |
-
-A rule with `"date"` is watched on that market date only; `--from-plan`
-rules carry the plan's date, so yesterday's stop never rings today. A `time`
-rule with `"before_close": true` moves 3 hours earlier on a 1:00 p.m. NYSE early
-close, so "flat by close" at 15:55 rings at 12:55 on those days.
-
-## Quotes
-
-- `yahoo` (default): `query2.finance.yahoo.com/v8/finance/chart/<TICKER>`, an
-  unofficial free JSON endpoint, one request per ticker, half a second apart.
-  On a 429 it waits and tries once more; on a 429 or a 5xx after that it
-  tries `query1`. It identifies itself as `day-trader-skill/2.0`.
-- `stooq`: `stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv`, Stooq's free CSV.
-  It answered 404 on 2026-10-13; the parser stays for when it is back.
-- Free quotes are unofficial, delayed and can lag. They are fine for alerts
-  and for checking a size, not for timing an order. The broker's price is the
-  one that fills. Each price in `trader/prices.json` keeps its quote time, and
-  trader-risk only uses one under 15 minutes old.
-- If both are down, read the price from the broker connector (Alpaca
-  `get_stock_snapshot`, IBKR `get_price_snapshot`) and write it into
-  `trader/prices.json` as `{"as_of": "...Z", "prices": {"TSLA": 366.48}}`.
-
-## The NYSE clock
-
-Regular session 9:30 a.m. to 4:00 p.m. New York time, closed on weekends and
-on these holidays, from nyse.com/markets/hours-calendars (read 2026-10-13):
-
-- 2026: Jan 1, Jan 19, Feb 16, Apr 3 (Good Friday), May 25, Jun 19, Jul 3
-  (Independence Day observed), Sep 7, Nov 26, Dec 25. Early close 1:00 p.m. on
-  Nov 27 and Dec 24.
-- 2027: Jan 1, Jan 18, Feb 15, Mar 26 (Good Friday), May 31, Jun 18
-  (Juneteenth observed), Jul 5 (Independence Day observed), Sep 6, Nov 25,
-  Dec 24 (Christmas observed). Early close 1:00 p.m. on Nov 26.
-
-Daylight saving time is worked out in the tool, so it needs no time zone
-files and ignores the computer's own zone. For any other year it says the
-holiday list is unknown.
-
-## Indian market (NSE/BSE) clock and profile
-
-Pass `--market IN` (or set `"market": "IN"` in `trader/config.json`) to use the
-Indian market engine (IST = UTC+05:30):
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock --market IN               # NSE open or closed, session bars
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote RELIANCE TCS --market IN  # quotes for canonical Indian scrips
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" history RELIANCE --market IN    # 5-minute bars aligned to IST
-```
-
-- Normal equity continuous session 09:15 to 15:30 IST (75 five-minute bars).
-- Closing Auction Session (CAS) modeling with 3 date-effective regimes (Pre-CAS, CAS V1 20-min auction, CAS V2 10-min auction).
-- Verified holiday calendars for 2025 and 2026 from official NSE/BSE circulars.
-- Dynamic session bar calculations for special sessions (e.g. 1-hour Diwali Muhurat Trading = 12 bars).
-- Data quality tier classification: all quotes and bars are explicitly labeled `DELAYED`, `HISTORICAL`, or `SIMULATED`, and never presented as real-time.
-- Granular session phases: pre-open order entry (09:00 to 09:08), order matching (09:08 to 09:12), buffer (09:12 to 09:15), continuous trading, closing auction order entry, equilibrium matching, and post-closing (15:50 to 16:00).
-
-## Steps
-
-1. Right after trader-exit writes the plan, run `add --from-plan`. Confirm
-   the three alerts back to the user: the stop, the target and the flat-by time.
-2. Run `check` while the trade is open: every few minutes from a Claude
-   scheduled task or `/loop`. Each run fetches only the tickers in today's
-   rules and rings each alert once. A check reads the latest delayed quote;
-   it is not a live feed, and a price can pass a level between two checks.
-3. Tell the user what rang in one line each. A stop or target alert means the
-   bracket order has probably filled: check `get_open_position` and record the
-   fill with trader-broker. "Flat by close" means close anything still open:
-   trader-broker `flatten`, then trader-risk, then the user's yes. Never act
-   for them.
-
-## Example: the reel
-
-TSLA on Monday 2026-10-19: entry 364.18 at 10:15 AM, stop 358.32, target
-370.04, flat by 15:55. `add --from-plan` writes `tsla-plan-stop`,
-`tsla-plan-target` and `tsla-flat-by` for that day. A `check` at 10:53 reads
-the real 10:52 quote, 366.48, between the stop and the target:
+## Market readiness and clocks
 
 ```
-NYSE OPEN (2026-10-19 10:53 New York, regular session).
-Nothing hit. 3 rule(s) watched today, TSLA $366.48.
+# US market clock (NYSE hours, 2026-2027 holidays, 1:00 p.m. ET early closes)
+python3 <SKILL_DIR>/trader-alerts/alerts.py clock --market US
+
+# Indian NSE/BSE clock (IST; pre-open 09:00-09:08, market 09:15-15:30, post-close / CAS)
+python3 <SKILL_DIR>/trader-alerts/alerts.py clock --market IN
+python3 <SKILL_DIR>/trader-alerts/alerts.py clock --market IN --symbol RELIANCE --cas --instruments trader/state/instruments.json
+
+# Pre-flight readiness check (config, calendar, instruments cache, data provider, portfolio)
+python3 <SKILL_DIR>/trader-alerts/alerts.py readiness --market IN --config trader/config.json --instruments trader/state/instruments.json
 ```
 
-At 3:55 PM:
+## Instrument master (`instruments.py`, Indian markets)
+
+Downloads and caches NSE (`EQUITY_L.csv`), F&O lot sizes (`fo_mktlots.csv`), BSE (`Equity.csv`), and Upstox BOD JSON masters with strict provenance and exchange isolation:
 
 ```
-ALERT Flat by close: it is 15:55 New York (set for 15:55), the market closes at 16:00. If TSLA is still
-open, close it: trader-broker flatten --symbol TSLA builds the sell ticket, then trader-risk and your yes.
+# Sync instrument master cache (online or from --offline folder)
+python3 <SKILL_DIR>/trader-alerts/instruments.py sync --exchange ALL --out trader/state/instruments.json
+python3 <SKILL_DIR>/trader-alerts/instruments.py sync --offline <BHARAT_FIXTURE_DIR> --exchange ALL --out trader/state/instruments.json
+
+# Inspect canonical or derivative symbols with explicit exchange resolution
+python3 <SKILL_DIR>/trader-alerts/instruments.py inspect RELIANCE --exchange NSE --cache trader/state/instruments.json
+python3 <SKILL_DIR>/trader-alerts/instruments.py inspect RELIANCE --exchange BSE --cache trader/state/instruments.json
 ```
 
-It rings once. The next morning the plan's three alerts are no longer
-watched; with `add --opening-bell`, the bell rings at 9:30.
+Key instrument invariants:
+- Canonical `tick_size` is stored in rupees (`tick_size_unit: "INR"`). Raw Upstox BOD values (reported in paise, e.g. NSE `RELIANCE = 10.0` paise -> `0.10 INR`, BSE `RELIANCE = 5.0` paise -> `0.05 INR`) are converted once at ingestion, while NSE/BSE CSV parsers stamp `"INR"` directly. Unmarked BOD/ambiguous caches fail closed and tell you to re-sync.
+- `instruments_by_exchange` keeps NSE and BSE records strictly isolated so exchange-specific tick sizes, ISINs, and CAS flags never overwrite one another.
 
-## Rules
+## Quotes, history, and price alerts (`alerts.py`)
 
-- An alert is a fact about a price or the clock. Say it as a fact.
-- Never present a quote as live. Free quotes are delayed and unofficial.
-- Confirm every new rule back to the user: ticker, type, level, day.
+```
+# Fetch quotes (writes trader/prices.json with --write for trader-budget & trader-risk)
+python3 <SKILL_DIR>/trader-alerts/alerts.py quote AAPL TSLA --write
+python3 <SKILL_DIR>/trader-alerts/alerts.py quote RELIANCE TCS --market IN --write
 
-## What it never does
+# Fetch historical bars (--market IN supports 1m, 5m, 1d via data_in / Upstox / Yahoo / offline)
+python3 <SKILL_DIR>/trader-alerts/alerts.py history RELIANCE --market IN --interval 5m --range 5d --write trader/history.json
 
-It never places, cancels or changes an order, never claims a quote is
-live, and never predicts where a price is going.
+# Add alerts (all three from trader/plan.json: stop, target, and flat-by-close --before-close)
+python3 <SKILL_DIR>/trader-alerts/alerts.py add --from-plan --plan trader/plan.json --config trader/config.json
+python3 <SKILL_DIR>/trader-alerts/alerts.py add --symbol TSLA --stop 358.32 --target 370.04
+python3 <SKILL_DIR>/trader-alerts/alerts.py add --opening-bell --market IN --label "NSE open"
+python3 <SKILL_DIR>/trader-alerts/alerts.py add --at 15:10 --before-close --market IN --label "Flat by close"
+
+# Check, list, or reset one-shot alerts
+python3 <SKILL_DIR>/trader-alerts/alerts.py check --market IN --offline <FIXTURE_DIR> --now "2026-10-19 10:15"
+python3 <SKILL_DIR>/trader-alerts/alerts.py list
+python3 <SKILL_DIR>/trader-alerts/alerts.py reset <ALERT_ID>
+```
+
+Subcommands of `alerts.py`:
+- `clock`: `--now`, `--json`, `--market US|IN`, `--cas`, `--symbol`, `--instruments`
+- `readiness`: `--market US|IN`, `--config`, `--instruments`, `--portfolio`, `--now`, `--json`
+- `quote`: `[symbols ...]`, `--holdings`, `--portfolio`, `--plan`, `--write [PATH]`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
+- `history`: `symbol`, `--interval 1m|5m|1d`, `--range 1d|5d|1mo|1y`, `--write [PATH]`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
+- `check`: `--rules`, `--state`, `--prices-out`, `--no-write`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
+- `add`: `--rules`, `--state`, `--symbol`, (`--above` | `--below` | `--stop` | `--target` | `--pct` | `--opening-bell` | `--at HH:MM` | `--from-plan`), `--plan`, `--config`, `--label`, `--before-close`, `--date`, `--direction up|down`, `--rearm`, `--note`, `--id`, `--market US|IN`
+- `list`: `--rules`, `--state`, `--market US|IN`
+- `reset`: `id`, `--state`, `--market US|IN`
+
+## Environment variables (read from process env or workspace `.env`)
+
+- Market/provider selection: `BHARAT_MARKET`, `INDIA_MARKET_DATA_PROVIDER`, `BHARAT_DATA_PROVIDER`, `INDIA_MARKET_DATA_FALLBACK_PROVIDER`, `INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK`, `INDIA_OFFLINE_DIR`, `TRADER_CONFIG`, `SEC_USER_AGENT`
+- Upstox (strictly read-only market data): `UPSTOX_ANALYTICS_TOKEN`, `UPSTOX_ACCOUNT_TIER` (`standard` = max 2 WS connections, `plus` = max 5 WS connections)
+
+## Rules and provenance
+
+- Never run silently on simulated `--now` or `--offline` fixtures while reporting live status: inspect and report `provider`, `data_status`, `is_live`, and `last_data_timestamp`.
+- Free Yahoo/Stooq quotes are unofficial and delayed (`~15m`). Do not claim real-time execution guarantees from delayed quotes.
+- An alert firing is informational only -- it never auto-places an order.
 
 ## Safety
 
-- Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.
-- Paper trading by default (`"paper": true`). Going live is the user's own decision, in their own config.
-- Nothing in this pack places an order except trader-broker, and only when all three hold: trader-risk
-  passed that exact order today, the user typed an explicit yes for that one order in the chat, and the
-  user clicked Allow once on Claude's own card because the order tool is set to "Needs approval"
-  (Customize > Connectors > tool permissions). Never set an order tool to "Always allow".
-- No options, margin, short selling or leverage unless the config allows it and the user confirms.
-- Broker keys live in environment variables or the Claude Desktop config, never in the chat.
+- Education and market monitoring tools, not financial advice.
+- Upstox integration is strictly read-only for market data and never places orders. Order placement happens only in `trader-broker` after `trader-risk` PASS today and an explicit typed `yes` from the user.
+- Keep `UPSTOX_ANALYTICS_TOKEN` and all broker credentials in local `.env` or process environment variables only. Never paste or ask for tokens or secrets in chat.

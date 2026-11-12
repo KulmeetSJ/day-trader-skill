@@ -3,11 +3,13 @@ name: trader-budget
 description: >-
   Budget Manager. Sizes every position to your budget and your max loss per
   trade. Reads the trade plan from trader-exit (entry, stop, target), finds
-  the whole shares that fit inside four limits (max loss per trade, position
-  cap, max order, cash after your buffer), says which limit decided it, and
-  writes ONE bracket order (entry, stop-loss, take-profit) to
-  trader/orders.json in the exact shape of Alpaca's place_stock_order. A stop
-  too far away for your max loss is a plain refusal, not a smaller order.
+  whole shares (or Indian F&O lots) that fit inside four limits (max loss per
+  trade, position cap, max order, cash after your buffer), enforces
+  authoritative INR tick sizes, T2T delivery blocks, and Indian statutory
+  charges (STT, NSE exchange fees, SEBI, stamp duty, GST + estimated
+  brokerage), and writes ONE proposal to trader/orders.json (intraday bracket
+  or Indian paper positional GTT OCO). A stop too far away for your max loss
+  or missing Indian tick metadata is a plain refusal, not a smaller order.
   Nothing is placed. Use when the user says "how many shares", "size this
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
@@ -29,23 +31,30 @@ loss small; it does not make a trade win.
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/size.py"                        # trader/plan.json + trader/config.json
 python3 "${CLAUDE_SKILL_DIR}/size.py" --write                # write trader/orders.json
+python3 "${CLAUDE_SKILL_DIR}/size.py" --market IN --exchange NSE --instruments trader/state/instruments.json --write
+python3 "${CLAUDE_SKILL_DIR}/size.py" --trading-style positional --market IN --write
 python3 "${CLAUDE_SKILL_DIR}/size.py" --limit --write        # a limit order at the plan's entry
 python3 "${CLAUDE_SKILL_DIR}/size.py" --limit 364.00 --json  # a limit order at 364.00
 python3 "${CLAUDE_SKILL_DIR}/size.py" --weights AAPL=40,KO=60 --config split.json   # weights mode, below
 ```
 
-`--now "2026-10-19 10:15"` pins the clock (market time: New York ET for US, IST for
-`--market IN`). A plan for another day is refused: make a new one with trader-exit.
+Flags: `--plan`, `--config`, `--budget`, `--limit [PRICE]`, `--prices`,
+`--portfolio`, `--market US|IN`, `--exchange NSE|BSE`,
+`--trading-style intraday|positional`, `--instruments PATH`, `--now`,
+`--write [PATH]` (`trader/orders.json`), `--json`; plus weights mode
+(`--weights`, `--targets`, `--top`, `--whole-shares`, `--cents`).
+A plan for another day is refused: make a new one with trader-exit.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
 | `trader/config.json` | the rules (`config.example.json` for US, `config.in.example.json` for India) |
-| `trader/plan.json` | the trade: entry, stop, target, setup, flat-by time (trader-exit writes it) |
+| `trader/plan.json` | the trade: entry, stop, target, setup, flat-by time, `tick_size`, `lot_size` (trader-exit writes it) |
+| `trader/state/instruments.json` | NSE/BSE cache (used when present or passed via `--instruments` to resolve/verify INR `tick_size`, `is_trade_to_trade`, F&O `lot_size`) |
 | `trader/prices.json` | optional: a fresh price above the plan's entry means a bigger risk (trader-alerts writes it) |
 | `trader/portfolio.json` | optional: its cash caps the size (trader-broker keeps it) |
-| `trader/orders.json` | the one proposed bracket order it writes with `--write` (uses INR and neutral keys in India mode) |
+| `trader/orders.json` | the one proposed order (`bracket` intraday, or paper-only `gtt_oco` positional in India mode) written with `--write` |
 
 ## Step 1: set the rules once
 
@@ -69,8 +78,8 @@ each value in plain words:
 python3 "${CLAUDE_SKILL_DIR}/size.py" --write
 ```
 
-Whole shares only: Alpaca takes no fractions in a bracket order. The size is
-the smallest of four limits:
+Whole shares only (and whole F&O contract lots for Indian `OPTIONS`/`FUTURES`):
+the size is the smallest of four limits:
 
 | limit | shares |
 | --- | --- |
@@ -79,23 +88,49 @@ the smallest of four limits:
 | max order | `max_order` (`_inr` or `_usd`) / entry |
 | cash | (budget minus the cash buffer) / entry, never more than the cash in `trader/portfolio.json` |
 
-The entry it sizes at: the limit price with `--limit`. For a market order, the
-plan's entry, or the price in `trader/prices.json` if it is fresh (under 15
-minutes old) and higher. A price that ran up since the plan means a bigger
-loss at the same stop, so fewer shares. A lower price never shrinks the risk.
+The entry it sizes at: the limit price with `--limit` (rounded to the
+authoritative `tick_size`). For a market order, the plan's entry, or the
+price in `trader/prices.json` if it is fresh (under 15 minutes old) and higher.
+A price that ran up since the plan means a bigger loss at the same stop, so
+fewer shares. A lower price never shrinks the risk.
 
-It refuses, and writes no order, when: the size is zero shares, the order is
-under the minimum, reward:risk is under `min_reward_risk`, the stop is not
+Indian-market sizing specifics (`--market IN`):
+
+- **Authoritative tick size (fail closed).** Uses `trader/state/instruments.json`
+  when present (or `--instruments`), else falls back only to an authoritative
+  `tick_size` already recorded on `plan.json`. If `--instruments` does not
+  exist, disagrees with the plan, or neither carries a valid `tick_size` for
+  an Indian plan, sizing fails closed rather than falling back to `₹0.05`.
+  Sub-paisa ticks (such as `0.0025`) keep full decimal precision.
+- **Equity vs F&O lots.** Cash equity trades in single shares (`lot_size: 1`);
+  Indian `OPTIONS`/`FUTURES` must size in exact multiples of `fo_lot_size`
+  (`contracts = qty // lot_size`) and refuse if lot metadata is missing.
+- **Trade-to-Trade (T2T) blocks.** Securities in series `BE`/`BZ`/`T` or
+  marked `is_trade_to_trade: true` are refused for intraday day trading.
+- **Intraday MIS vs Positional GTT OCO.** Intraday orders write `product: "MIS"`,
+  `time_in_force: "day"`, `order_class: "bracket"`. Positional orders
+  (`--trading-style positional` or positional plan) write Indian paper-only
+  `product: "CNC"` (equity) or `"NRML"` (F&O), `time_in_force: "gtc"`,
+  `order_class: "gtt_oco"`, and `multi_session_protection` (`persists_across_sessions: true`),
+  refusing if `paper` is false or `broker` is not `"paper"`.
+- **Transaction costs.** Computes effective-dated Indian statutory levies
+  (STT per 2026-04-01 schedule, NSE transaction charges incl. IPFT per
+  2026-03-01 schedule, SEBI Rs 10/crore, buy-side stamp duty, 18% GST) separately
+  from estimated discount brokerage and prints the breakeven exit price.
+
+It refuses, and writes no order, when: the size is zero shares/lots, the order
+is under the minimum, reward:risk is under `min_reward_risk`, the stop is not
 below the entry, the target is not above it (the move already happened), the
-plan is for another day, the ticker is blocked, or the plan is a short. Say
-the reason to the user in one line.
+plan is for another day, the ticker is blocked or T2T intraday, or the plan is
+a short. Say the reason to the user in one line.
 
 ## Step 3: show the user
 
-Show the four limits, which one decided the size, the shares, the order
-amount (in USD `$` or INR `₹` depending on market) and the max loss at the
-stop. Say plainly that a stop is an order, not a promise: in a fast market it
-can fill below the stop. Then hand over to `/trader-risk`.
+Show the four limits, which one decided the size, the shares (and F&O lots if
+applicable), the order amount (in USD `$` or INR `₹` depending on market), the
+max loss at the stop, and any Indian charge breakdown / breakeven level. Say
+plainly that a stop is an order, not a promise: in a fast market it can fill
+below the stop. Then hand over to `/trader-risk`.
 
 ## Example: the reel
 
@@ -132,27 +167,28 @@ the same plan sizes to 6 shares at 8.16 a share, and reward:risk falls to
 here) splits a budget across a list by weight: the cash buffer comes off the
 top, weights are renormalised to 100, any stock over `max_position_pct` is
 pinned at the cap and its excess shared out, slices under the minimum order
-are dropped, and amounts round to whole currency units (dollars or rupees) so nothing is left idle by
-accident. With `"max_position_pct": 25` and `"fractional": true`, the example
-file gives AAPL $1,250 (capped), AXP $1,119, GOOGL $823, KO $708, BAC $600.
-With `"fractional": false` (the example config) it buys whole shares and
-needs prices (`--prices trader/prices.json`). These are plain buys with no stop: trader-risk blocks them while
-`require_stop` is true and counts each one against `max_trades_per_day`. Use
-a separate config (`--config`) for a long-term split.
+are dropped, and amounts round to whole currency units (dollars or rupees, or
+sub-units with `--cents`) so nothing is left idle by accident. With
+`"max_position_pct": 25` and `"fractional": true`, the example file gives AAPL
+$1,250 (capped), AXP $1,119, GOOGL $823, KO $708, BAC $600. With
+`"fractional": false` (the example config) it buys whole shares and needs
+prices (`--prices trader/prices.json`). These are plain buys with no stop:
+trader-risk blocks them while `require_stop` is true and counts each one
+against `max_trades_per_day`. Use a separate config (`--config`) for a long-term
+split.
 
 ## Rules
 
 - Proposals only. This skill never calls a broker tool.
 - Never size money the user has not said is for this. Ask for the budget and the max loss.
-- Every number comes from the config, the plan or the prices. Nothing is guessed.
+- Every number comes from the config, the plan, the prices or the instrument master. Nothing is guessed.
 - No projections: never say what a trade will make. A target is a plan, not a forecast.
 - Free Yahoo prices are unofficial and can lag. The broker's price is the one that fills.
 
 ## What it never does
 
 It never places, approves or schedules an order, never raises a limit on its
-own, never shrinks a stop to fit more shares, and never sizes options,
-margin or short positions.
+own, never shrinks a stop to fit more shares, and never sizes short positions.
 
 ## Safety
 

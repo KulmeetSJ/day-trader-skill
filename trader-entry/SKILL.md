@@ -2,17 +2,20 @@
 name: trader-entry
 description: >-
   Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
-  Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
-  first 15 minutes by default) and calls the entry on the first completed bar
-  that CLOSES above the range high, or above a level you give it (like a
-  20-day high from the scanner), with an optional volume check. Says waiting
-  and how far, triggered with the time and the price, expired, or not open
-  yet, and writes trader/entry.json for /trader-exit. Long side only. It never
-  places an order. Use when the user says "tell me when to get in", "watch
-  TSLA", "has it broken out", "did it break the opening range", "entry
-  signal", "time my entry", "check my watchlist", or after /trader-scanner
-  and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level|breakout_20d] [--interval 5m|1m]"
+  Reads free Yahoo 1-minute or 5-minute bars (or India provider/offline data),
+  builds the opening range (the first 15 minutes by default) and calls the
+  entry on the first completed bar that CLOSES above the range high, above a
+  given price level, above a prior 20-day daily breakout high, or matching
+  ma_crossover, trend, rsi_momentum, or simulated options_orb rules, with an
+  optional volume check. Supports US and Indian (NSE/BSE, IST, authoritative
+  tick-size normalization) markets, says waiting and how far, triggered with
+  time and price, expired, no-data, or not open yet, and writes
+  trader/entry.json for /trader-exit. Long side only. It never places an
+  order. Use when the user says "tell me when to get in", "watch TSLA", "has
+  it broken out", "did it break the opening range", "entry signal", "time my
+  entry", "check my watchlist", or after /trader-scanner and /trader-news,
+  before /trader-exit.
+argument-hint: "[TICKER] [--setup orb|level|breakout_20d|ma_crossover|trend|rsi_momentum|options_orb] [--interval 5m|1m]"
 ---
 
 # trader-entry
@@ -30,18 +33,27 @@ people money, and a clean signal does not change that.
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA                  # 15-minute opening range, 5-minute bars
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --write          # also save trader/entry.json
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --level 371.20
-python3 "${CLAUDE_SKILL_DIR}/entry.py" check RELIANCE --market IN --setup breakout_20d
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check RELIANCE --market IN --exchange NSE --setup breakout_20d
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch TSLA --until 15:30    # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
 ```
 
-Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
-saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
-`<TICKER>.json`), `--daily PATH` (saved `1d` daily history JSON or folder
-containing `<TICKER>-daily.json` for `--setup breakout_20d`), `--now "2026-10-19 10:15"` (market local time) to override the application clock for replay/backtests (clock-overridden runs are always marked non-live),
-and `--market US|IN`. `watch` with `--now` or `--offline` runs on a simulated
-clock and replays the day bar by bar without waiting.
+Flags on `check`, `watch`, and `watchlist`:
+- `--setup`: `orb` (default), `level`, `breakout_20d`, `ma_crossover`,
+  `trend`, `rsi_momentum`, or `options_orb`
+- `--or-minutes N` (default `15`), `--interval 5m|1m` (default `5m`),
+  `--level PRICE` (`--setup level`), `--min-volume-x FLOAT`
+- `--market US|IN`, `--exchange NSE|BSE`, `--instruments PATH`,
+  `--trading-style intraday|positional`
+- `--option-strategy STRATEGY` (e.g. `long_call`, `long_put`),
+  `--strike-selection ATM|ITM1|ITM2|OTM1|OTM2` (`options_orb`)
+- `--offline PATH` (saved chart JSON `.json`/`.json.gz` or folder),
+  `--daily PATH` (saved `1d` daily history JSON or folder for `breakout_20d`),
+  `--now "2026-10-19 10:15"` (market local time, ET for US or IST for IN;
+  clock-overridden runs are always marked non-live), `--config PATH`, `--json`
+- `watch`: `--every SECS` (default `30`), `--until HH:MM`, `--out PATH`
+  (with `--now` or `--offline`, replays bar by bar without sleeping)
 
 ## What it reads and writes
 
@@ -49,37 +61,52 @@ clock and replays the day bar by bar without waiting.
 | --- | --- |
 | `trader/watchlist.json` | the scanner's hits (`hits[].symbol`), for `watchlist` |
 | `trader/config.json` | `no_entries_before` / `no_entries_after` (`09:45`/`15:30` ET for US; `09:30`/`15:00` IST for India). Optional |
-| Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
-| `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range |
+| `trader/state/instruments.json` | optional NSE/BSE cache for exchange resolution and authoritative INR tick size (India) |
+| Yahoo / India data provider | today's bars (`5m` or `1m`) plus `1d` history for `breakout_20d`: Yahoo is free, unofficial, and can lag |
+| `trader/entry.json` | with `check --write` or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range, data tier and optional `invalidation_level` / `option_contract` |
 
 ## The rule
 
-- **Opening range (orb).** The high and low of the first 15 minutes: the
-  9:30, 9:35 and 9:40 five-minute bars, or fifteen 1-minute bars. The level
-  to beat is the range high.
-- **Level.** A price you give, like a 20-day high from `/trader-scanner`.
-- **20-day breakout (`breakout_20d`).** Derives the prior 20-day closing high from
-  completed daily sessions before the evaluation date (using `/trader-scanner`
-  logic) and requires price confirmation via a completed intraday candle
-  closing strictly above that breakout level. A prior daily scanner match alone
-  never triggers without intraday confirmation, and stale or insufficient daily
-  history returns `no-data`.
+- **Opening range (orb).** The high and low of the first 15 minutes:
+  `9:30`, `9:35`, `9:40` ET bars (US) or `9:15`, `9:20`, `9:25` IST bars
+  (India), or fifteen 1-minute bars. The level to beat is the range high.
+- **Level.** A price you give, like a level from `/trader-scanner`.
+- **20-day breakout (`breakout_20d`).** Derives the prior 20-day closing high
+  from completed daily sessions strictly before the evaluation date and
+  requires a completed intraday bar closing strictly above that breakout
+  level. A daily scanner hit never triggers without intraday confirmation;
+  stale or missing daily history returns `no-data`. Also records
+  `invalidation_level` for `/trader-exit`.
+- **Intraday indicator setups.** `ma_crossover` (9-bar SMA crossing above
+  21-bar SMA), `trend` (close > 9-bar SMA > 21-bar SMA), and `rsi_momentum`
+  (14-bar RSI crossing at or above 60.0).
+- **Simulated options ORB (`options_orb`).** Applies the ORB trigger on the
+  underlying and selects an option contract via `data_in`; when live option
+  chain data is absent, contracts come from the analytical Black-Scholes
+  engine and are explicitly tagged `SIMULATED` (`is_simulated: true`).
 - **The trigger** is the first completed bar after the range that CLOSES
   above the level. A wick above is not a trigger. A close exactly at the
   level is not above it.
 - **The time** is that bar's close time (the 10:10 bar closes at 10:15 AM).
-  The price is its close, to 0.01 (cent or paise).
-- **Only closed bars count.** A bar is closed when the clock passes its start
-  plus 5 (or 1) minutes and Yahoo has caught up to that moment (it waits a
-  minute at most). Yahoo's live tick, like 10:49:45, is never a bar.
+  Trigger and level prices round using the authoritative `tick_size` from
+  `--instruments` / chart metadata when present (preserving sub-paisa INR
+  ticks such as `0.0025`, or standard `0.01`, `0.05`, `0.10`).
+- **Only closed bars count.** A bar is closed once the clock passes its
+  close and the feed has caught up. Live in-progress ticks are never counted.
 - **Volume, if you want it.** `--min-volume-x 1.5` also needs the trigger
-  bar's volume at 1.5 times the range bars' average. The 9:30 bar holds the
+  bar's volume at 1.5 times the range bars' average. The opening bar holds the
   opening auction, so 1.0 is already strict.
-- **Time limits.** No entries before 9:45 or after 15:30 (config). On a 1:00
-  p.m. early close the cutoff moves up with the close, to 12:30.
+- **Time limits.** US: `09:45` to `15:30` ET by default (moved up to `12:30` on
+  a `1:00 p.m.` early close). India (`--market IN`): `09:30` to `15:00` IST
+  (with continuous close `15:30 IST`, or `15:15 IST` during CAS V1 for CAS
+  eligible scrips). Positional setups (`--trading-style positional`) plan for
+  multi-session delivery holds rather than same-day square-off.
+- **Data provenance.** Output includes `data_tier` (`CURRENT`, `DELAYED`,
+  `HISTORICAL`, `FIXTURE`, `SIMULATED`) and `is_live_signal`. Mocked clock
+  (`--now`) or offline fixture runs are never marked live signals.
 - **What it says.** Waiting (and how far the last close is from the level),
-  triggered, expired, or no data. Before 9:30: not open yet. Before 9:45: the
-  range is still forming. Weekends and NYSE holidays: the market is closed.
+  triggered, expired, or no data. Before open: not open yet. During the
+  opening range: still forming. Weekends and exchange holidays: market closed.
 
 ## Steps
 
@@ -93,9 +120,9 @@ clock and replays the day bar by bar without waiting.
    bar, and exits 0 on the trigger (it writes `trader/entry.json`) or 1 when
    the setup expires. Keep the computer awake while it watches: a sleeping
    laptop pauses it, and it catches up, late, when it wakes.
-4. When it triggers, say the time and the price, and that nothing was placed.
-   If the trigger is more than a bar old, say that too: a late entry is a
-   different trade.
+4. When it triggers, say the time, the price, the data tier, and that nothing
+   was placed. If the trigger is more than a bar old, say that too: a late
+   entry is a different trade.
 5. Hand off to `/trader-exit` to set the stop and the target BEFORE anything
    is bought.
 
@@ -124,8 +151,8 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
 
 ## Rules
 
-- Bar by bar, on free Yahoo 1-minute or 5-minute bars. They are unofficial
-  and can lag. Say so when a minute matters.
+- Bar by bar, on free Yahoo 1-minute or 5-minute bars (or configured Indian
+  provider). Free feeds are unofficial and can lag. Say so when a minute matters.
 - A signal is information, not an order, and not a promise. Nothing here
   promises winning trades or money.
 - Long side only. v2 plans longs only. If the user wants a short, say that.

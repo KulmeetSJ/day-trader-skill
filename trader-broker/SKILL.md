@@ -1,26 +1,29 @@
 ---
 name: trader-broker
 description: >-
-  Order Executor. Sends approved orders to your broker, paper trading by
-  default, never without your yes. Shows each order as a plain ticket (a
-  bracket shows its stop-loss, take-profit and the max loss at the stop)
-  plus the exact JSON for Alpaca's place_stock_order, records your yes word
-  for word, then Claude's own Allow once / Deny card asks again. Builds the
-  sell ticket that closes a day trade by your flat-by time, records fills,
-  and logs each trade's max loss so trader-risk can hold the daily limit.
-  Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
-  default, keys in env vars, never in chat), the Interactive Brokers
-  connector, and setting order tools to "Needs approval". Use when the user
-  says "place the order", "buy it", "execute", "send it to my broker",
-  "close my position", "flatten", "get me out", "connect Alpaca", "set up
-  paper trading", or after /trader-risk passes.
+  Order Executor. Sends approved orders to your broker in US mode (paper
+  trading by default, never without your yes), and renders paper-only tickets
+  for Indian NSE/BSE trades (intraday MIS brackets or multi-session CNC/NRML
+  GTT OCO). Shows each order as a plain ticket (with stop-loss, take-profit,
+  max loss at the stop, INR/USD tick precision, and estimated Indian charges
+  when applicable) plus the exact JSON for Alpaca's place_stock_order in US
+  mode, records your yes word for word (with symbol-normalized qty checks),
+  then Claude's own Allow once / Deny card asks again. Builds the sell ticket
+  that closes a day trade by your flat-by time, records fills, and logs each
+  trade's max loss so trader-risk can hold the daily limit. Covers Alpaca's
+  official MCP server in Claude Desktop (paper by default, keys in env vars,
+  never in chat) and Interactive Brokers; Upstox integration in this pack is
+  strictly read-only market data with zero live Indian broker order routing.
+  Use when the user says "place the order", "buy it", "execute", "send it to
+  my broker", "close my position", "flatten", "get me out", "connect Alpaca",
+  "set up paper trading", or after /trader-risk passes.
 argument-hint: "[order number]"
 ---
 
 # trader-broker
 
 The Order Executor is the only skill in this pack that can lead to a real
-order, so it is the strictest. An order reaches the market only after three
+order, so it is the strictest. An order reaches a broker only after three
 separate gates, every time, for every order:
 
 1. **trader-risk passed this exact order today** (matched by fingerprint).
@@ -41,9 +44,20 @@ python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol TSLA --qty 8
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
 ```
 
+Common flags across commands: `--market US|IN`, `--now "2026-10-19 10:15"`
+(marks tickets non-live `HISTORICAL` with a warning), `--today YYYY-MM-DD`,
+`--orders`, `--config`, `--risk`, `--state`, plus `decline --index N` and
+`show --json`.
+
 `ticket.py` never talks to a broker. It renders tickets, checks that a reply
 is a real yes for that order, builds the flatten ticket, and keeps the log in
-`trader/state/broker.json`. `--now "2026-10-19 10:15"` overrides the application clock (market local time) for backtesting and deterministic tests; clock-overridden tickets are always marked non-live (`HISTORICAL`) with a warning.
+`trader/state/broker.json`. In India mode (`--market IN` or `"broker": "paper"`),
+tickets render `MIS` intraday brackets or multi-session `CNC`/`NRML` GTT OCO
+orders with `₹` formatting, full authoritative `tick_size` decimal precision
+(including 4-decimal sub-paisa ticks such as `0.0025`), F&O lot counts, and
+estimated Indian statutory charges, for **paper trading only**. There is NO
+live Indian broker order execution; Upstox integration in `trader-alerts` is
+strictly read-only market data.
 
 ## What it reads and writes
 
@@ -52,7 +66,7 @@ is a real yes for that order, builds the flatten ticket, and keeps the log in
 | `trader/orders.json` | the proposed orders (trader-budget writes it; `flatten` replaces it) |
 | `trader/state/risk.json` | trader-risk's verdicts; only a PASS from today is READY |
 | `trader/state/broker.json` | every yes, no, placed, failed and filled, with each entry's max loss |
-| `trader/portfolio.json` | cash and shares, updated by `fill` and by `result --filled-qty` |
+| `trader/portfolio.json` | cash and shares (USD or INR), updated by `fill` and by `result --filled-qty` |
 | `trader/plan.json` | the flat-by time for `flatten` |
 
 ## Setup A: Alpaca (official MCP server, Claude Desktop)
@@ -144,9 +158,14 @@ that draft orders to Needs approval too.
 3. Run `ticket.py approve --index N --reply "<the user's reply, word for word>"`.
    If it prints "Not recorded", the reply was not an explicit yes for this
    order (for example "sure", "yes to all", or a yes that names a different
-   stock or amount). Ask again. Never turn a reply into a yes yourself.
-4. Only after "Recorded your yes", call `place_stock_order` with exactly the
-   JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   stock or amount, or a quantity that disagrees with the ticket). Ask again.
+   Never turn a reply into a yes yourself.
+4. Only after "Recorded your yes":
+   - For Alpaca/US connected accounts, call `place_stock_order` with exactly
+     the JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   - For Indian paper mode (`broker: "paper"`), record the paper result and
+     update `trader/portfolio.json` via `result` / `fill`; there is no live
+     Indian broker execution tool.
 5. Record what happened: `ticket.py result --index N --status placed
    --broker-id <id> --filled-qty Q --filled-price P` (the fill from the
    response or `get_open_position`), or `--status denied`, or `--status failed`
@@ -156,20 +175,21 @@ that draft orders to Needs approval too.
 ## Steps: while it is open, and out by the close
 
 - trader-alerts watches the stop, the target and the flat-by time
-  (`alerts.py add --from-plan`). The bracket's own orders do the stopping.
+  (`alerts.py add --from-plan`). The bracket's own orders (or paper GTT OCO
+  monitoring for positional Indian trades) track the exits.
 - When the stop-loss or the take-profit fills, record it:
   `ticket.py fill --symbol TSLA --side sell --qty 8 --price 358.32`.
-- By `flat_by` (15:55 ET for US, 15:20 IST for India), anything still open gets closed:
-  1. Ask Alpaca how many shares are held: `get_open_position` (read only).
-  2. `ticket.py flatten --symbol TSLA --qty 8` writes a market sell for those
+- By `flat_by` (15:55 ET for US, 15:20 IST for India intraday), anything still open gets closed:
+  1. Check held shares (`get_open_position` for Alpaca, or `trader/portfolio.json` for India paper).
+  2. `ticket.py flatten --symbol SYMBOL --qty N` writes a market sell for those
      shares to `trader/orders.json`.
   3. `/trader-risk`. A sell that only closes what the user holds is never
-     blocked by the daily limits or the entry window.
+     blocked by the daily limits, entry window, or missing cache on an
+     unpriced market flatten.
   4. `ticket.py show`, then the user's yes for that one order, as above.
-  5. The bracket's stop-loss and take-profit still hold those shares, so
-     Alpaca rejects a new sell until they are canceled: `get_orders` (status
-     open, nested true) shows them; `cancel_order_by_id` each one (Needs
-     approval). Then `place_stock_order` with the ticket, then `result`.
+  5. On Alpaca, the bracket's stop-loss and take-profit still hold those shares,
+     so cancel those open child orders first (`get_orders`, `cancel_order_by_id`
+     each one with Needs approval), then `place_stock_order`, then `result`.
 
 ## Example: the reel
 
@@ -197,6 +217,7 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 - Never places orders from a scheduled or background task: nobody is there to say yes.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
+- Never adds or enables live Indian broker execution (Upstox is strictly read-only).
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
 - Never promises a fill price: a market order and a stop fill at whatever the market gives.
 

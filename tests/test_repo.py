@@ -51,12 +51,16 @@ class Repo(unittest.TestCase):
         with open(gitignore_path, "r", encoding="utf-8") as fh:
             gitignore_lines = [line.strip() for line in fh]
         self.assertIn(".env", gitignore_lines, ".env must remain in .gitignore")
+        self.assertIn("dist/", gitignore_lines, "dist/ must remain in .gitignore")
         trader_path = os.path.join(ROOT, "trader")
         if os.path.exists(trader_path):
             self.assertTrue(os.path.isdir(trader_path), "trader at root must be a directory")
+        dist_path = os.path.join(ROOT, "dist")
+        if os.path.exists(dist_path):
+            self.assertTrue(os.path.isdir(dist_path), "dist at root must be a directory")
         root = sorted(
             d for d in os.listdir(ROOT)
-            if not d.startswith(".git") and d not in (".agents", ".env", "agents", "trader")
+            if not d.startswith(".git") and d not in (".agents", ".env", "agents", "dist", "trader")
         )
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
