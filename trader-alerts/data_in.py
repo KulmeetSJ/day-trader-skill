@@ -7,6 +7,7 @@ Python 3.8 compatible without third-party dependencies.
 """
 
 import datetime
+from decimal import Decimal, InvalidOperation
 import gzip
 import inspect
 import json
@@ -44,6 +45,35 @@ YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 DEFAULT_TIMEOUT = 10
 DEFAULT_PAUSE = 0.3
 DEFAULT_BACKOFF = 2.0
+
+
+def _normalize_provider_tick_size(raw_tick, source_unit="INR", segment="", instrument_type=""):
+    """Normalize raw tick_size to canonical INR (rupees) without inventing precision.
+
+    Divides by 100 via Decimal ONLY when source_unit is 'paise'. Returns (tick_inr_or_none, status).
+    Valid status values: 'ok', 'not_applicable_index', 'missing', 'invalid'.
+    """
+    seg_up = str(segment or "").strip().upper()
+    type_up = str(instrument_type or "").strip().upper()
+    is_index = seg_up.endswith("_INDEX") or type_up == "INDEX"
+
+    if raw_tick is None or (isinstance(raw_tick, str) and not raw_tick.strip()):
+        return None, ("not_applicable_index" if is_index else "missing")
+    if isinstance(raw_tick, bool):
+        return None, "invalid"
+    try:
+        dec = Decimal(str(raw_tick).strip())
+    except (InvalidOperation, ValueError):
+        return None, "invalid"
+    if not dec.is_finite() or dec <= 0:
+        return None, "invalid"
+
+    unit = str(source_unit or "INR").strip().lower()
+    if unit in ("paise", "paisa", "p"):
+        dec = dec / Decimal("100")
+    elif unit not in ("inr", "rupee", "rupees"):
+        return None, "invalid"
+    return float(dec), "ok"
 
 
 class DataStatus:
@@ -1542,35 +1572,132 @@ class OfflineMarketDataProvider(MarketDataProvider):
             for fname in ("instruments.json", "instruments-%s.json" % exch.lower(), "nse_instruments.json"):
                 cand = os.path.join(self.base_path, fname)
                 if os.path.exists(cand):
-                    doc = json.loads(self._read_file(cand))
-                    raw_items = doc.get("instruments") if isinstance(doc, dict) else doc
+                    try:
+                        doc = json.loads(self._read_file(cand))
+                    except ValueError as e:
+                        raise DataError("Malformed instrument JSON in %s: %s" % (cand, e))
+                    if isinstance(doc, dict):
+                        if isinstance(doc.get("instruments"), list):
+                            try:
+                                flat_list = [
+                                    instruments._normalize_cache_record_tick(
+                                        r,
+                                        cache_payload=doc,
+                                        allow_none=True,
+                                        sym_hint=(r.get("symbol") or r.get("canonical_symbol")),
+                                    )
+                                    for r in doc["instruments"]
+                                    if isinstance(r, dict)
+                                ]
+                                by_exch_raw = doc.get("instruments_by_exchange")
+                                if "instruments_by_exchange" in doc and by_exch_raw is not None:
+                                    if not isinstance(by_exch_raw, dict):
+                                        raise instruments.InstrumentMetadataError(
+                                            "Malformed instrument cache: 'instruments_by_exchange' must be a dict"
+                                        )
+                                    ex_bucket = by_exch_raw.get(exch)
+                                    if ex_bucket is None:
+                                        raw_items = []
+                                    elif isinstance(ex_bucket, dict):
+                                        raw_items = [
+                                            instruments._normalize_cache_record_tick(
+                                                r, cache_payload=doc, allow_none=True, sym_hint=k
+                                            )
+                                            for k, r in ex_bucket.items()
+                                        ]
+                                    elif isinstance(ex_bucket, list):
+                                        raw_items = [
+                                            instruments._normalize_cache_record_tick(
+                                                r,
+                                                cache_payload=doc,
+                                                allow_none=True,
+                                                sym_hint=(r.get("symbol") or r.get("canonical_symbol")),
+                                            )
+                                            for r in ex_bucket
+                                            if isinstance(r, dict)
+                                        ]
+                                    else:
+                                        raise instruments.InstrumentMetadataError(
+                                            "Malformed instrument cache: exchange bucket %r must be a dict" % (exch,)
+                                        )
+                                else:
+                                    raw_items = flat_list
+                            except instruments.InstrumentMetadataError as e:
+                                raise DataError(str(e))
+                        else:
+                            try:
+                                norm_doc = instruments.normalize_instrument_cache_payload(doc, allow_none_tick=True)
+                            except instruments.InstrumentMetadataError as e:
+                                raise DataError(str(e))
+                            by_exch = norm_doc.get("instruments_by_exchange")
+                            if isinstance(by_exch, dict):
+                                ex_bucket = by_exch.get(exch)
+                                raw_items = list(ex_bucket.values()) if isinstance(ex_bucket, dict) else []
+                            else:
+                                flat = norm_doc.get("instruments") or {}
+                                raw_items = list(flat.values()) if isinstance(flat, dict) else flat
+                    elif isinstance(doc, list):
+                        try:
+                            raw_items = [
+                                instruments._normalize_cache_record_tick(r, cache_payload=None, allow_none=True)
+                                for r in doc
+                                if isinstance(r, dict)
+                            ]
+                        except instruments.InstrumentMetadataError as e:
+                            raise DataError(str(e))
+                    else:
+                        raise DataError("Malformed instrument JSON root in %s" % cand)
                     break
         if raw_items is None and os.path.isdir(self.base_path):
             for fname in ("EQUITY_L.csv", "EQUITY_L_sample.csv"):
                 cand = os.path.join(self.base_path, fname)
                 if os.path.exists(cand):
                     try:
-                        raw_items = instruments.parse_equity_l_csv(self._read_file(cand), exchange=exch)
+                        parsed = instruments.parse_equity_l_csv(self._read_file(cand), exchange=exch)
+                        raw_items = list(parsed.values()) if isinstance(parsed, dict) else parsed
                     except Exception:
                         raw_items = None
                     break
         if raw_items is None and os.path.exists(instruments.DEFAULT_CACHE_PATH):
             try:
                 cache_payload = instruments.load_instrument_cache(max_age_days=3650)
-                if cache_payload and cache_payload.get("instruments"):
+            except (FileNotFoundError, instruments.StaleMetadataError):
+                cache_payload = None
+            except instruments.InstrumentMetadataError as e:
+                raise DataError(str(e))
+            if cache_payload:
+                by_exch = cache_payload.get("instruments_by_exchange")
+                if isinstance(by_exch, dict):
+                    ex_bucket = by_exch.get(exch)
+                    raw_items = list(ex_bucket.values()) if isinstance(ex_bucket, dict) else []
+                elif isinstance(cache_payload.get("instruments"), dict):
                     raw_items = list(cache_payload["instruments"].values())
-            except Exception:
-                raw_items = None
         if raw_items is None:
             raw_items = list(instruments.INDEX_INSTRUMENTS.values())
         target_sym = symbols_in.normalize_symbol(symbol) if symbol else None
         for rec in (raw_items or []):
             if not isinstance(rec, dict):
                 continue
-            sym = symbols_in.normalize_symbol(rec.get("symbol") or "")
-            rec_exch = _normalize_exchange(rec.get("exchange") or exch)
+            sym = symbols_in.normalize_symbol(rec.get("symbol") or rec.get("canonical_symbol") or "")
+            raw_rec_exch = rec.get("exchange")
+            if raw_rec_exch:
+                rec_exch = _normalize_exchange(raw_rec_exch)
+                if rec_exch != exch:
+                    continue
+            else:
+                rec_exch = exch
             if target_sym and sym != target_sym:
                 continue
+            try:
+                norm_rec = instruments._normalize_cache_record_tick(rec, cache_payload=None, allow_none=True, sym_hint=sym)
+            except instruments.InstrumentMetadataError as e:
+                raise DataError(str(e))
+            tick_inr, tick_status = _normalize_provider_tick_size(
+                norm_rec.get("tick_size"),
+                source_unit=norm_rec["tick_size_unit"],
+                segment=norm_rec.get("segment") or "",
+                instrument_type=norm_rec.get("asset_type") or norm_rec.get("instrument_type") or "",
+            )
             items.append({
                 "symbol": sym,
                 "exchange": rec_exch,
@@ -1578,7 +1705,9 @@ class OfflineMarketDataProvider(MarketDataProvider):
                 "name": rec.get("name", ""),
                 "asset_type": rec.get("asset_type", "EQUITY"),
                 "lot_size": int(rec.get("lot_size") or 1),
-                "tick_size": float(rec.get("tick_size") or 0.05),
+                "tick_size": tick_inr,
+                "tick_size_unit": "INR",
+                "tick_size_status": tick_status,
                 "isin": rec.get("isin"),
             })
         return _standardize_payload(
@@ -1611,7 +1740,10 @@ class OfflineMarketDataProvider(MarketDataProvider):
             except SymbolNotFoundError:
                 path = self._locate_file(canonical, "option-chain")
         text = self._read_file(path)
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise DataError("Malformed option chain JSON in %s: %s" % (path, e))
         if isinstance(data, dict):
             data["source"] = "offline"
             data["tier"] = self.tier
@@ -2665,10 +2797,10 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                     info = None
             except Exception:
                 info = None
-        elif self._http_get_fn is None and exch == "NSE" and hasattr(instruments, "resolve_instrument"):
+        elif self._http_get_fn is None and exch in ("NSE", "BSE") and hasattr(instruments, "resolve_instrument"):
             try:
-                cand_info = instruments.resolve_instrument(canon, require_intraday=False)
-                if isinstance(cand_info, dict) and str(cand_info.get("exchange") or "NSE").upper() == "NSE":
+                cand_info = instruments.resolve_instrument(canon, require_intraday=False, exchange=exch)
+                if isinstance(cand_info, dict) and str(cand_info.get("exchange") or "NSE").upper() == exch:
                     info = cand_info
             except Exception:
                 info = None
@@ -2937,7 +3069,7 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         item = self._extract_quote_item(data_map, ikey, canon, exch)
         return self._normalize_quote_item(item, ikey, canon, exch, now=now, mode="ltp")
 
-    def get_ohlc(self, symbol, interval="1d", exchange="NSE", now=None):
+    def get_ohlc(self, symbol, exchange="NSE", interval="1d", now=None):
         ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
         upstox_iv = {"1d": "1d", "1m": "I1", "30m": "I30"}.get(str(interval or "1d").lower(), interval)
         try:
@@ -3015,8 +3147,9 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             for ikey, canon, exch in batch:
                 try:
                     item = self._extract_quote_item(data_map, ikey, canon, exch)
-                    if item is not None:
-                        out[canon] = self._normalize_quote_item(item, ikey, canon, exch, now=now, mode=req_mode)
+                    if item is None:
+                        raise DataError("No quote returned for %s:%s" % (exch, canon))
+                    out[canon] = self._normalize_quote_item(item, ikey, canon, exch, now=now, mode=req_mode)
                 except DataError as e:
                     out[canon] = _standardize_payload(
                         {
@@ -3349,17 +3482,38 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                 ikey = str(rec.get("instrument_key") or "").strip()
                 tsym = str(rec.get("trading_symbol") or rec.get("tradingsymbol") or "").strip()
                 ex = _normalize_exchange(rec.get("exchange") or norm_exch)
+                seg_str = rec.get("segment") or ""
+                itype_str = rec.get("instrument_type") or ""
+                # Upstox BOD JSON instrument master publishes tick_size in paise; normalize once to INR.
+                if "tick_size_unit" in rec:
+                    raw_unit = rec.get("tick_size_unit")
+                    unit_low = str(raw_unit or "").strip().lower()
+                    if not unit_low or unit_low not in ("inr", "rupee", "rupees", "paise", "paisa", "p"):
+                        raise DataError(
+                            "Unsupported tick_size_unit %r for Upstox instrument %r"
+                            % (raw_unit, tsym or ikey)
+                        )
+                else:
+                    raw_unit = "paise"
+                tick_inr, tick_status = _normalize_provider_tick_size(
+                    rec.get("tick_size"),
+                    source_unit=raw_unit,
+                    segment=seg_str,
+                    instrument_type=itype_str,
+                )
                 item = {
                     "symbol": tsym,
                     "trading_symbol": tsym,
                     "name": rec.get("name") or rec.get("short_name") or tsym,
                     "exchange": ex,
-                    "segment": rec.get("segment") or "",
+                    "segment": seg_str,
                     "instrument_key": ikey,
                     "instrument_token": rec.get("exchange_token") or ikey,
                     "isin": rec.get("isin") or "",
-                    "instrument_type": rec.get("instrument_type") or "",
-                    "tick_size": rec.get("tick_size"),
+                    "instrument_type": itype_str,
+                    "tick_size": tick_inr,
+                    "tick_size_unit": "INR",
+                    "tick_size_status": tick_status,
                     "lot_size": rec.get("lot_size"),
                     "expiry": rec.get("expiry"),
                     "strike_price": rec.get("strike_price"),
@@ -3407,7 +3561,7 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             {
                 "symbol": symbol or norm_exch,
                 "exchange": norm_exch,
-                "instruments": filtered,
+                "instruments": [dict(r) for r in filtered],
                 "count": len(filtered),
             },
             provider_name=self.provider_name,
@@ -3417,6 +3571,19 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             tier=DataTier.HISTORICAL,
             is_live=False,
         )
+
+    def get_instrument_metadata(self, symbol, exchange="NSE", require_tick=False):
+        """Resolve an instrument's normalized metadata (canonical INR tick_size, lot_size, key)."""
+        ikey, canon, exch = self.resolve_instrument_key(symbol, exchange=exchange)
+        if ikey not in self._meta_by_key:
+            self.get_instruments(exchange=exch)
+        meta = dict(self._meta_by_key.get(ikey) or {"instrument_key": ikey, "symbol": canon, "exchange": exch})
+        if require_tick and meta.get("tick_size") is None:
+            raise DataError(
+                "Missing or invalid tick_size for %s (%s): %s"
+                % (symbol, exch, meta.get("tick_size_status") or "missing")
+            )
+        return meta
 
     def get_derivatives_master(self, exchange="NSE", underlying=None):
         norm_exch = _normalize_exchange(exchange)

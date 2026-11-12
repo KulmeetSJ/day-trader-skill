@@ -272,7 +272,7 @@ class TestBharatRules2026(unittest.TestCase):
         plan = {
             "symbol": "RELIANCE", "entry": 1326.0, "stop": 1318.95, "target": 1340.10,
             "risk_per_share": 7.05, "reward_risk": 2.0, "entry_from": "plan", "flat_by": "15:20",
-            "market": "IN", "currency": "INR", "trading_style": "intraday"
+            "market": "IN", "currency": "INR", "tick_size": 0.05, "trading_style": "intraday"
         }
         cfg = {
             "budget": 100000, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_inr": 75000,

@@ -55,6 +55,7 @@ Money that cannot be invested is reported as "left idle", never hidden.
 
 import argparse
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 import json
 import math
 import os
@@ -667,6 +668,53 @@ def _cfg_money(raw_cfg, merged_cfg, base, market, default=None):
     return val if val is not None else default
 
 
+def _parse_tick(val, allow_none=False, context="tick_size"):
+    """Validate and return positive finite float tick size, or None if allowed."""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        if allow_none:
+            return None
+        raise SizeError("Missing tick_size in %s" % context)
+    if isinstance(val, bool):
+        raise SizeError("Invalid boolean tick_size %r in %s" % (val, context))
+    try:
+        dec = Decimal(str(val).strip())
+    except (InvalidOperation, ValueError):
+        raise SizeError("Invalid non-numeric tick_size %r in %s" % (val, context))
+    if not dec.is_finite() or dec <= 0:
+        raise SizeError("Invalid non-positive tick_size %r in %s" % (val, context))
+    return float(dec)
+
+
+def _tick_scale(tick=0.01):
+    try:
+        d = Decimal(str(tick))
+        return max(2, -d.as_tuple().exponent)
+    except Exception:
+        return 2
+
+
+def round_tick(x, tick=0.01):
+    """Round a price to exact multiples of tick (half up)."""
+    d_x = Decimal(str(float(x)))
+    d_tick = Decimal(str(tick))
+    q_fmt = Decimal("1").scaleb(-_tick_scale(tick))
+    val = ((d_x / d_tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_tick).quantize(
+        q_fmt, rounding=ROUND_HALF_UP
+    )
+    return float(val) + 0.0
+
+
+def floor_tick(x, tick=0.01):
+    """Floor a price down to exact multiples of tick (protective for stops)."""
+    d_x = Decimal(str(float(x)))
+    d_tick = Decimal(str(tick))
+    q_fmt = Decimal("1").scaleb(-_tick_scale(tick))
+    val = ((d_x / d_tick).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_tick).quantize(
+        q_fmt, rounding=ROUND_HALF_UP
+    )
+    return float(val) + 0.0
+
+
 def round_price(x):
     """Round a price to 0.01 sub-units (cent or paise, half up)."""
     return math.floor(float(x) * 100 + 0.5 + EPS) / 100.0
@@ -676,8 +724,10 @@ round_cent = round_price
 
 
 def shares_for(amount, per_share, lot_size=1):
-    """Whole shares that fit in amount at per_share, in exact integer sub-units (cents or paise), aligned to lot_size."""
-    u, p = int(round(float(amount) * 100)), int(round(float(per_share) * 100))
+    """Whole shares that fit in amount at per_share, in exact sub-units aligned to lot_size."""
+    scale = Decimal("10000")
+    u = int((Decimal(str(round(float(amount), 4))) * scale).to_integral_value(rounding=ROUND_HALF_UP))
+    p = int((Decimal(str(round(float(per_share), 4))) * scale).to_integral_value(rounding=ROUND_HALF_UP))
     if p <= 0 or u <= 0:
         return 0
     raw = u // p
@@ -686,9 +736,10 @@ def shares_for(amount, per_share, lot_size=1):
     return raw
 
 
-def _price(x):
-    """358.32 -> "358.32": Alpaca wants prices as strings."""
-    return "%.2f" % round_cent(x)
+def _price(x, tick=0.01):
+    """358.32 -> "358.32": format price cleanly to tick precision."""
+    scale = _tick_scale(tick)
+    return "%.*f" % (scale, round_tick(x, tick))
 
 
 def _num(x):
@@ -756,7 +807,7 @@ def validate_positional_support(cfg, market="IN", asset_type="EQUITY", stop=None
     }
 
 
-def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None, instruments_path=None, trading_style=None):
+def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None, market=None, instruments_path=None, trading_style=None, exchange=None):
     """Pure function: one plan + your rules -> the sizing (a dict). qty may be 0.
 
     limit  the limit price for a limit order (None = market)
@@ -768,11 +819,20 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     c.update(raw_cfg)
     if not isinstance(plan, dict):
         raise SizeError("the plan is not a JSON object")
-    sym = str(plan.get("symbol") or "").strip().upper()
+    raw_sym = str(plan.get("symbol") or "").strip().upper()
+    sym = raw_sym
     if not sym:
         raise SizeError("the plan has no symbol (run trader-exit)")
     if market is None:
         market = get_market_profile(plan=plan, cfg=c)
+    req_exchange = exchange or plan.get("exchange") or c.get("exchange")
+    if not req_exchange:
+        if raw_sym.endswith(".BO") or raw_sym.startswith("BSE:"):
+            req_exchange = "BSE"
+        elif raw_sym.endswith(".NS") or raw_sym.startswith("NSE:"):
+            req_exchange = "NSE"
+    if req_exchange:
+        req_exchange = str(req_exchange).strip().upper()
     if market == "IN" and symbols_in:
         try:
             sym = symbols_in.normalize_symbol(sym)
@@ -830,22 +890,69 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if not 0 <= buf_pct < 100:
         raise SizeError("cash_buffer_pct must be between 0 and 100")
 
-    if limit is not None:
-        ref, ref_from = round_cent(limit), "limit"
-    elif price is not None and round_cent(price) > round_cent(entry_plan):
-        ref, ref_from = round_cent(price), "price"
+    # Indian instrument metadata: load cache first so tick size drives price normalization
+    inst_cache = None
+    inst = None
+    inst_tick = None
+    resolved_exchange = req_exchange or ("NSE" if market == "IN" else None)
+    explicit_inst = instruments_path is not None
+    if market == "IN" and instruments:
+        inst_path = instruments_path or getattr(instruments, "DEFAULT_CACHE_PATH", None)
+        if explicit_inst and (not inst_path or not os.path.isfile(inst_path)):
+            raise SizeError("Instrument cache not found at: %s" % inst_path)
+        if inst_path and os.path.isfile(inst_path):
+            try:
+                inst_cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=today)
+            except Exception as exc:
+                raise SizeError("Failed to load authoritative instrument cache (%s): %s" % (inst_path, exc))
+        if inst_cache is not None:
+            instr_err_cls = getattr(instruments, "InstrumentMetadataError", Exception)
+            try:
+                inst = instruments.resolve_instrument(
+                    raw_sym, cache_payload=inst_cache, require_intraday=False, exchange=req_exchange
+                )
+            except instr_err_cls as exc:
+                raise SizeError(str(exc))
+            if inst:
+                inst_tick = _parse_tick(inst.get("tick_size"), allow_none=False, context="instrument master (%s)" % sym)
+                if inst.get("exchange"):
+                    resolved_exchange = str(inst["exchange"]).strip().upper()
+
+    plan_tick = None
+    if "tick_size" in plan:
+        plan_tick = _parse_tick(plan.get("tick_size"), allow_none=False, context="plan (%s)" % sym)
+    if inst_tick is not None and plan_tick is not None and Decimal(str(inst_tick)) != Decimal(str(plan_tick)):
+        raise SizeError(
+            "Plan tick_size %s disagrees with instrument master tick_size %s (%s) for %s"
+            % (plan_tick, inst_tick, resolved_exchange, sym)
+        )
+    if inst_tick is not None:
+        tick_size = inst_tick
+    elif plan_tick is not None:
+        tick_size = plan_tick
+    elif market == "IN":
+        raise SizeError(
+            "Cannot authoritatively resolve tick_size for %s: provide a valid instrument cache or plan tick_size"
+            % sym
+        )
     else:
-        ref, ref_from = round_cent(entry_plan), "plan"
-    stop, target = round_cent(stop), round_cent(target)
+        tick_size = 0.01
+
+    if limit is not None:
+        ref, ref_from = round_tick(limit, tick_size), "limit"
+    elif price is not None and round_tick(price, tick_size) > round_tick(entry_plan, tick_size):
+        ref, ref_from = round_tick(price, tick_size), "price"
+    else:
+        ref, ref_from = round_tick(entry_plan, tick_size), "plan"
+    stop, target = floor_tick(stop, tick_size), round_tick(target, tick_size)
     if stop >= ref:
         raise SizeError("the stop %s is not below the entry %s; a long trade needs its stop underneath"
-                        % (_price(stop), _price(ref)))
+                        % (_price(stop, tick_size), _price(ref, tick_size)))
     if target <= ref:
         raise SizeError("the target %s is not above the entry %s: the move has already happened. "
-                        "Skip it or make a new plan with trader-exit" % (_price(target), _price(ref)))
-    risk_c = int(round((ref - stop) * 100))
-    reward_c = int(round((target - ref) * 100))
-    risk = risk_c / 100.0
+                        "Skip it or make a new plan with trader-exit" % (_price(target, tick_size), _price(ref, tick_size)))
+    risk = float(Decimal(str(ref)) - Decimal(str(stop)))
+    reward = float(Decimal(str(target)) - Decimal(str(ref)))
 
     cash_buffer = round(budget * buf_pct / 100.0, 2)
     available = budget - cash_buffer
@@ -855,7 +962,6 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         cash_note = "cash %s in trader/portfolio.json minus the %s buffer" % (money(cash, market=market), money(cash_buffer, market=market))
     available = max(round(available, 2), 0.0)
 
-    # Indian instrument metadata: lot size, tick size, Trade-to-Trade check
     lot_size = int(plan.get("lot_size") or 1)
     if asset_type == "EQUITY" and not (symbols_in and symbols_in.is_derivative_symbol(sym)):
         # Cash equity trades in shares (lot_size=1). F&O contract lot sizes must not apply to cash equity.
@@ -864,29 +970,28 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         if plan.get("option_contract") and plan["option_contract"].get("lot_size"):
             lot_size = int(plan["option_contract"]["lot_size"])
         elif market == "IN" and instruments:
-            fo_lot = instruments.get_fo_lot_size(sym)
+            fo_lot = instruments.get_fo_lot_size(sym, cache_payload=inst_cache)
             if fo_lot:
                 lot_size = int(fo_lot)
     if asset_type in ("OPTIONS", "FUTURES") and lot_size <= 1:
         raise SizeError("Cannot authoritatively resolve F&O lot size for derivative %r: missing or incomplete instrument metadata" % sym)
     if lot_size <= 0:
         lot_size = 1
-    tick_size = _f(plan.get("tick_size")) or (0.05 if market == "IN" else 0.01)
 
     is_t2t = bool(plan.get("is_trade_to_trade"))
     series = plan.get("series", "")
     if not is_t2t and market == "IN" and instruments:
-        try:
-            inst_path = instruments_path or getattr(instruments, "DEFAULT_CACHE_PATH", None)
-            cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=today) if inst_path else None
-            inst = instruments.resolve_instrument(sym, cache_payload=cache, require_intraday=False)
-            if inst:
-                if inst.get("is_trade_to_trade"):
-                    is_t2t = True
-                if not series and inst.get("series"):
-                    series = inst["series"]
-        except Exception:
-            pass
+        if inst is None and isinstance(inst_cache, dict):
+            try:
+                canon_sym = symbols_in.normalize_symbol(sym) if symbols_in else sym
+            except Exception:
+                canon_sym = sym
+            inst = (inst_cache.get("instruments") or {}).get(canon_sym)
+        if inst:
+            if inst.get("is_trade_to_trade"):
+                is_t2t = True
+            if not series and inst.get("series"):
+                series = inst["series"]
     if is_t2t or (series and series.upper() in ("BE", "BZ", "T")):
         is_t2t = True
 
@@ -900,18 +1005,18 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     max_loss = _f(_cfg_money(raw_cfg, c, "max_loss_per_trade", market))
     if max_loss:
         limits.append(_limit_row("max loss", max_loss, risk, shares_for(max_loss, risk, lot_size=lot_size),
-                                 "%s max loss / %s risk a share" % (money(max_loss, market=market), _price(risk))))
+                                 "%s max loss / %s risk a share" % (money(max_loss, market=market), _price(risk, tick_size))))
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
         limits.append(_limit_row("position cap", cap, ref, shares_for(cap, ref, lot_size=lot_size),
-                                 "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget, market=market), money(cap, market=market), _price(ref))))
+                                 "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget, market=market), money(cap, market=market), _price(ref, tick_size))))
     max_order = _f(_cfg_money(raw_cfg, c, "max_order", market))
     if max_order:
         limits.append(_limit_row("max order", max_order, ref, shares_for(max_order, ref, lot_size=lot_size),
-                                 "%s / %s" % (money(max_order, market=market), _price(ref))))
+                                 "%s / %s" % (money(max_order, market=market), _price(ref, tick_size))))
     limits.append(_limit_row("cash", available, ref, shares_for(available, ref, lot_size=lot_size),
-                             "%s = %s / %s" % (cash_note, money(available, market=market), _price(ref))))
+                             "%s = %s / %s" % (cash_note, money(available, market=market), _price(ref, tick_size))))
 
     min_order_raw = _cfg_money(raw_cfg, c, "min_order", market, default=5)
     min_order = _f(min_order_raw) if min_order_raw is not None else 0
@@ -933,7 +1038,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         refusal = None
 
     cost = round(qty * ref, 2)
-    loss = round(qty * risk_c / 100.0, 2)
+    loss = round(qty * risk, 2)
 
     if not is_t2t:
         min_rr = _f(c.get("min_reward_risk"))
@@ -947,15 +1052,15 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
                 else:
                     refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
                                "No order. Skip this trade, or plan a closer stop with trader-exit."
-                               % (money(risk, market=market), _price(ref), _price(stop), money(max_loss, market=market)))
+                               % (money(risk, market=market), _price(ref, tick_size), _price(stop, tick_size), money(max_loss, market=market)))
             else:
                 unit_lbl = ("one lot of %s (%d shares)" % (sym, lot_size)) if lot_size > 1 else ("one share of %s" % sym)
                 refusal = ("%s costs %s, more than your %s limit (%s). No order."
                            % (unit_lbl, money(ref, market=market), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
-        elif min_rr and reward_c < min_rr * risk_c - EPS:
+        elif min_rr and reward < min_rr * risk - EPS:
             refusal = ("reward:risk %.2f (target %s, entry %s, stop %s) is under your minimum %s, so trader-risk "
                        "would block it. No order. Skip it, or make a new plan with trader-exit."
-                       % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
+                       % (reward / float(risk), _price(target, tick_size), _price(ref, tick_size), _price(stop, tick_size), _num(c["min_reward_risk"])))
         elif cost < float(min_order) - 0.005:
             refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
                        % (qty, "" if qty == 1 else "s", sym, money(cost, market=market), money(min_order, market=market)))
@@ -980,9 +1085,9 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     trading_style = resolved_style
     res = {
         "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
-        "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
+        "entry_time": plan.get("entry_time", ""), "entry_plan": round_tick(entry_plan, tick_size),
         "entry": ref, "entry_from": ref_from, "stop": stop, "target": target,
-        "risk_per_share": risk, "reward_risk": round(reward_c / float(risk_c), 2),
+        "risk_per_share": risk, "reward_risk": round(reward / float(risk), 2),
         "stop_label": plan.get("stop_label", ""), "target_label": plan.get("target_label", ""),
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "currency": "INR" if market == "IN" else "USD",
@@ -1012,6 +1117,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         res["currency"] = "INR"
         res["lot_size"] = lot_size
         res["tick_size"] = tick_size
+        if resolved_exchange:
+            res["exchange"] = resolved_exchange
         if is_t2t:
             res["is_trade_to_trade"] = True
         res["transaction_costs"] = calculate_indian_transaction_charges(
@@ -1040,13 +1147,19 @@ def build_order(s, cfg=None):
         raise SizeError("unsupported trading_style %r; use 'intraday' or 'positional'" % style)
 
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
+    if s.get("tick_size") is not None:
+        tick_sz = s["tick_size"]
+    elif market == "IN":
+        raise SizeError("Missing resolved tick_size for %s" % s.get("symbol"))
+    else:
+        tick_sz = 0.01
     max_loss_limit = s.get("max_loss_per_trade") if s.get("max_loss_per_trade") is not None else s.get("max_loss_per_trade_usd")
     max_loss_how = "%s max loss per trade" % money(max_loss_limit or 0, market=market)
     why = ("%s on %s: %d shares, bound by your %s (%d x %s = %s at the stop)"
            % (setup, s["symbol"], s["qty"], {"max loss": max_loss_how,
                                              "position cap": "position cap", "max order": "max order",
                                              "cash": "cash after the buffer"}.get(s["bound_by"], s["bound_by"]),
-              s["qty"], _price(s["risk_per_share"]), money(s["max_loss"], market=market)))
+              s["qty"], _price(s["risk_per_share"], tick_sz), money(s["max_loss"], market=market)))
 
     if style == "positional":
         eff_cfg = cfg if cfg is not None else {
@@ -1064,13 +1177,13 @@ def build_order(s, cfg=None):
             "time_in_force": "gtc",
             "persists_across_sessions": True,
             "triggers": {
-                "stop_loss": _price(s["stop"]),
-                "take_profit": _price(s["target"]),
+                "stop_loss": _price(s["stop"], tick_sz),
+                "take_profit": _price(s["target"], tick_sz),
             },
             "note": (
                 "Paper GTT OCO (%s): stop-loss %s and take-profit %s remain active across sessions "
                 "until triggered, canceled, or manually exited."
-                % (product, _price(s["stop"]), _price(s["target"]))
+                % (product, _price(s["stop"], tick_sz), _price(s["target"], tick_sz))
             ),
         }
         o = {
@@ -1081,13 +1194,13 @@ def build_order(s, cfg=None):
             "time_in_force": "gtc",
         }
         if s["order_type"] == "limit":
-            o["limit_price"] = _price(s["entry"])
+            o["limit_price"] = _price(s["entry"], tick_sz)
         o.update({
             "order_class": "gtt_oco",
             "product": product,
             "trading_style": "positional",
-            "take_profit_limit_price": _price(s["target"]),
-            "stop_loss_stop_price": _price(s["stop"]),
+            "take_profit_limit_price": _price(s["target"], tick_sz),
+            "stop_loss_stop_price": _price(s["stop"], tick_sz),
             "multi_session_protection": protection,
             "why": why,
             "plan": {
@@ -1101,11 +1214,11 @@ def build_order(s, cfg=None):
         o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
              "time_in_force": "day"}
         if s["order_type"] == "limit":
-            o["limit_price"] = _price(s["entry"])
+            o["limit_price"] = _price(s["entry"], tick_sz)
         o.update({
             "order_class": "bracket",
-            "take_profit_limit_price": _price(s["target"]),
-            "stop_loss_stop_price": _price(s["stop"]),
+            "take_profit_limit_price": _price(s["target"], tick_sz),
+            "stop_loss_stop_price": _price(s["stop"], tick_sz),
             "why": why,
             "plan": {"entry": s["entry"], "stop": s["stop"], "target": s["target"],
                      "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
@@ -1135,6 +1248,12 @@ def build_order(s, cfg=None):
         o["market"] = "IN"
         o["currency"] = "INR"
         o["plan"]["market"] = "IN"
+        if s.get("tick_size") is not None:
+            o["tick_size"] = s["tick_size"]
+            o["plan"]["tick_size"] = s["tick_size"]
+        if s.get("exchange"):
+            o["exchange"] = s["exchange"]
+            o["plan"]["exchange"] = s["exchange"]
     for k in PROVENANCE_KEYS:
         if k in s:
             o[k] = s[k]
@@ -1150,20 +1269,26 @@ def bracket_order(s, cfg=None):
 def plan_report(s, order, notes=()):
     lines = []
     market = s.get("market", "US")
+    if s.get("tick_size") is not None:
+        tick_sz = s["tick_size"]
+    elif market == "IN":
+        raise SizeError("Missing resolved tick_size for %s" % s.get("symbol"))
+    else:
+        tick_sz = 0.01
     tz_label = "IST" if market == "IN" else "New York"
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
-    lines.append("%s buy, %s, entry %s%s" % (s["symbol"], setup, _price(s["entry_plan"]),
+    lines.append("%s buy, %s, entry %s%s" % (s["symbol"], setup, _price(s["entry_plan"], tick_sz),
                                             (" at " + s["entry_time"]) if s["entry_time"] else ""))
-    lines.append("Stop %s%s. Target %s%s." % (_price(s["stop"]), (": " + s["stop_label"]) if s["stop_label"] else "",
-                                             _price(s["target"]),
+    lines.append("Stop %s%s. Target %s%s." % (_price(s["stop"], tick_sz), (": " + s["stop_label"]) if s["stop_label"] else "",
+                                             _price(s["target"], tick_sz),
                                              (": " + s["target_label"]) if s["target_label"] else ""))
     for n in notes:
         lines.append(n)
     src = {"plan": "the plan's entry", "price": "the latest price, above the plan's entry",
            "limit": "your limit price"}[s["entry_from"]]
     lines.append("Sized at %s (%s). Risk %s a share (entry %s minus stop %s). Reward:risk %.2f."
-                 % (_price(s["entry"]), src, _price(s["risk_per_share"]), _price(s["entry"]), _price(s["stop"]),
-                    s["reward_risk"]))
+                 % (_price(s["entry"], tick_sz), src, _price(s["risk_per_share"], tick_sz),
+                    _price(s["entry"], tick_sz), _price(s["stop"], tick_sz), s["reward_risk"]))
     lines.append("")
     lines.append("Limits (whole shares; the smallest one wins):")
     for l in s["limits"]:
@@ -1621,11 +1746,6 @@ def run_plan(a, cfg):
         if p is not None and fresh:
             price = p
             used_price_t = t
-            if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
-                notes.append("%s last %s (as of %s %s) is above the plan's entry %s, so the risk "
-                             "is bigger: sized at %s." % (sym, _price(p), to_local(t, market=market).strftime("%H:%M"),
-                                                          tz_lbl,
-                                                          _price(plan.get("entry")), _price(p)))
         elif p is not None:
             if t is not None and t > now:
                 notes.append(
@@ -1643,7 +1763,18 @@ def run_plan(a, cfg):
         cash = _f(pf.get("cash")) if isinstance(pf, dict) else None
     s = size_trade(plan, cfg, a.budget, limit, price, cash, today, market=market,
                    instruments_path=getattr(a, "instruments", None),
-                   trading_style=getattr(a, "trading_style", None))
+                   trading_style=getattr(a, "trading_style", None),
+                   exchange=getattr(a, "exchange", None))
+    if price is not None and used_price_t is not None and s.get("entry_from") == "price":
+        note_tick = s.get("tick_size") or 0.01
+        notes.insert(0, "%s last %s (as of %s %s) is above the plan's entry %s, so the risk "
+                     "is bigger: sized at %s." % (
+                         sym, _price(price, note_tick),
+                         to_local(used_price_t, market=market).strftime("%H:%M"),
+                         tz_lbl,
+                         _price(s["entry_plan"], note_tick),
+                         _price(s["entry"], note_tick),
+                     ))
 
     plan_lts_utc = parse_utc(plan.get("last_data_timestamp")) if isinstance(plan, dict) else None
     latest_data_utc = plan_lts_utc
@@ -1744,9 +1875,10 @@ def main(argv=None):
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; its cash caps the size if it exists")
     ap.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
+    ap.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian instruments (NSE or BSE)")
     ap.add_argument("--trading-style", choices=["intraday", "positional"],
                     help="override trading style (intraday bracket/day vs positional CNC/NRML GTT OCO)")
-    ap.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
+    ap.add_argument("--instruments", default=None, help="path to instruments cache (defaults to trader/state/instruments.json if present)")
     ap.add_argument("--now", help="override the application clock to this market time for backtests/tests, e.g. \"2026-10-19 10:15\" (marks signals non-live)")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",
                     help="write the proposed order (default trader/orders.json)")

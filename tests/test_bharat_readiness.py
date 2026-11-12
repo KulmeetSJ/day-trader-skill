@@ -196,6 +196,7 @@ class TestBharatReadiness(unittest.TestCase):
             "stop": 2800.00,
             "target": 2950.00,
             "market": "IN",
+            "tick_size": 0.05,
             "date": "2026-10-19",
             "setup": "orb"
         }

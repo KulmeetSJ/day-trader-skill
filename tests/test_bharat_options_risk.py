@@ -37,6 +37,7 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "lot_size": 25,
             "asset_type": "OPTIONS",
             "market": "IN",
+            "tick_size": 0.05,
             "date": "2026-10-19",
             "setup": "options_orb",
         }
@@ -77,6 +78,7 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "lot_size": 25,
             "asset_type": "OPTIONS",
             "market": "IN",
+            "tick_size": 0.05,
             "date": "2026-10-19",
         }
         cfg = {

@@ -356,9 +356,33 @@ def floor_cents(x, tick=CENT):
     return floor_tick(x, tick)
 
 
-def money(x, market="US"):
+def _price_scale(x=None, tick=None):
+    scale = 2
+    if tick is not None:
+        try:
+            td = Decimal(str(tick).strip()).normalize()
+            if td.is_finite() and td > 0 and td.as_tuple().exponent < 0:
+                scale = max(scale, -td.as_tuple().exponent)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    if x is not None:
+        try:
+            vd = Decimal(str(x).strip()).normalize()
+            if vd.is_finite() and vd.as_tuple().exponent < 0:
+                v_exp = -vd.as_tuple().exponent
+                if v_exp <= 4:
+                    scale = max(scale, v_exp)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    return scale
+
+
+def money(x, market="US", tick=None):
     curr = "\u20b9" if market == "IN" else "$"
-    return "%s%s" % (curr, format(D(x).quantize(CENT), ",f"))
+    d = D(x)
+    scale = _price_scale(d, tick=tick)
+    q = Decimal("1").scaleb(-scale)
+    return "%s%s" % (curr, format(d.quantize(q, rounding=ROUND_HALF_UP), ",f"))
 
 
 def num(x):
@@ -417,7 +441,17 @@ def r_label(r):
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
             atr=None, atr_bars=None, market="US", tick_size=None):
     """The stop, the target and the risk, in exact ticks. Raises PlanError with the reason."""
-    tick = Decimal(str(tick_size)) if tick_size else (TICK_IN if market == "IN" else CENT)
+    if tick_size is not None:
+        if isinstance(tick_size, bool):
+            raise PlanError("Invalid boolean tick_size %r" % (tick_size,))
+        try:
+            tick = Decimal(str(tick_size))
+        except Exception:
+            raise PlanError("Invalid tick_size %r" % (tick_size,))
+        if not tick.is_finite() or tick <= 0:
+            raise PlanError("Invalid non-positive tick_size %r" % (tick_size,))
+    else:
+        tick = TICK_IN if market == "IN" else CENT
     curr = "\u20b9" if market == "IN" else "$"
     e = round_tick(entry, tick)
     if e <= 0:
@@ -428,11 +462,11 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             raise PlanError("an %s stop needs the opening range (--or-high and --or-low)" % stop_rule.replace("_", "-"))
         oh, ol = round_tick(or_high, tick), round_tick(or_low, tick)
         if oh <= ol:
-            raise PlanError("the opening-range high %s must be above its low %s" % (money(oh, market=market), money(ol, market=market)))
+            raise PlanError("the opening-range high %s must be above its low %s" % (money(oh, market=market, tick=tick), money(ol, market=market, tick=tick)))
         if stop_rule == "or_mid":
             raw = (oh + ol) / 2
             label = "opening-range midpoint"
-            detail = "(%s + %s) / 2 = %s%s" % (money(oh, market=market), money(ol, market=market), curr, num(raw))
+            detail = "(%s + %s) / 2 = %s%s" % (money(oh, market=market, tick=tick), money(ol, market=market, tick=tick), curr, num(raw))
         else:
             raw, label = ol, "opening-range low"
     elif stop_rule == "price":
@@ -445,7 +479,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     elif stop_rule == "pct":
         raw = e * (1 - stop_param / 100)
         label = "%s%% under the entry" % num(stop_param)
-        detail = "%s x (1 - %s%%) = %s%s" % (money(e, market=market), num(stop_param), curr, num(raw))
+        detail = "%s x (1 - %s%%) = %s%s" % (money(e, market=market, tick=tick), num(stop_param), curr, num(raw))
     elif stop_rule == "atr":
         if atr is None or atr_bars is None:
             raise PlanError("an atr stop needs the session's bars")
@@ -461,15 +495,15 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         detail = (detail + ", rounded down" if detail else "%s%s rounded down" % (curr, num(raw)))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
-                        % (money(stop, market=market), label, money(e, market=market)))
+                        % (money(stop, market=market, tick=tick), label, money(e, market=market, tick=tick)))
     if stop <= 0:
-        raise PlanError("the stop works out to %s: pick a stop above %s0" % (money(stop, market=market), curr))
+        raise PlanError("the stop works out to %s: pick a stop above %s0" % (money(stop, market=market, tick=tick), curr))
     risk = e - stop
     floor_risk = e * MIN_RISK_PCT / 100
     if risk < floor_risk:
         raise PlanError("the stop is %s under the entry, less than 0.05%% of the price (%s on %s): too tight to "
                         "survive the spread, normal wiggle would stop you out. Widen it."
-                        % (money(risk, market=market), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP), market=market), money(e, market=market)))
+                        % (money(risk, market=market, tick=tick), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP), market=market), money(e, market=market, tick=tick)))
     if target_rule == "r":
         target = round_tick(e + target_param * risk, tick)
         t_label = r_label(target_param)
@@ -478,7 +512,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         t_label = None
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
-                        % (money(target, market=market), money(e, market=market)))
+                        % (money(target, market=market, tick=tick), money(e, market=market, tick=tick)))
     rr = ((target - e) / risk).quantize(CENT, rounding=ROUND_HALF_UP)
     if t_label is None:
         t_label = "your price (%sR)" % ratio(rr)
@@ -708,11 +742,15 @@ def read_config(path, market="US"):
     cfg = dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
     if path and os.path.exists(path):
         doc = read_json(path, "config")
-        for k in DEFAULTS:
-            if doc.get(k) is not None:
-                cfg[k] = doc[k]
-        if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
-            cfg["market"] = "IN"
+        if isinstance(doc, dict):
+            for k, v in doc.items():
+                if k in DEFAULTS:
+                    if v is not None:
+                        cfg[k] = v
+                elif v is not None:
+                    cfg[k] = v
+            if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
+                cfg["market"] = "IN"
     return cfg
 
 
@@ -797,12 +835,39 @@ def build_plan(a, now_utc=None):
     if now_utc is None:
         now_utc = parse_now(getattr(a, "now", None), market=market)
     simulated = bool(explicit_now or (info.get("doc") or {}).get("simulated_at"))
+    raw_symbol = info["symbol"]
+    doc_meta = info.get("doc") or {}
+    cli_exch = getattr(a, "exchange", None)
+    doc_exch = doc_meta.get("exchange") if isinstance(doc_meta, dict) else None
+    if cli_exch and doc_exch and str(cli_exch).strip().upper() != str(doc_exch).strip().upper():
+        raise PlanError(
+            "CLI --exchange %s disagrees with entry document exchange %s for %s"
+            % (str(cli_exch).strip().upper(), str(doc_exch).strip().upper(), info["symbol"])
+        )
+    req_exchange = cli_exch or doc_exch
+    up_raw = str(raw_symbol or "").strip().upper()
+    sym_exch = None
+    if up_raw.endswith(".BO") or up_raw.startswith("BSE:"):
+        sym_exch = "BSE"
+    elif up_raw.endswith(".NS") or up_raw.startswith("NSE:"):
+        sym_exch = "NSE"
+    if sym_exch and req_exchange and sym_exch != str(req_exchange).strip().upper():
+        raise PlanError(
+            "Symbol exchange %s disagrees with requested exchange %s for %s"
+            % (sym_exch, str(req_exchange).strip().upper(), raw_symbol)
+        )
+    if not req_exchange:
+        req_exchange = sym_exch
     if market == "IN" and symbols_in:
         try:
             info["symbol"] = symbols_in.normalize_symbol(info["symbol"])
         except Exception:
             pass
     cfg_market = read_config(a.config, market=market) if market == "IN" else cfg
+    if not req_exchange and market == "IN":
+        req_exchange = cfg_market.get("exchange")
+    if req_exchange:
+        req_exchange = str(req_exchange).strip().upper()
 
     trading_style = info.get("trading_style") or cfg_market.get("trading_style") or "intraday"
     asset_type = info.get("asset_type") or cfg_market.get("asset_type") or "EQUITY"
@@ -825,20 +890,66 @@ def build_plan(a, now_utc=None):
     # Instrument metadata resolution (tick size, lot size, T2T)
     tick_size = None
     lot_size = 1
+    resolved_exchange = req_exchange or ("NSE" if market == "IN" else None)
     if market == "IN":
-        inst_path = getattr(a, "instruments", "trader/state/instruments.json")
+        doc_tick = doc_meta.get("tick_size") if isinstance(doc_meta, dict) and "tick_size" in doc_meta else None
+        if isinstance(doc_meta, dict) and "tick_size" in doc_meta:
+            if doc_tick is None or isinstance(doc_tick, bool):
+                raise PlanError("Invalid tick_size %r in entry document for %s" % (doc_tick, info["symbol"]))
+            try:
+                doc_tick_dec = Decimal(str(doc_tick))
+                if not doc_tick_dec.is_finite() or doc_tick_dec <= 0:
+                    raise PlanError("Non-positive tick_size %r in entry document for %s" % (doc_tick, info["symbol"]))
+            except PlanError:
+                raise
+            except Exception:
+                raise PlanError("Invalid tick_size %r in entry document for %s" % (doc_tick, info["symbol"]))
+            doc_tick = doc_tick_dec
+        raw_inst_arg = getattr(a, "instruments", None)
+        explicit_inst = raw_inst_arg is not None
+        inst_path = raw_inst_arg or (getattr(instruments, "DEFAULT_CACHE_PATH", None) if instruments else None) or "trader/state/instruments.json"
+        if explicit_inst and not os.path.exists(inst_path):
+            raise PlanError("Instrument cache not found at: %s" % inst_path)
         if instruments and inst_path and os.path.exists(inst_path):
             instr_err = instruments.InstrumentMetadataError
             try:
                 cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=info.get("date"))
-                rec = instruments.resolve_instrument(info["symbol"], cache, require_intraday=True)
-                tick_size = Decimal(str(rec.get("tick_size") or "0.05"))
+                rec = instruments.resolve_instrument(
+                    raw_symbol,
+                    cache,
+                    require_intraday=(str(trading_style).lower() == "intraday"),
+                    exchange=req_exchange,
+                )
+                tick_size = Decimal(str(instruments.parse_tick_size(rec.get("tick_size"), symbol=info["symbol"])))
+                if rec.get("exchange"):
+                    rec_exch = str(rec["exchange"]).strip().upper()
+                    if req_exchange and rec_exch != req_exchange:
+                        raise PlanError(
+                            "Resolved instrument exchange %s disagrees with requested exchange %s for %s"
+                            % (rec_exch, req_exchange, info["symbol"])
+                        )
+                    resolved_exchange = rec_exch
                 # Derivatives trade in F&O contract lots; cash equities trade in shares (lot_size=1)
                 if asset_type in ("OPTIONS", "FUTURES"):
                     lot_size = rec.get("fo_lot_size") or rec.get("lot_size") or 1
                 else:
                     lot_size = rec.get("lot_size") or 1
             except instr_err as exc:
+                raise PlanError(str(exc))
+            if doc_tick is not None and tick_size != doc_tick:
+                raise PlanError(
+                    "Entry document tick_size %s disagrees with instrument master tick_size %s (%s) for %s"
+                    % (doc_tick, tick_size, resolved_exchange, info["symbol"])
+                )
+        elif doc_tick is not None:
+            tick_size = doc_tick
+        elif asset_type in ("OPTIONS", "FUTURES") and instruments:
+            try:
+                d_rec = instruments.resolve_derivative_contract(info["symbol"], exchange=req_exchange)
+                tick_size = Decimal(str(instruments.parse_tick_size(d_rec.get("tick_size"), symbol=info["symbol"])))
+                if d_rec.get("exchange"):
+                    resolved_exchange = str(d_rec["exchange"]).strip().upper()
+            except Exception as exc:
                 raise PlanError(str(exc))
         else:
             tick_size = TICK_IN
@@ -944,6 +1055,8 @@ def build_plan(a, now_utc=None):
         plan["market"] = "IN"
         plan["currency"] = "INR"
         plan["tick_size"] = float(c["tick_size"])
+        if resolved_exchange:
+            plan["exchange"] = resolved_exchange
         if lot_size and lot_size > 1:
             plan["lot_size"] = lot_size
     if atr is not None:
@@ -1017,13 +1130,14 @@ def describe(plan):
         when = " at %s" % plan["entry_time"]
         if plan.get("entry_bar") is not None:
             when += " (bar %d)" % plan["entry_bar"]
+    p_tick = plan.get("tick_size")
     out = ["Exit plan: %s long, %s, %s on %s bars" % (
         plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute")]
-    out.append("  Entry         %s%s" % (money(plan["entry"], market=market), when))
-    out.append("  Stop          %s  %s%s" % (money(plan["stop"], market=market), plan["stop_label"],
+    out.append("  Entry         %s%s" % (money(plan["entry"], market=market, tick=p_tick), when))
+    out.append("  Stop          %s  %s%s" % (money(plan["stop"], market=market, tick=p_tick), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
-    out.append("  Target        %s  %s" % (money(plan["target"], market=market), plan["target_label"]))
-    out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"], market=market), pct))
+    out.append("  Target        %s  %s" % (money(plan["target"], market=market, tick=p_tick), plan["target_label"]))
+    out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"], market=market, tick=p_tick), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
     if plan.get("option_contract"):
         opt = plan["option_contract"]
@@ -1112,7 +1226,8 @@ def main(argv=None):
     p.add_argument("--asset-type", choices=["EQUITY", "FUTURES", "OPTIONS"], help="asset type")
     p.add_argument("--trading-style", choices=["intraday", "positional"], help="trading style")
     p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
-    p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
+    p.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian instruments (NSE or BSE)")
+    p.add_argument("--instruments", default=None, help="path to instruments cache (default trader/state/instruments.json if present)")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
     p.add_argument("--now", help='override the application clock to this market time for backtests/tests, e.g. "2026-10-19 10:15" (marks signals non-live)')

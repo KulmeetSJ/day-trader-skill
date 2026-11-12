@@ -382,7 +382,7 @@ class TestUpstoxProvider(unittest.TestCase):
                 "exchange": "NSE",
                 "instrument_type": "EQ",
                 "isin": "INE002A01018",
-                "tick_size": 0.1,
+                "tick_size": 10.0,
                 "lot_size": 1,
             },
             {
@@ -394,7 +394,7 @@ class TestUpstoxProvider(unittest.TestCase):
                 "exchange": "BSE",
                 "instrument_type": "EQ",
                 "isin": "INE002A01018",
-                "tick_size": 0.05,
+                "tick_size": 5.0,
                 "lot_size": 1,
             },
             {
@@ -409,7 +409,7 @@ class TestUpstoxProvider(unittest.TestCase):
                 "strike_price": 24500.0,
                 "expiry": 1795689000000,
                 "lot_size": 75,
-                "tick_size": 0.05,
+                "tick_size": 5.0,
             },
         ]
         gz_payload = gzip.compress(json.dumps(master_records).encode("utf-8"))
@@ -443,19 +443,24 @@ class TestUpstoxProvider(unittest.TestCase):
         self.assertEqual(prov.resolve_instrument_key("SENSEX", exchange="BSE")[0], "BSE_INDEX|SENSEX")
         self.assertEqual(prov.resolve_instrument_key("NSE_EQ|INE467B01029")[0], "NSE_EQ|INE467B01029")
 
-        # Equity master fetch decodes gzip JSON cleanly
+        # Equity master fetch decodes gzip JSON cleanly and normalizes paise -> INR
         inst_res = prov.get_instruments(exchange="NSE", symbol="RELIANCE")
         self.assertEqual(inst_res["count"], 1)
         self.assertEqual(inst_res["instruments"][0]["instrument_key"], "NSE_EQ|INE002A01018")
+        self.assertEqual(inst_res["instruments"][0]["tick_size"], 0.1)
+        self.assertEqual(inst_res["instruments"][0]["tick_size_unit"], "INR")
         # Public asset CDN request must not send Bearer auth header
         self.assertNotIn("Authorization", seen_urls[0][1])
 
         self.assertEqual(prov.resolve_instrument_key("RELIANCE.NS")[0], "NSE_EQ|INE002A01018")
         self.assertEqual(prov.resolve_instrument_key("RELIANCE.BO", exchange="BSE")[0], "BSE_EQ|INE002A01018")
+        bse_res = prov.get_instruments(exchange="BSE", symbol="RELIANCE")
+        self.assertEqual(bse_res["instruments"][0]["tick_size"], 0.05)
 
         derivs = prov.get_derivatives_master(exchange="NSE", underlying="NIFTY")
         self.assertEqual(derivs["count"], 1)
         self.assertEqual(derivs["contracts"][0]["instrument_type"], "CE")
+        self.assertEqual(derivs["contracts"][0]["tick_size"], 0.05)
 
         with self.assertRaises(data_in.InvalidSymbolError):
             prov.resolve_instrument_key("DOESNOTEXIST_XYZ")

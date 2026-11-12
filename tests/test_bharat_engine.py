@@ -182,7 +182,7 @@ class TestBharatBudgetAndSizing(unittest.TestCase):
         plan = {
             "symbol": "SUZLON", "side": "buy", "entry": 50.00, "stop": 48.00, "target": 54.00,
             "risk_per_share": 2.00, "market": "IN", "setup": "orb", "entry_time": "09:35 AM", "flat_by": "15:20",
-            "is_trade_to_trade": True
+            "tick_size": 0.05, "is_trade_to_trade": True
         }
         cfg = {"budget": 100000, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_usd": 100000,
                "max_loss_per_trade_usd": 2000, "paper": True}
@@ -207,6 +207,7 @@ class TestBharatBudgetAndSizing(unittest.TestCase):
                     "series": "BE",
                     "is_trade_to_trade": True,
                     "tick_size": 0.05,
+                    "tick_size_unit": "INR",
                     "lot_size": 1,
                 }
             },
@@ -227,7 +228,8 @@ class TestBharatBudgetAndSizing(unittest.TestCase):
     def test_bracket_order_generation_inr(self):
         plan = {
             "symbol": "RELIANCE", "side": "buy", "entry": 2850.00, "stop": 2830.00, "target": 2890.00,
-            "risk_per_share": 20.00, "market": "IN", "setup": "orb", "entry_time": "09:35 AM", "flat_by": "15:20"
+            "risk_per_share": 20.00, "market": "IN", "tick_size": 0.05,
+            "setup": "orb", "entry_time": "09:35 AM", "flat_by": "15:20"
         }
         cfg = {
             "budget": 100000, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_usd": 100000,

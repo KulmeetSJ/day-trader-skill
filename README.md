@@ -127,7 +127,7 @@ news / analyst / pelosi                                                        (
    RELIANCE triggers an opening-range breakout above its 15-minute opening range
    (09:15-09:30 range ₹2,836.00 to ₹2,848.00; the 10:25 bar closed at ₹2,849.00, +0.04% over).
 2. **`/trader-entry`** verifies breakout trigger at 10:30 AM IST at ₹2,849.00.
-3. **`/trader-exit`** plans the trade with official tick size ₹0.05: stop at
+3. **`/trader-exit`** plans the trade using the instrument's exchange-resolved INR tick size (e.g. ₹0.05 or security-specific tick from the master): stop at
    opening-range midpoint ₹2,842.00 (risk ₹7.00/share), target 2R at ₹2,863.00,
    flat by 15:20 IST ahead of the closing auction session.
 4. **`/trader-timemachine`** replays 10,000 simulations over historical IST
@@ -173,7 +173,7 @@ python3 trader-scanner/scan.py orb --market IN --at 10:35             # Indian O
 python3 trader-news/news.py --tickers RELIANCE TCS INFY --hours 48    # Indian corporate news in IST
 python3 trader-entry/entry.py check RELIANCE --setup orb --market IN   # IST bar-by-bar entry timer
 python3 trader-entry/entry.py check RELIANCE --setup breakout_20d --market IN  # 20d breakout + intraday confirmation
-python3 trader-exit/exit.py plan --from trader/entry.json --market IN  # Tick size ₹0.05, flat_by 15:20 IST
+python3 trader-exit/exit.py plan --from trader/entry.json --market IN  # Exchange-resolved INR tick size, flat_by 15:20 IST
 python3 trader-timemachine/timemachine.py run --plan trader/plan.json --market IN  # 10k IST replays
 python3 trader-budget/size.py --plan trader/plan.json --config trader/config.json --market IN  # INR sizing
 python3 trader-risk/check.py --orders trader/orders.json --config trader/config.json --market IN  # Pre-trade gate
@@ -448,7 +448,7 @@ python3 trader-entry/entry.py check NIFTY --setup options_orb --strike-selection
 python3 trader-entry/entry.py check TCS --setup ma_crossover --trading-style positional --market IN
 ```
 
-8. Exit plan generation with Indian tick sizes (Rs 0.05 default), options, and closing rules:
+8. Exit plan generation with exchange-resolved Indian INR tick sizes (security/exchange-specific when cached, ₹0.05 fallback only when unspecified in exit planning), options, and closing rules:
 
 ```bash
 # Equity exit plan: stop at opening-range midpoint, 2R target, flat_by 15:20 IST
@@ -576,7 +576,7 @@ python3 trader-scanner/scan.py orb --market IN --offline tests/fixtures/bharat -
 # 2. Entry Timer: Verify breakout trigger on RELIANCE at 10:30 AM IST (bar 14 close > range high)
 python3 trader-entry/entry.py check RELIANCE --setup orb --offline tests/fixtures/bharat/RELIANCE-5m.json --now "2026-10-19 10:35" --market IN --write trader/entry.json
 
-# 3. Exit Planner: Set stop-loss, 2R target and 15:20 IST closing rule with Rs 0.05 tick size
+# 3. Exit Planner: Set stop-loss, 2R target and 15:20 IST closing rule using exchange-resolved INR tick size
 python3 trader-exit/exit.py plan --from trader/entry.json --market IN --write trader/plan.json
 
 # 4. Time Machine: 10,000-session Monte Carlo simulation over historical IST session bars
@@ -626,7 +626,7 @@ python3 trader-broker/ticket.py log --state trader/state/broker.json --config tr
 
 | Asset Class / Instrument | Support Level | Execution Mode | Data Provider Tier | Capabilities & Limitations |
 | :--- | :--- | :--- | :--- | :--- |
-| **Cash Equities (NSE / BSE)** | Fully Supported | Paper Trading | `DELAYED` (Yahoo 15m) / `HISTORICAL` / `OFFLINE` | Complete support for all listed cash equities. Sectoral and broad indices (NIFTY 50 to 500, SENSEX, BSE 100). SEBI Trade-to-Trade (T2T) series BE/BZ/T intraday blocks enforced. Tick size Rs 0.05. |
+| **Cash Equities (NSE / BSE)** | Fully Supported | Paper Trading | `DELAYED` (Yahoo 15m) / `HISTORICAL` / `OFFLINE` | Complete support for all listed cash equities. Sectoral and broad indices (NIFTY 50 to 500, SENSEX, BSE 100). SEBI Trade-to-Trade (T2T) series BE/BZ/T intraday blocks enforced. Exchange- and security-specific INR tick sizes resolved from instrument masters (e.g. ₹0.01, ₹0.05, ₹0.10, ₹5.00). |
 | **Corporate News & Disclosures** | Fully Supported | Monitoring | `DELAYED` / `UNOFFICIAL` / `OFFLINE` | Public RSS syndication via Google News India corporate queries and Yahoo Finance RSS. Symbol normalization (RELIANCE, TCS.NS, BSE:INFY). Publisher attribution, source URLs, IST timestamps (+5:30), cross-feed deduplication, and automated price tracker filtering. |
 | **Indices (NIFTY, BANKNIFTY, SENSEX)** | Fully Supported | Paper Trading | `DELAYED` (Yahoo 15m) / `HISTORICAL` | Spot price tracking, ORB calculation, setup scanning, and underlying spot reference for derivative contracts. |
 | **Index Options (Long CE / PE)** | Fully Supported | Paper Trading | `SIMULATED` (Analytical BS) / `OFFLINE` | Contract naming (e.g. `NIFTY26OCT24000CE`), expiry calendar shifting for holidays, ATM/ITM/OTM strike selection, lot sizing (25 shares), analytical Black-Scholes Greeks (Delta, Gamma, Theta, Vega, Rho), IV solving, 14:30 IST expiry day cutoff. |
@@ -708,6 +708,7 @@ All Indian trading workflows (`trader-scanner`, `trader-entry`, `trader-exit`, `
 
 - **Default Unauthenticated Behavior (Yahoo Finance)**: Anyone without an Upstox token runs on free delayed Yahoo Finance data (`data_status: DELAYED`, `is_live: False`). Failed or timed-out requests raise typed errors (`RateLimitError`, `SymbolNotFoundError`, `ProviderConnectionError`, `MissingDataError`) and never fabricate prices or treat outages as empty setup scans.
 - **Optional Read-Only Upstox Feed**: Requires `INDIA_MARKET_DATA_PROVIDER=upstox` and `UPSTOX_ANALYTICS_TOKEN`. Account tier defaults strictly to **`standard`** (`UPSTOX_ACCOUNT_TIER=standard`: 2 concurrent WebSocket V3 connections; LTPC 5,000 individual / 2,000 combined; Option Greeks 3,000 individual / 2,000 combined; Full 2,000 individual / 1,500 combined; `full_d30` disabled). Opt into **`plus`** (`UPSTOX_ACCOUNT_TIER=plus` or `config["provider_credentials"]["upstox"]["account_tier"]`) only if your account holds Upstox Plus to enable 5 concurrent connections and `full_d30` (`50` keys per connection / `1,500` combined). Also enforces V3 historical lookback caps (`2022-01-01` floor for minutes/hours, calendar-safe month/quarter chunking), exponential backoff reconnects with fresh single-use authorization URLs, HTTP redirect following on WebSocket upgrade, and stale-tick detection (`stale_after_seconds`).
+- **Canonical INR Tick Sizes & Provenance**: All Indian instrument masters store tick sizes in INR (rupees) tagged with `"tick_size_unit": "INR"`. Upstox BOD feeds publish raw `tick_size` in paise and are converted exactly once (`dec / 100`) at provider ingestion, while separate NSE and BSE tick sizes for the same symbol (e.g. `NSE` ₹0.10 vs `BSE` ₹0.05) remain isolated by exchange. Legacy NSE/BSE CSV caches are accepted only when CSV provenance is structurally verified; unmarked Upstox/BOD or ambiguous caches fail closed across entry, exit, sizing, and risk validation without guessing or substituting ₹0.05.
 - **Simulated Options Safety**: Analytical Black-Scholes option pricing and chains remain isolated inside `SimulatedMarketDataProvider` and are always tagged `data_status: SIMULATED`, `is_simulated: True`, `is_live: False`.
 
 #### Adding a Future Adapter (e.g. Groww, Zerodha, Dhan)

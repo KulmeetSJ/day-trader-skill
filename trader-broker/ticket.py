@@ -35,6 +35,7 @@ New York dates; --now "2026-10-19 10:15" pins the clock.
 
 import argparse
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import json
 import os
@@ -411,15 +412,47 @@ def tool_input(order):
     return out
 
 
-def _money(v, market="US"):
-    f = float(v)
-    s = "{:,.2f}".format(f)
+def _price_scale(v=None, tick=None):
+    scale = 2
+    if tick is not None:
+        try:
+            td = Decimal(str(tick).strip()).normalize()
+            if td.is_finite() and td > 0 and td.as_tuple().exponent < 0:
+                scale = max(scale, -td.as_tuple().exponent)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    if v is not None:
+        try:
+            vd = Decimal(str(v).strip()).normalize()
+            if vd.is_finite() and vd.as_tuple().exponent < 0:
+                v_exp = -vd.as_tuple().exponent
+                if v_exp <= 4:
+                    scale = max(scale, v_exp)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    return scale
+
+
+def _money(v, market="US", tick=None):
     curr = "₹" if market == "IN" else "$"
-    return curr + (s[:-3] if s.endswith(".00") else s)
+    scale = _price_scale(v, tick=tick)
+    try:
+        d = Decimal(str(v).strip())
+        q = Decimal("1").scaleb(-scale)
+        s = "{:,f}".format(d.quantize(q, rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, AttributeError):
+        s = ("{:,." + str(scale) + "f}").format(float(v))
+    return curr + (s[:-3] if (scale == 2 and s.endswith(".00")) else s)
 
 
-def _p(v):
-    return "%.2f" % float(v)
+def _p(v, tick=None):
+    scale = _price_scale(v, tick=tick)
+    try:
+        d = Decimal(str(v).strip())
+        q = Decimal("1").scaleb(-scale)
+        return format(d.quantize(q, rounding=ROUND_HALF_UP), "f")
+    except (InvalidOperation, ValueError, AttributeError):
+        return "%.*f" % (scale, float(v))
 
 
 def is_bracket(order):
@@ -443,8 +476,8 @@ def max_loss(order):
         entry = _f(plan.get("entry"))
     if not entry:
         return None, stop
-    risk = abs(entry - stop)
-    return round(q * int(round(risk * 100)) / 100.0, 2), stop
+    risk = abs(Decimal(str(entry)) - Decimal(str(stop)))
+    return round(float(Decimal(str(q)) * risk), 2), stop
 
 
 def plain_parts(order, market=None):
@@ -456,8 +489,10 @@ def plain_parts(order, market=None):
     typ = str(order.get("type", "market"))
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
     contracts = order.get("contracts")
+    plan_doc = order.get("plan") if isinstance(order.get("plan"), dict) else {}
+    tick = order.get("tick_size") if order.get("tick_size") is not None else plan_doc.get("tick_size")
     if is_bracket(order) or is_positional_gtt(order):
-        how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
+        how = "limit %s" % _p(order["limit_price"], tick=tick) if typ == "limit" and order.get("limit_price") else typ
         if contracts:
             qty_desc = "%s (%s contract%s)" % (_str_num(order.get("qty")), contracts, "" if contracts == 1 else "s")
         else:
@@ -468,16 +503,16 @@ def plain_parts(order, market=None):
         else:
             parts = ["%s %s %s, %s, %s" % (side, qty_desc, sym, how, tif)]
         if order.get("stop_loss_stop_price") is not None:
-            leg = "stop-loss %s" % _p(order["stop_loss_stop_price"])
+            leg = "stop-loss %s" % _p(order["stop_loss_stop_price"], tick=tick)
             if order.get("stop_loss_limit_price") is not None:
-                leg += " (limit %s)" % _p(order["stop_loss_limit_price"])
+                leg += " (limit %s)" % _p(order["stop_loss_limit_price"], tick=tick)
             parts.append(leg)
         if order.get("take_profit_limit_price") is not None:
-            parts.append("take-profit %s" % _p(order["take_profit_limit_price"]))
+            parts.append("take-profit %s" % _p(order["take_profit_limit_price"], tick=tick))
         loss, stop = max_loss(order)
         if loss is not None:
             parts.append("max loss about %s if the stop fills at %s (it can fill worse in a fast market)"
-                         % (_money(loss, market=market), _p(stop)))
+                         % (_money(loss, market=market), _p(stop, tick=tick)))
         if order.get("transaction_costs"):
             tc = order["transaction_costs"]
             parts.append("est charges %s" % _money(tc["total"], market=market))
@@ -488,11 +523,14 @@ def plain_parts(order, market=None):
         q = _str_num(order.get("qty"))
         what = "%s share%s of %s" % (q, "" if q == "1" else "s", sym)
     if typ == "limit":
-        how = "limit order at %s" % _money(order.get("limit_price"), market=market)
+        how = "limit order at %s" % _money(order.get("limit_price"), market=market, tick=tick)
     elif typ == "stop":
-        how = "stop order at %s" % _money(order.get("stop_price"), market=market)
+        how = "stop order at %s" % _money(order.get("stop_price"), market=market, tick=tick)
     elif typ == "stop_limit":
-        how = "stop %s, limit %s" % (_money(order.get("stop_price"), market=market), _money(order.get("limit_price"), market=market))
+        how = "stop %s, limit %s" % (
+            _money(order.get("stop_price"), market=market, tick=tick),
+            _money(order.get("limit_price"), market=market, tick=tick),
+        )
     else:
         how = "%s order" % typ.replace("_", " ")
     return ["%s %s, %s, %s" % (side, what, how, tif)]
@@ -1021,6 +1059,12 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None,
     if market == "IN":
         res["market"] = "IN"
         res["currency"] = "INR"
+        tick_val = order.get("tick_size") if order.get("tick_size") is not None else (order.get("plan") or {}).get("tick_size")
+        if tick_val is not None:
+            res["tick_size"] = tick_val
+        exch_val = order.get("exchange") or (order.get("plan") or {}).get("exchange")
+        if exch_val:
+            res["exchange"] = exch_val
     if order.get("asset_type"):
         res["asset_type"] = order["asset_type"]
     if order.get("contracts"):
@@ -1061,9 +1105,15 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None)
     if qty <= 0 or price <= 0:
         raise TicketError("a fill needs a positive qty and price")
     cost = round(qty * price, 2)
+    positions = pf.get("positions")
+    if positions is None:
+        positions = []
+        pf["positions"] = positions
+    elif not isinstance(positions, list):
+        raise TicketError("invalid portfolio %s: 'positions' must be a list" % portfolio_path)
     pos = None
-    for p in pf.setdefault("positions", []):
-        if str(p.get("ticker", "")).upper() == symbol:
+    for p in positions:
+        if isinstance(p, dict) and str(p.get("ticker", "")).upper() == symbol:
             pos = p
     if side not in ("buy", "sell"):
         raise TicketError("--side wants buy or sell, not %r" % side)
@@ -1123,13 +1173,13 @@ def _apply_state_meta(state, sim_at=None, lts=None):
         state["last_data_timestamp"] = lts
 
 
-def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simulated_at=None, last_data_timestamp=None):
+def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simulated_at=None, last_data_timestamp=None, tick=None):
     """A fill in the log, so trader-risk can count day trades (a buy and a sell the same day)."""
     state = load_state(state_path)
     entry = {
         "at": ny_iso(now, market=market), "date": today, "status": "filled", "symbol": symbol.upper(), "side": side,
         "qty": _str_num(float(qty)), "price": float(price),
-        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price)),
+        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price, tick=tick)),
     }
     if market == "IN":
         entry["market"] = "IN"
@@ -1405,8 +1455,13 @@ def cmd_flatten(a):
             raise TicketError("--qty wants the number of shares you hold, like --qty 8")
     else:
         pf = read_json(a.portfolio, "portfolio", required=False) or {}
-        qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
-                  if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
+        positions = pf.get("positions")
+        if positions is None:
+            positions = []
+        if not isinstance(positions, list):
+            raise TicketError("invalid portfolio %s: 'positions' must be a list" % a.portfolio)
+        qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in positions
+                  if isinstance(p, dict) and str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
         source = a.portfolio
         if qty <= 1e-9:
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
@@ -1544,15 +1599,6 @@ def main(argv=None):
     clock(p)
     p.add_argument("--all", action="store_true")
     a = ap.parse_args(argv)
-    if not a.cmd:
-        ap.print_help()
-        return 1
-    try:
-        return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
-                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
-    except TicketError as e:
-        print("ticket.py: %s" % e, file=sys.stderr)
-        return 1
     if not a.cmd:
         ap.print_help()
         return 1

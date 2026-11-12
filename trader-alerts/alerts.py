@@ -1663,7 +1663,7 @@ def cmd_reset(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Price alerts and the NYSE/NSE clock (trader-alerts).")
-    ap.add_argument("--market", default="US", choices=["US", "IN"], help="market profile (US or IN)")
+    ap.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
@@ -1672,12 +1672,12 @@ def main(argv=None):
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
         p.add_argument("--now", help="override the application clock to this time for backtests/tests (no offset = New York time for US, IST for IN; signals marked non-live)")
         p.add_argument("--json", action="store_true")
-        p.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
+        p.add_argument("--market", default=argparse.SUPPRESS, choices=["US", "IN"], help="market profile (US or IN)")
 
     p = sub.add_parser("clock", help="is the exchange open?")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--market", default=None, choices=["US", "IN"], help="market profile (US or IN)")
+    p.add_argument("--market", default=argparse.SUPPRESS, choices=["US", "IN"], help="market profile (US or IN)")
     p.add_argument("--cas", action="store_true", help="evaluate as Closing Auction Session (CAS) eligible security")
     p.add_argument("--symbol", help="security symbol to resolve CAS eligibility from instruments")
     p.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
@@ -1725,12 +1725,15 @@ def main(argv=None):
     p.add_argument("--rearm", action="store_true")
     p.add_argument("--note")
     p.add_argument("--id")
+    p.add_argument("--market", default=argparse.SUPPRESS, choices=["US", "IN"], help="market profile (US or IN)")
     p = sub.add_parser("list", help="list the rules")
     p.add_argument("--rules", default="trader/alerts.json")
     p.add_argument("--state", default="trader/state/alerts.json")
+    p.add_argument("--market", default=argparse.SUPPRESS, choices=["US", "IN"], help="market profile (US or IN)")
     p = sub.add_parser("reset", help="re-arm a rule that rang")
     p.add_argument("id")
     p.add_argument("--state", default="trader/state/alerts.json")
+    p.add_argument("--market", default=argparse.SUPPRESS, choices=["US", "IN"], help="market profile (US or IN)")
     p = sub.add_parser("readiness", help="pre-market trading readiness check")
     p.add_argument("--market", choices=["US", "IN"], default="IN", help="market profile: IN (NSE/BSE) or US")
     p.add_argument("--config", default="trader/config.json", help="path to config JSON")

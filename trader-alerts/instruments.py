@@ -9,9 +9,11 @@ Python 3.8 compatible.
 import csv
 import datetime
 import json
+import math
 import os
 import sys
 import tempfile
+from decimal import Decimal, InvalidOperation
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
@@ -42,6 +44,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "NIFTY",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 25,
         "strike_interval": 50.0,
@@ -58,6 +61,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "BANKNIFTY",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 15,
         "strike_interval": 100.0,
@@ -74,6 +78,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "FINNIFTY",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 25,
         "strike_interval": 50.0,
@@ -90,6 +95,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "MIDCPNIFTY",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 50,
         "strike_interval": 25.0,
@@ -106,6 +112,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "SENSEX",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 10,
         "strike_interval": 100.0,
@@ -122,6 +129,7 @@ INDEX_INSTRUMENTS = {
         "instrument_type": "INDEX",
         "instrument_identifier": "BANKEX",
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
         "lot_size": 1,
         "fo_lot_size": 15,
         "strike_interval": 100.0,
@@ -150,6 +158,207 @@ class TickResolutionError(InstrumentMetadataError):
 class LotSizeResolutionError(InstrumentMetadataError):
     """Raised when a security lot size cannot be authoritatively resolved."""
     pass
+
+
+_VALID_TICK_UNITS_INR = ("inr", "rupee", "rupees")
+_VALID_TICK_UNITS_PAISE = ("paise", "paisa", "p")
+_UPSTOX_BOD_MARKERS = (
+    "instrument_key",
+    "segment",
+    "trading_symbol",
+    "tradingsymbol",
+    "exchange_token",
+    "instrument_token",
+)
+
+
+def _has_upstox_bod_provenance(rec, cache_payload=None):
+    """Return True if a record or its enclosing cache carries Upstox/BOD provenance markers."""
+    if isinstance(cache_payload, dict):
+        prov = str(cache_payload.get("provider") or "").strip().lower()
+        if prov:
+            return True
+    if not isinstance(rec, dict):
+        return False
+    if str(rec.get("provider") or "").strip():
+        return True
+    return any(k in rec for k in _UPSTOX_BOD_MARKERS)
+
+
+def _is_legacy_csv_entry(rec, cache_payload=None):
+    """Positively identify pre-unit-marker legacy NSE/BSE CSV cache entries by structure only."""
+    if not isinstance(rec, dict):
+        return False
+    if _has_upstox_bod_provenance(rec, cache_payload=cache_payload):
+        return False
+    if isinstance(cache_payload, dict) and "metadata_version" in cache_payload:
+        if str(cache_payload.get("metadata_version") or "").strip() not in ("1.0",):
+            return False
+
+    sym = rec.get("canonical_symbol")
+    exch = str(rec.get("exchange") or "").strip().upper()
+    ident = rec.get("instrument_identifier")
+    lot = rec.get("lot_size")
+    if not isinstance(sym, str) or not sym.strip():
+        return False
+    if exch not in ("NSE", "BSE"):
+        return False
+    if not isinstance(ident, str) or not ident.strip():
+        return False
+    if lot is None or isinstance(lot, bool) or not isinstance(lot, int) or lot <= 0:
+        return False
+
+    itype = str(rec.get("instrument_type") or "").strip().upper()
+    if itype == "EQUITY":
+        return (
+            isinstance(rec.get("series"), str)
+            and isinstance(rec.get("isin"), str)
+            and isinstance(rec.get("is_trade_to_trade"), bool)
+        )
+    if itype == "INDEX":
+        return rec.get("series") == "INDEX" and ("strike_interval" in rec)
+    if itype in ("OPTIDX", "OPTSTK", "FUTIDX", "FUTSTK"):
+        return (
+            isinstance(rec.get("underlying"), str)
+            and bool(rec.get("underlying").strip())
+            and ("expiry_source" in rec or "tick_size_source" in rec)
+        )
+    return False
+
+
+def normalize_tick_size_inr(raw_tick, source_unit="INR", allow_none=False):
+    """Normalize and validate an instrument tick size in INR (rupees).
+
+    Converts from paise to INR by dividing by 100 ONLY when source_unit is 'paise'.
+    If source_unit is 'INR', preserves the value without double conversion.
+    Rejects unknown units, bool, NaN/Inf, non-numeric, and non-positive values explicitly.
+    """
+    if source_unit is None or not str(source_unit).strip():
+        raise TickResolutionError("Unsupported tick_size unit %r" % (source_unit,))
+    unit = str(source_unit).strip().lower()
+    if unit not in (_VALID_TICK_UNITS_INR + _VALID_TICK_UNITS_PAISE):
+        raise TickResolutionError("Unsupported tick_size unit %r" % (source_unit,))
+
+    if raw_tick is None or (isinstance(raw_tick, str) and not raw_tick.strip()):
+        if allow_none:
+            return None
+        raise TickResolutionError("Cannot authoritatively resolve tick size: missing value")
+    if isinstance(raw_tick, bool):
+        raise TickResolutionError("Invalid boolean tick_size %r" % (raw_tick,))
+    try:
+        dec = Decimal(str(raw_tick).strip())
+    except (InvalidOperation, ValueError):
+        raise TickResolutionError("Invalid non-numeric tick_size %r" % (raw_tick,))
+    if not dec.is_finite() or dec <= 0:
+        raise TickResolutionError("Invalid non-positive or non-finite tick_size %r" % (raw_tick,))
+    if unit in _VALID_TICK_UNITS_PAISE:
+        dec = dec / Decimal("100")
+    return float(dec)
+
+
+def _normalize_cache_record_tick(rec, cache_payload=None, allow_none=False, sym_hint=None):
+    """Validate tick provenance and normalize tick_size to canonical INR without guessing.
+
+    Never infers units from numerical magnitude. Explicitly distinguishes:
+    - tick_size_unit='INR': validated without dividing by 100.
+    - tick_size_unit='paise': converted once (dec / 100) and stamped tick_size_unit='INR'.
+    - Unknown/empty tick_size_unit: raises TickResolutionError.
+    - Unmarked Upstox/BOD records: raises TickResolutionError instructing cache rebuild.
+    - Unmarked verifiable NSE/BSE CSV records: preserved as INR and stamped in memory.
+    - Unmarked ambiguous records: raises TickResolutionError.
+    """
+    if not isinstance(rec, dict):
+        raise InstrumentMetadataError("Malformed instrument record: expected dict")
+
+    sym = sym_hint or rec.get("canonical_symbol") or rec.get("trading_symbol") or rec.get("symbol") or "UNKNOWN"
+    out = dict(rec)
+    raw_tick = out.get("tick_size")
+
+    if "tick_size_unit" in out:
+        unit_val = out.get("tick_size_unit")
+        if unit_val is None or not str(unit_val).strip():
+            raise TickResolutionError(
+                "Invalid empty 'tick_size_unit' for instrument %r; expected 'INR' or 'paise'" % (sym,)
+            )
+        tick_inr = normalize_tick_size_inr(raw_tick, source_unit=unit_val, allow_none=allow_none)
+        out["tick_size"] = tick_inr
+        out["tick_size_unit"] = "INR"
+        return out
+
+    if _has_upstox_bod_provenance(out, cache_payload=cache_payload):
+        raise TickResolutionError(
+            "Unmarked Upstox/BOD instrument cache record for %r lacks 'tick_size_unit'; "
+            "rebuild the instrument cache before trading" % (sym,)
+        )
+
+    if _is_legacy_csv_entry(out, cache_payload=cache_payload):
+        tick_inr = normalize_tick_size_inr(raw_tick, source_unit="INR", allow_none=allow_none)
+        out["tick_size"] = tick_inr
+        out["tick_size_unit"] = "INR"
+        return out
+
+    raise TickResolutionError(
+        "Ambiguous instrument cache record for %r is missing 'tick_size_unit' and lacks "
+        "verifiable CSV provenance; cannot safely infer tick unit" % (sym,)
+    )
+
+
+def normalize_instrument_cache_payload(payload, allow_none_tick=True):
+    """Validate tick provenance across an instrument cache payload and normalize units to INR."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("instruments"), dict):
+        raise InstrumentMetadataError("Malformed instrument cache: missing 'instruments' mapping")
+
+    out = dict(payload)
+    norm_flat = {}
+    for sym_key, rec in payload["instruments"].items():
+        norm_flat[sym_key] = _normalize_cache_record_tick(
+            rec, cache_payload=payload, allow_none=allow_none_tick, sym_hint=sym_key
+        )
+    out["instruments"] = norm_flat
+
+    if "instruments_by_exchange" in payload and payload["instruments_by_exchange"] is not None:
+        by_exch = payload["instruments_by_exchange"]
+        if not isinstance(by_exch, dict):
+            raise InstrumentMetadataError("Malformed instrument cache: 'instruments_by_exchange' must be a dict")
+        norm_by_exch = {}
+        for ex_name, bucket in by_exch.items():
+            if not isinstance(bucket, dict):
+                raise InstrumentMetadataError(
+                    "Malformed instrument cache: exchange bucket %r must be a dict" % (ex_name,)
+                )
+            norm_bucket = {}
+            for sym_key, rec in bucket.items():
+                norm_bucket[sym_key] = _normalize_cache_record_tick(
+                    rec, cache_payload=payload, allow_none=allow_none_tick, sym_hint=sym_key
+                )
+            norm_by_exch[ex_name] = norm_bucket
+        out["instruments_by_exchange"] = norm_by_exch
+
+    return out
+
+
+def parse_tick_size(value, symbol=None):
+    """Strictly parse a positive finite INR tick size; never substitutes a default."""
+    try:
+        return normalize_tick_size_inr(value, source_unit="INR", allow_none=False)
+    except TickResolutionError as exc:
+        if symbol:
+            raise TickResolutionError("Cannot authoritatively resolve tick size for %r: %s" % (symbol, exc))
+        raise
+
+
+def _infer_exchange_from_symbol(symbol, explicit_exchange=None):
+    """Infer explicit NSE/BSE exchange from --exchange or symbol suffix/prefix."""
+    if explicit_exchange:
+        ex = str(explicit_exchange).strip().upper()
+        if ex in ("NSE", "BSE"):
+            return ex
+    raw = str(symbol or "").strip().upper()
+    if raw.endswith(".BO") or raw.startswith("BSE:") or raw.startswith("BSE_"):
+        return "BSE"
+    if raw.endswith(".NS") or raw.startswith("NSE:") or raw.startswith("NSE_"):
+        return "NSE"
+    return None
 
 
 def parse_equity_l_csv(csv_path_or_text, exchange="NSE"):
@@ -198,6 +407,7 @@ def parse_equity_l_csv(csv_path_or_text, exchange="NSE"):
             # Official tick size: in NSE cash equity, standard series EQ is 0.05
             # unless a distinct tick size is authoritatively assigned in instrument master
             "tick_size": 0.05,
+            "tick_size_unit": "INR",
             "lot_size": lot_size,
             "expiry": None,
             "is_trade_to_trade": series in ("BE", "BZ", "T"),
@@ -250,6 +460,7 @@ def parse_bse_equity_csv(csv_path_or_text):
             "instrument_type": "EQUITY",
             "instrument_identifier": symbol,
             "tick_size": 0.05,
+            "tick_size_unit": "INR",
             "lot_size": 1,
             "expiry": None,
             "is_trade_to_trade": group in ("T", "Z", "XT"),
@@ -292,8 +503,12 @@ def get_strike_interval(underlying, spot_price=None):
 
 
 def get_fo_lot_size(symbol, cache_payload=None):
-    """Authoritatively resolve the derivative contract lot size for a security or index."""
+    """Authoritatively resolve the derivative contract lot size for a security, derivative, or index."""
     sym = normalize_symbol(symbol)
+    if is_derivative_symbol(sym):
+        parsed = parse_derivative_symbol(sym)
+        if parsed and parsed.get("underlying"):
+            sym = normalize_symbol(parsed["underlying"])
     if sym in INDEX_INSTRUMENTS:
         return INDEX_INSTRUMENTS[sym]["fo_lot_size"]
 
@@ -369,31 +584,57 @@ def parse_fo_lots_csv(csv_path_or_text):
     return lots
 
 
-def build_instrument_master(equity_records, fo_lots=None, effective_date=None, source_timestamp=None):
+def build_instrument_master(equity_records, fo_lots=None, effective_date=None, source_timestamp=None, by_exchange_records=None):
     """Combine cash equity records and derivative metadata into authoritative master payload."""
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     ts = source_timestamp or now_utc.isoformat()
     eff = effective_date or now_utc.strftime("%Y-%m-%d")
 
     instruments = {}
+    instruments_by_exchange = {}
     fo_map = fo_lots or {}
 
-    for sym, rec in equity_records.items():
+    def _finalize_entry(sym, rec):
         entry = dict(rec)
+        entry.setdefault("canonical_symbol", sym)
+        entry.setdefault("symbol", entry["canonical_symbol"])
         entry["source_timestamp"] = ts
         entry["effective_date"] = eff
-        # Enrich with derivative contract lot size if eligible
+        entry = _normalize_cache_record_tick(entry, cache_payload=None, allow_none=True, sym_hint=sym)
         if sym in fo_map:
             entry["fo_lot_size"] = fo_map[sym]
             entry["is_fo_eligible"] = True
             # Since August 3, 2026, eligible F&O equities participate in Closing Auction Session (CAS) on NSE
             entry["is_cas_eligible"] = entry.get("exchange", "NSE") == "NSE"
         else:
-            entry["fo_lot_size"] = None
-            entry["is_fo_eligible"] = False
-            entry["is_cas_eligible"] = False
+            entry.setdefault("fo_lot_size", None)
+            entry.setdefault("is_fo_eligible", False)
+            entry.setdefault("is_cas_eligible", False)
+        return entry
 
-        instruments[sym] = entry
+    items_iter = equity_records.items() if isinstance(equity_records, dict) else (
+        (r.get("canonical_symbol") or r.get("symbol"), r) for r in (equity_records or []) if isinstance(r, dict)
+    )
+    for sym_key, rec in items_iter:
+        if not sym_key or not isinstance(rec, dict):
+            continue
+        canon = str(rec.get("canonical_symbol") or sym_key).upper()
+        if ":" in sym_key and not rec.get("canonical_symbol"):
+            canon = sym_key.split(":", 1)[1].upper()
+        entry = _finalize_entry(canon, rec)
+        ex = str(entry.get("exchange") or "NSE").upper()
+        instruments_by_exchange.setdefault(ex, {})[sym_key if ":" not in sym_key else canon] = entry
+        if sym_key not in instruments or ex == "NSE":
+            instruments[sym_key] = entry
+
+    if isinstance(by_exchange_records, dict):
+        for ex_name, recs_map in by_exchange_records.items():
+            ex_up = str(ex_name).upper()
+            ex_bucket = instruments_by_exchange.setdefault(ex_up, {})
+            if isinstance(recs_map, dict):
+                for s_k, rec in recs_map.items():
+                    entry = _finalize_entry(s_k, rec)
+                    ex_bucket[s_k] = entry
 
     # Seed canonical index instruments
     for idx_sym, idx_meta in INDEX_INSTRUMENTS.items():
@@ -402,6 +643,8 @@ def build_instrument_master(equity_records, fo_lots=None, effective_date=None, s
             idx_entry["source_timestamp"] = ts
             idx_entry["effective_date"] = eff
             instruments[idx_sym] = idx_entry
+            idx_ex = str(idx_entry.get("exchange") or "NSE").upper()
+            instruments_by_exchange.setdefault(idx_ex, {}).setdefault(idx_sym, idx_entry)
 
     payload = {
         "metadata_version": "1.0",
@@ -410,8 +653,124 @@ def build_instrument_master(equity_records, fo_lots=None, effective_date=None, s
         "exchange": "NSE",
         "count": len(instruments),
         "instruments": instruments,
+        "instruments_by_exchange": instruments_by_exchange,
     }
     return payload
+
+
+def build_master_from_provider_records(records, fo_lots=None, effective_date=None, source_timestamp=None, provider="upstox"):
+    """Build an instrument master cache payload from normalized provider instrument records.
+
+    Provider records are expected to carry canonical rupee tick sizes (tick_size_unit='INR').
+    Double conversion is guarded against: records marked 'INR' or without explicit 'paise' unit
+    are validated as INR without dividing by 100. Missing or invalid tick sizes are preserved as
+    None rather than silently substituted with 0.05.
+    """
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    ts = source_timestamp or now_utc.isoformat()
+    eff = effective_date or now_utc.strftime("%Y-%m-%d")
+
+    flat = {}
+    by_exch = {}
+    fo_map = fo_lots or {}
+
+    for raw_rec in (records or []):
+        if not isinstance(raw_rec, dict):
+            continue
+        ex = str(raw_rec.get("exchange") or "NSE").upper()
+        seg = str(raw_rec.get("segment") or "").upper()
+        itype = str(raw_rec.get("instrument_type") or "").upper()
+        raw_sym = str(raw_rec.get("canonical_symbol") or raw_rec.get("trading_symbol") or raw_rec.get("symbol") or "").strip()
+        if not raw_sym:
+            continue
+        is_deriv = seg.endswith("_FO") or itype in ("CE", "PE", "FUT") or is_derivative_symbol(raw_sym)
+        if is_deriv:
+            canon = raw_sym.upper()
+        else:
+            try:
+                canon = normalize_symbol(raw_sym)
+            except Exception:
+                canon = raw_sym.upper()
+
+        raw_tick = raw_rec.get("tick_size")
+        if "tick_size_unit" in raw_rec:
+            unit_val = raw_rec.get("tick_size_unit")
+            if unit_val is None or not str(unit_val).strip():
+                raise TickResolutionError(
+                    "Invalid empty 'tick_size_unit' for provider instrument %r; expected 'INR' or 'paise'" % (canon,)
+                )
+            unit_low = str(unit_val).strip().lower()
+            if unit_low not in (_VALID_TICK_UNITS_INR + _VALID_TICK_UNITS_PAISE):
+                raise TickResolutionError("Unsupported tick_size unit %r" % (unit_val,))
+            try:
+                tick_inr = normalize_tick_size_inr(raw_tick, source_unit=unit_val, allow_none=True)
+            except TickResolutionError:
+                tick_inr = None
+        elif _is_legacy_csv_entry(raw_rec):
+            try:
+                tick_inr = normalize_tick_size_inr(raw_tick, source_unit="INR", allow_none=True)
+            except TickResolutionError:
+                tick_inr = None
+        else:
+            raise TickResolutionError(
+                "Unmarked provider instrument record %r is missing 'tick_size_unit'; "
+                "rebuild or pass explicit 'tick_size_unit' ('INR' or 'paise')" % (canon,)
+            )
+
+        raw_lot = raw_rec.get("lot_size")
+        try:
+            lot_val = int(raw_lot) if raw_lot is not None and not isinstance(raw_lot, bool) and int(raw_lot) > 0 else 1
+        except (TypeError, ValueError):
+            lot_val = 1
+
+        is_t2t = bool(raw_rec.get("is_trade_to_trade", False)) or seg in ("NSE_BE", "BSE_T") or itype in ("BE", "T")
+        entry = {
+            "canonical_symbol": canon,
+            "symbol": canon,
+            "exchange": ex,
+            "segment": seg,
+            "name": raw_rec.get("name") or canon,
+            "series": raw_rec.get("series") or itype or "EQ",
+            "isin": raw_rec.get("isin") or "",
+            "instrument_key": raw_rec.get("instrument_key") or "",
+            "instrument_token": raw_rec.get("instrument_token") or "",
+            "instrument_type": itype or ("EQUITY" if seg.endswith("_EQ") else ""),
+            "tick_size": tick_inr,
+            "tick_size_unit": "INR",
+            "lot_size": lot_val,
+            "fo_lot_size": fo_map.get(canon) or (lot_val if is_deriv else None),
+            "is_fo_eligible": bool(canon in fo_map or is_deriv),
+            "is_cas_eligible": bool((canon in fo_map) and ex == "NSE"),
+            "is_trade_to_trade": is_t2t,
+            "provider": provider,
+            "source_timestamp": ts,
+            "effective_date": eff,
+        }
+        if raw_rec.get("expiry") is not None:
+            entry["expiry"] = raw_rec.get("expiry")
+        if raw_rec.get("strike_price") is not None:
+            entry["strike_price"] = raw_rec.get("strike_price")
+
+        ex_bucket = by_exch.setdefault(ex, {})
+        # Prefer EQ/FO canonical records over less common segments when duplicate trading_symbol exists
+        prev = ex_bucket.get(canon)
+        if prev is None or (seg in ("NSE_EQ", "BSE_EQ") and prev.get("segment") not in ("NSE_EQ", "BSE_EQ")):
+            ex_bucket[canon] = entry
+
+        # In flat map: NSE canonical takes precedence for unqualified equity lookup; composite also stored if NSE!=ex
+        if canon not in flat or (ex == "NSE" and flat[canon].get("exchange") != "NSE"):
+            flat[canon] = entry
+
+    return {
+        "metadata_version": "1.0",
+        "effective_date": eff,
+        "generated_at": ts,
+        "provider": provider,
+        "exchange": "ALL" if len(by_exch) > 1 else (next(iter(by_exch.keys()), "NSE")),
+        "count": len(flat),
+        "instruments": flat,
+        "instruments_by_exchange": by_exch,
+    }
 
 
 def save_instrument_cache(payload, cache_path=DEFAULT_CACHE_PATH, history_dir=HISTORY_DIR):
@@ -424,9 +783,8 @@ def save_instrument_cache(payload, cache_path=DEFAULT_CACHE_PATH, history_dir=HI
     if target_dir and not os.path.exists(target_dir):
         os.makedirs(target_dir, exist_ok=True)
 
-    # Validate payload integrity before writing
-    if not isinstance(payload, dict) or "instruments" not in payload:
-        raise InstrumentMetadataError("Invalid instrument master payload: missing 'instruments' key")
+    # Validate payload integrity and tick provenance before writing
+    payload = normalize_instrument_cache_payload(payload, allow_none_tick=True)
 
     # Atomic write to main cache
     temp_fh = tempfile.NamedTemporaryFile("w", dir=target_dir, delete=False, encoding="utf-8")
@@ -475,6 +833,8 @@ def load_instrument_cache(cache_path=DEFAULT_CACHE_PATH, max_age_days=1, as_of_d
     if not isinstance(payload, dict) or "instruments" not in payload:
         raise InstrumentMetadataError("Malformed instrument cache: missing 'instruments' root")
 
+    payload = normalize_instrument_cache_payload(payload, allow_none_tick=True)
+
     eff_str = payload.get("effective_date")
     if not eff_str:
         raise InstrumentMetadataError("Instrument cache missing 'effective_date'")
@@ -508,7 +868,7 @@ def load_instrument_cache(cache_path=DEFAULT_CACHE_PATH, max_age_days=1, as_of_d
     return payload
 
 
-def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
+def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None, exchange=None):
     """Authoritatively resolve instrument metadata for an Indian derivative contract.
 
     Parses symbol (e.g. NIFTY26NOV24000CE or RELIANCE26NOVFUT) and enriches with:
@@ -516,12 +876,12 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
     - contract lot size
     - strike interval
     - authoritative expiry date
-    - tick size (0.05)
+    - tick size (actual contract tick size if cached, or 0.05 synthetic fallback)
     """
     if cache_payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
         try:
             cache_payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30, as_of_date=as_of_date)
-        except Exception:
+        except (FileNotFoundError, StaleMetadataError):
             cache_payload = None
 
     parsed = parse_derivative_symbol(symbol)
@@ -529,12 +889,24 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
     asset_type = parsed["asset_type"]
     opt_type = parsed["option_type"]
     strike = parsed["strike"]
+    inferred_exch = _infer_exchange_from_symbol(symbol, explicit_exchange=exchange) or (
+        "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
+    )
 
-    # Check if exact contract exists in cache
-    if cache_payload and "instruments" in cache_payload:
-        exact = cache_payload["instruments"].get(parsed["canonical_symbol"])
+    # Check if exact contract exists in cache (exchange-specific first, then flat)
+    if cache_payload:
+        exact = None
+        by_exch = cache_payload.get("instruments_by_exchange") or {}
+        if inferred_exch in by_exch:
+            exact = by_exch[inferred_exch].get(parsed["canonical_symbol"])
+        if exact is None and "instruments" in cache_payload:
+            cand = cache_payload["instruments"].get(parsed["canonical_symbol"])
+            if cand and (not cand.get("exchange") or str(cand.get("exchange")).upper() == inferred_exch):
+                exact = cand
         if exact:
-            out = dict(exact)
+            out = _normalize_cache_record_tick(
+                exact, cache_payload=cache_payload, allow_none=False, sym_hint=parsed["canonical_symbol"]
+            )
             out.setdefault("expiry_source", "contract_master")
             return out
 
@@ -543,7 +915,6 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
     if not lot_size:
         raise LotSizeResolutionError("Cannot resolve F&O lot size for underlying: %r" % underlying)
 
-    exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
     strike_interval = get_strike_interval(underlying)
 
     # Resolve expiry date
@@ -555,14 +926,14 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
         expiry_source = "symbol_explicit"
     else:
         # Monthly contract: resolve last trading day based on underlying convention
-        exp_dt = calendar_in.get_monthly_expiry(year, month, exchange=exchange, underlying=underlying)
+        exp_dt = calendar_in.get_monthly_expiry(year, month, exchange=inferred_exch, underlying=underlying)
         expiry_date = exp_dt.strftime("%Y-%m-%d")
         expiry_source = "exchange_fallback_rule"
 
     return {
         "canonical_symbol": parsed["canonical_symbol"],
         "underlying": underlying,
-        "exchange": exchange,
+        "exchange": inferred_exch,
         "asset_type": asset_type,
         "instrument_type": ("OPTIDX" if underlying in INDEX_INSTRUMENTS else "OPTSTK") if asset_type == "OPTIONS" else ("FUTIDX" if underlying in INDEX_INSTRUMENTS else "FUTSTK"),
         "instrument_identifier": parsed["canonical_symbol"],
@@ -572,6 +943,8 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
         "expiry_source": expiry_source,
         "lot_size": lot_size,
         "tick_size": 0.05,
+        "tick_size_unit": "INR",
+        "tick_size_source": "synthetic_default",
         "strike_interval": strike_interval,
         "is_trade_to_trade": False,
         "is_cas_eligible": False,
@@ -579,19 +952,21 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None):
     }
 
 
-def resolve_instrument(symbol, cache_payload=None, require_intraday=True):
+def resolve_instrument(symbol, cache_payload=None, require_intraday=True, exchange=None):
     """Authoritatively resolve instrument metadata for a canonical symbol.
 
     Fails closed:
     - Resolves derivatives if is_derivative_symbol is True.
     - Resolves index instruments if symbol is a known index.
-    - Raises InstrumentMetadataError if symbol is missing from master.
+    - Respects exchange qualifiers (.NS, .BO, NSE:, BSE:, or explicit exchange=).
+    - Raises InstrumentMetadataError if symbol is missing from master (or absent on requested exchange).
     - Raises InstrumentMetadataError if security is Trade-to-Trade and require_intraday is True.
     - Raises TickResolutionError if tick size is missing or invalid.
     - Raises LotSizeResolutionError if lot size is missing or <= 0.
     """
+    req_exch = _infer_exchange_from_symbol(symbol, explicit_exchange=exchange)
     if is_derivative_symbol(symbol):
-        return resolve_derivative_contract(symbol, cache_payload=cache_payload)
+        return resolve_derivative_contract(symbol, cache_payload=cache_payload, exchange=req_exch)
 
     try:
         sym = normalize_symbol(symbol)
@@ -604,17 +979,42 @@ def resolve_instrument(symbol, cache_payload=None, require_intraday=True):
     if not cache_payload and os.path.isfile(DEFAULT_CACHE_PATH):
         try:
             cache_payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
-        except Exception:
+        except (FileNotFoundError, StaleMetadataError):
             cache_payload = None
 
     if not cache_payload:
         raise InstrumentMetadataError("Instrument cache payload required to resolve equity: %r" % sym)
 
-    instruments = cache_payload.get("instruments", {})
-    if sym not in instruments:
-        raise InstrumentMetadataError("Symbol %r not found in authoritative instrument master" % sym)
+    entry = None
+    instruments = cache_payload.get("instruments") or {}
+    by_exch = cache_payload.get("instruments_by_exchange") or {}
+    if req_exch:
+        if isinstance(by_exch.get(req_exch), dict) and sym in by_exch[req_exch]:
+            entry = by_exch[req_exch][sym]
+        elif "%s:%s" % (req_exch, sym) in instruments:
+            entry = instruments["%s:%s" % (req_exch, sym)]
+        elif sym in instruments:
+            cand = instruments[sym]
+            cand_exch = str(cand.get("exchange") or "").upper()
+            if not cand_exch or cand_exch == req_exch:
+                entry = cand
+            else:
+                raise InstrumentMetadataError(
+                    "Symbol %r found only on %s, not requested exchange %s" % (sym, cand_exch, req_exch)
+                )
+    else:
+        if sym in instruments:
+            entry = instruments[sym]
+        else:
+            for ex_cand in ("NSE", "BSE"):
+                if isinstance(by_exch.get(ex_cand), dict) and sym in by_exch[ex_cand]:
+                    entry = by_exch[ex_cand][sym]
+                    break
 
-    entry = instruments[sym]
+    if entry is None:
+        if req_exch:
+            raise InstrumentMetadataError("Symbol %r (%s) not found in authoritative instrument master" % (sym, req_exch))
+        raise InstrumentMetadataError("Symbol %r not found in authoritative instrument master" % sym)
 
     # Series / Trade-to-Trade checks
     if require_intraday and entry.get("is_trade_to_trade"):
@@ -624,17 +1024,15 @@ def resolve_instrument(symbol, cache_payload=None, require_intraday=True):
             % (sym, series)
         )
 
-    # Tick size resolution
-    tick_size = entry.get("tick_size")
-    if tick_size is None or not isinstance(tick_size, (int, float)) or tick_size <= 0:
-        raise TickResolutionError("Cannot authoritatively resolve tick size for %r" % sym)
+    # Tick size resolution & provenance validation (strict positive finite INR; never invent precision)
+    entry = _normalize_cache_record_tick(entry, cache_payload=cache_payload, allow_none=False, sym_hint=sym)
 
     # Lot size resolution
     lot_size = entry.get("lot_size")
-    if lot_size is None or not isinstance(lot_size, int) or lot_size <= 0:
+    if lot_size is None or isinstance(lot_size, bool) or not isinstance(lot_size, int) or lot_size <= 0:
         raise LotSizeResolutionError("Cannot authoritatively resolve lot size for %r" % sym)
 
-    return entry
+    return dict(entry)
 
 
 def is_cas_eligible(symbol, cache_payload):
@@ -723,6 +1121,7 @@ def sync_masters(dest_path=DEFAULT_CACHE_PATH, offline_dir=None, exchange="NSE")
 
     # 3. Check for BSE Equity.csv
     bse_text = None
+    bse_records = {}
     if offline_dir and os.path.isdir(offline_dir):
         p = os.path.join(offline_dir, "Equity.csv")
         if os.path.isfile(p):
@@ -734,7 +1133,15 @@ def sync_masters(dest_path=DEFAULT_CACHE_PATH, offline_dir=None, exchange="NSE")
             if sym not in equity_records:
                 equity_records[sym] = rec
 
-    payload = build_instrument_master(equity_records, fo_lots=fo_lots)
+    by_exch = {}
+    if equity_records:
+        nse_only = {k: v for k, v in equity_records.items() if str(v.get("exchange") or "NSE").upper() == "NSE"}
+        if nse_only:
+            by_exch["NSE"] = nse_only
+    if bse_records:
+        by_exch["BSE"] = bse_records
+
+    payload = build_instrument_master(equity_records, fo_lots=fo_lots, by_exchange_records=by_exch or None)
     save_instrument_cache(payload, cache_path=dest_path)
     return payload
 
@@ -753,6 +1160,7 @@ def main(argv=None):
     p = sub.add_parser("inspect", help="inspect metadata for a symbol or derivative")
     p.add_argument("symbol", help="canonical or derivative symbol (e.g. RELIANCE, NIFTY26NOV24000CE)")
     p.add_argument("--cache", default=DEFAULT_CACHE_PATH, help="cache path (default %s)" % DEFAULT_CACHE_PATH)
+    p.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange qualifier (NSE or BSE)")
     p.add_argument("--json", action="store_true", help="output JSON")
 
     a = ap.parse_args(argv)
@@ -788,7 +1196,9 @@ def main(argv=None):
             payload = None
             if os.path.isfile(a.cache):
                 payload = load_instrument_cache(a.cache, max_age_days=30)
-            res = resolve_instrument(a.symbol, cache_payload=payload, require_intraday=False)
+            res = resolve_instrument(
+                a.symbol, cache_payload=payload, require_intraday=False, exchange=getattr(a, "exchange", None)
+            )
             if a.json:
                 print(json.dumps(res, indent=2))
             else:

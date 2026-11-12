@@ -13,7 +13,7 @@ for _k in (
     "INDIA_MARKET_DATA_ALLOW_YAHOO_FALLBACK",
     "INDIA_MARKET_DATA_FALLBACK_PROVIDER",
 ):
-    os.environ.setdefault(_k, "")
+    os.environ[_k] = ""
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIX = os.path.join(ROOT, "tests", "fixtures")

@@ -928,11 +928,15 @@ def read_config(path, market="US"):
                 doc = json.load(fh)
         except ValueError as e:
             raise EntryError("%s is not valid JSON: %s" % (path, e))
-        for k in DEFAULTS:
-            if doc.get(k):
-                cfg[k] = doc[k]
-        if str(doc.get("market", "")).upper() == "IN":
-            cfg["market"] = "IN"
+        if isinstance(doc, dict):
+            for k, v in doc.items():
+                if k in DEFAULTS:
+                    if v:
+                        cfg[k] = v
+                elif v is not None:
+                    cfg[k] = v
+            if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
+                cfg["market"] = "IN"
     for k in DEFAULTS:
         parse_hhmm(cfg[k], k, market=market)
     return cfg
@@ -966,26 +970,112 @@ def rsi_val(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
-def _tick_step(market="US"):
+def _tick_step(market="US", tick_size=None):
+    if tick_size is not None:
+        return float(tick_size)
     return 0.05 if market == "IN" else 0.01
 
 
-def _floor_tick(price, tick=0.05):
-    from decimal import Decimal, ROUND_FLOOR
-    d_price = Decimal(str(round(float(price), 4)))
+def _tick_scale(tick):
+    from decimal import Decimal
     d_tick = Decimal(str(tick))
-    floored = (d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_tick
-    return round(float(floored), 2) + 0.0
+    return max(2, -d_tick.as_tuple().exponent)
 
 
-def _compute_breakout_invalidation(breakout_level, trig_low, trig_close, market="US"):
+def _floor_tick(price, tick=0.05):
+    from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+    d_price = Decimal(str(round(float(price), 6)))
+    d_tick = Decimal(str(tick))
+    q_fmt = Decimal("1").scaleb(-_tick_scale(tick))
+    floored = ((d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_tick).quantize(
+        q_fmt, rounding=ROUND_HALF_UP
+    )
+    return float(floored) + 0.0
+
+
+def _round_tick(price, tick=0.05):
+    from decimal import Decimal, ROUND_HALF_UP
+    d_price = Decimal(str(round(float(price), 6)))
+    d_tick = Decimal(str(tick))
+    q_fmt = Decimal("1").scaleb(-_tick_scale(tick))
+    rounded = ((d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_tick).quantize(
+        q_fmt, rounding=ROUND_HALF_UP
+    )
+    return float(rounded) + 0.0
+
+
+def _validate_tick_value(raw_tick, context="instrument"):
+    from decimal import Decimal, InvalidOperation
+    if raw_tick is None or isinstance(raw_tick, bool):
+        raise EntryError("Missing or invalid boolean tick_size (%r) from %s" % (raw_tick, context))
+    try:
+        dec = Decimal(str(raw_tick).strip())
+    except (InvalidOperation, ValueError):
+        raise EntryError("Invalid non-numeric tick_size %r from %s" % (raw_tick, context))
+    if not dec.is_finite() or dec <= 0:
+        raise EntryError("Invalid non-positive tick_size %r from %s" % (raw_tick, context))
+    return float(dec)
+
+
+def _infer_exchange_in(symbol, exchange=None, chart=None, cfg=None, market="US"):
+    if exchange:
+        return str(exchange).strip().upper()
+    raw = str(symbol or "").strip().upper()
+    if raw.endswith(".BO") or raw.startswith("BSE:"):
+        return "BSE"
+    if raw.endswith(".NS") or raw.startswith("NSE:"):
+        return "NSE"
+    if isinstance(chart, dict):
+        ex = chart.get("exchange") or (chart.get("meta") or {}).get("exchange")
+        if ex and str(ex).strip().upper() in ("NSE", "BSE"):
+            return str(ex).strip().upper()
+    if isinstance(cfg, dict) and cfg.get("exchange"):
+        return str(cfg["exchange"]).strip().upper()
+    return "NSE" if market == "IN" else "NYSE"
+
+
+def _resolve_entry_tick(symbol, market="US", chart=None, cfg=None, exchange=None,
+                        instruments_path=None, tick_size=None, eval_day=None):
+    """Return (eff_tick, explicit_resolved, eff_exchange)."""
+    eff_exch = _infer_exchange_in(symbol, exchange=exchange, chart=chart, cfg=cfg, market=market)
+    explicit_inst = instruments_path is not None
+    if explicit_inst and (not instruments_path or not os.path.isfile(instruments_path)):
+        raise EntryError("Instrument cache not found at: %s" % instruments_path)
+    if tick_size is not None:
+        return _validate_tick_value(tick_size, context="tick_size argument"), True, eff_exch
+    if isinstance(chart, dict) and "tick_size" in chart:
+        raw_c_tick = chart.get("tick_size")
+        if raw_c_tick is not None:
+            return _validate_tick_value(raw_c_tick, context="chart metadata"), True, eff_exch
+        asset_up = str(chart.get("asset_type") or "").upper()
+        if asset_up != "INDEX":
+            raise EntryError("Chart metadata for %s specifies missing/invalid tick_size: %r" % (symbol, raw_c_tick))
+    if market == "IN" and instruments is not None:
+        inst_path = instruments_path or (cfg or {}).get("instruments_path") or getattr(instruments, "DEFAULT_CACHE_PATH", None)
+        if inst_path and os.path.isfile(inst_path):
+            tick_err_cls = getattr(instruments, "TickResolutionError", Exception)
+            meta_err_cls = getattr(instruments, "InstrumentMetadataError", Exception)
+            try:
+                as_of = eval_day.isoformat() if hasattr(eval_day, "isoformat") else eval_day
+                cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=as_of)
+                rec = instruments.resolve_instrument(symbol, cache_payload=cache, require_intraday=False, exchange=eff_exch)
+                return _validate_tick_value(rec.get("tick_size"), context="instrument master (%s)" % (rec.get("exchange") or eff_exch)), True, (rec.get("exchange") or eff_exch)
+            except tick_err_cls as exc:
+                raise EntryError(str(exc))
+            except meta_err_cls as exc:
+                if explicit_inst:
+                    raise EntryError(str(exc))
+    return _tick_step(market), False, eff_exch
+
+
+def _compute_breakout_invalidation(breakout_level, trig_low, trig_close, market="US", tick_size=None):
     """Structural invalidation stop below broken level/trigger bar low, strictly below entry."""
-    tick = _tick_step(market)
+    tick = _tick_step(market, tick_size=tick_size)
     anchor = float(breakout_level)
     if trig_low is not None:
         anchor = min(anchor, float(trig_low))
     inv = _floor_tick(anchor, tick=tick)
-    entry_r = r2(trig_close)
+    entry_r = _round_tick(trig_close, tick=tick) if tick_size is not None else r2(trig_close)
     if entry_r is not None and inv >= entry_r:
         inv = _floor_tick(entry_r - tick, tick=tick)
     if inv <= 0:
@@ -1043,7 +1133,7 @@ def _find_20d_fallback(closes):
     return tags, {"high20": hi20}
 
 
-def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US"):
+def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US", tick_size=None):
     """Compute prior-session 20d closing high entering eval_day, reusing trader-scanner logic."""
     min_daily = getattr(scanner_mod, "MIN_DAILY_BARS", 30) if scanner_mod else 30
     daily_err = chart.get("daily_error")
@@ -1099,10 +1189,11 @@ def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US"):
         _, today_nums = _find_20d_fallback(closes_prior + [closes_prior[-1]])
 
     breakout_level = float(today_nums["high20"])
-    tick = _tick_step(market)
-    ref_inv = _floor_tick(breakout_level - tick, tick=tick)
+    tick = _tick_step(market, tick_size=tick_size)
+    anchor_level = _round_tick(breakout_level, tick=tick) if tick_size is not None else breakout_level
+    ref_inv = _floor_tick(anchor_level - tick, tick=tick)
     if ref_inv <= 0:
-        ref_inv = r2(breakout_level)
+        ref_inv = _round_tick(anchor_level, tick=tick) if tick_size is not None else r2(breakout_level)
 
     expected_prev = _expected_prev_trading_day(eval_day, market=market)
     missed = _count_missed_trading_days(latest_daily_date, eval_day, market=market)
@@ -1251,7 +1342,8 @@ def _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
              min_volume_x=None, cfg=None, market=None, trading_style="intraday",
-             option_strategy=None, strike_selection="ATM", simulated=False):
+             option_strategy=None, strike_selection="ATM", simulated=False,
+             tick_size=None, exchange=None, instruments_path=None):
     """Pure function: the setup's status at now_utc from one session's bars."""
     market = market or chart.get("market") or "US"
     cfg = cfg or dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
@@ -1269,7 +1361,11 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     local = to_local(now_utc, market=market)
     day = local.date()
     curr = "\u20b9" if market == "IN" else "$"
-    exchange = "NSE" if market == "IN" else "NYSE"
+    eff_tick, explicit_tick, eff_exch = _resolve_entry_tick(
+        chart.get("symbol", ""), market=market, chart=chart, cfg=cfg, exchange=exchange,
+        instruments_path=instruments_path, tick_size=tick_size, eval_day=day,
+    )
+    exchange = eff_exch if market == "IN" else "NYSE"
     is_clock_override = bool(simulated or chart.get("clock_override"))
     is_sim_run = bool(simulated or chart.get("clock_override") or chart.get("simulated_at"))
     res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
@@ -1279,6 +1375,11 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "trading_style": trading_style,
            "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS if market == "US" else True,
            "market": market, "currency": "INR" if market == "IN" else "USD", "_bars": []}
+    if market == "IN":
+        res["exchange"] = exchange
+        if explicit_tick:
+            res["tick_size"] = eff_tick
+        res["_explicit_tick"] = explicit_tick
     if is_clock_override:
         res["clock_override"] = True
     if is_sim_run:
@@ -1365,12 +1466,16 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res["_market_session_open"] = False
             res["_replay_full_session"] = True
             if setup == "breakout_20d":
-                b20_ref = _analyze_breakout_20d_baseline(chart, now_utc, last_td, market=market)
-                res["breakout_level"] = r2(b20_ref["breakout_level"]) if b20_ref.get("breakout_level") is not None else None
-                res["level"] = res["breakout_level"]
+                b20_ref = _analyze_breakout_20d_baseline(chart, now_utc, last_td, market=market, tick_size=eff_tick)
+                b20_lvl = (
+                    (_round_tick(b20_ref["breakout_level"], eff_tick) if explicit_tick else r2(b20_ref["breakout_level"]))
+                    if b20_ref.get("breakout_level") is not None else None
+                )
+                res["breakout_level"] = b20_lvl
+                res["level"] = b20_lvl
                 res["confirmation_price"] = None
                 res["timestamp"] = None
-                res["invalidation_level"] = b20_ref.get("ref_invalidation") if b20_ref.get("breakout_level") is not None else None
+                res["invalidation_level"] = b20_ref.get("ref_invalidation") if b20_lvl is not None else None
                 res["scanner_breakout_matched"] = bool(b20_ref.get("scanner_matched"))
                 if b20_ref.get("daily_close_date") is not None:
                     res["daily_close_date"] = b20_ref["daily_close_date"]
@@ -1440,8 +1545,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     b20 = None
     if setup == "breakout_20d":
-        b20 = _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market=market)
-        res["breakout_level"] = r2(b20["breakout_level"]) if b20.get("breakout_level") is not None else None
+        b20 = _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market=market, tick_size=eff_tick)
+        res["breakout_level"] = (_round_tick(b20["breakout_level"], eff_tick) if explicit_tick else r2(b20["breakout_level"])) if b20.get("breakout_level") is not None else None
         res["level"] = res["breakout_level"]
         res["confirmation_price"] = None
         res["timestamp"] = None
@@ -1524,7 +1629,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     or_bars = [b for b in bars if b["slot"] < n_or]
     avg_vol = (sum(b["v"] for b in or_bars) / float(len(or_bars))) if or_bars else None
     if or_bars:
-        res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
+        or_h = max(b["h"] for b in or_bars)
+        or_l = min(b["l"] for b in or_bars)
+        res["opening_range"] = {"high": _round_tick(or_h, eff_tick) if explicit_tick else r2(or_h),
+                                "low": _round_tick(or_l, eff_tick) if explicit_tick else r2(or_l),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
                                 "complete": (replay_full_session or local >= or_end), "avg_volume": int(round(avg_vol))}
     if setup in ("orb", "options_orb"):
@@ -1546,7 +1654,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         lvl = float(b20["breakout_level"])
     else:
         lvl = float(chart.get("prev_close") or (bars[0]["c"] if bars else 100.0))
-    res["level"] = r2(lvl)
+    res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
 
     first_slot = n_or if setup in ("orb", "options_orb") else 0
     trig, thin = None, []
@@ -1629,14 +1737,18 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res.update(status="triggered", phase="open" if session_is_open else "after-close",
                    reason=trig_reason)
         conf_iso = _market_iso(local_to_utc(trig["end"], market=market), market=market)
+        trig_px = _round_tick(trig["c"], eff_tick) if explicit_tick else r2(trig["c"])
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
-                          "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
+                          "bar_index": trig["slot"], "price": trig_px, "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if setup == "breakout_20d":
-            res["confirmation_price"] = r2(trig["c"])
+            res["confirmation_price"] = trig_px
             res["timestamp"] = conf_iso
-            res["invalidation_level"] = _compute_breakout_invalidation(lvl, trig.get("l"), trig["c"], market=market)
+            lvl_ref = res["level"] if res.get("level") is not None else lvl
+            res["invalidation_level"] = _compute_breakout_invalidation(
+                lvl_ref, trig.get("l"), trig["c"], market=market, tick_size=eff_tick
+            )
             res["signal_freshness"] = _breakout_signal_freshness(
                 "triggered", data_tier, data_status, is_live_data, is_fixture, is_simulated,
                 is_historical, replay_full_session, eval_day, day,
@@ -1828,6 +1940,10 @@ def entry_doc(res, now_utc):
            "source": doc_source, "provider": provider_name, "checked_at": iso(now_utc), "reason": res.get("reason")}
     if res.get("market"):
         doc["market"] = res["market"]
+    if res.get("exchange"):
+        doc["exchange"] = res["exchange"]
+    if res.get("_explicit_tick") and res.get("tick_size") is not None:
+        doc["tick_size"] = res["tick_size"]
     if res.get("currency"):
         doc["currency"] = res["currency"]
     if res.get("option_contract"):
@@ -2186,13 +2302,18 @@ def _opts(a, cfg):
     strike_selection = getattr(a, "strike_selection", None) or cfg.get("strike_selection") or "ATM"
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
             "min_volume_x": a.min_volume_x, "cfg": cfg, "trading_style": trading_style,
-            "option_strategy": option_strategy, "strike_selection": strike_selection}
+            "option_strategy": option_strategy, "strike_selection": strike_selection,
+            "exchange": getattr(a, "exchange", None),
+            "instruments_path": getattr(a, "instruments", None)}
 
 
 def _load(a, sym, now, market="US", cfg=None, setup=None):
     """(chart, now). An offline file without --now is read as of its own time."""
     if cfg is None and hasattr(a, "config"):
         cfg = read_config(a.config, market=market)
+    if getattr(a, "exchange", None):
+        cfg = dict(cfg or {})
+        cfg["exchange"] = a.exchange
     setup = setup or getattr(a, "setup", "orb")
     daily = getattr(a, "daily", None)
     real_today = to_local(utc_now(), market=market).date()
@@ -2274,9 +2395,6 @@ def cmd_watch(a):
 
 
 def cmd_watchlist(a):
-    market = get_market_profile(a)
-    cfg = read_config(a.config, market=market)
-    opts = _opts(a, cfg)
     if not os.path.exists(a.watchlist):
         raise EntryError("no watchlist at %s: run /trader-scanner first (it writes the hits there)" % a.watchlist)
     try:
@@ -2289,14 +2407,19 @@ def cmd_watchlist(a):
         raise EntryError("no hits in %s: the scanner found nothing to watch" % a.watchlist)
     if a.offline and not os.path.isdir(a.offline):
         raise EntryError("watchlist --offline wants a folder of <TICKER>.json files")
+    market = get_market_profile(a)
+    inferred_in = False
     if not getattr(a, "market", None) and str(doc.get("market", "")).upper() in ("IN", "INDIA"):
         market = "IN"
+        inferred_in = True
+    cfg = read_config(a.config, market=market)
+    opts = _opts(a, cfg)
 
     now = parse_now(a.now, market=market) if a.now else None
     rows = []
     for i, h in enumerate(hits):
         sym = str(h["symbol"]).upper()
-        item_market = market if getattr(a, "market", None) else get_market_profile(a, sym=sym, cfg=cfg)
+        item_market = market if (getattr(a, "market", None) or inferred_in) else get_market_profile(a, sym=sym, cfg=cfg)
         o = dict(opts)
         o["market"] = item_market
         if a.setup == "level" and o["level"] is None:
@@ -2356,6 +2479,8 @@ def main(argv=None):
         p.add_argument("--daily", metavar="PATH", help="saved 1d daily history JSON (.json/.json.gz) or folder (--setup breakout_20d)")
         p.add_argument("--config", default="trader/config.json")
         p.add_argument("--market", choices=["US", "IN"], help="market profile (US or IN)")
+        p.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian instruments (NSE or BSE)")
+        p.add_argument("--instruments", help="path to instruments master cache JSON")
         p.add_argument("--trading-style", choices=["intraday", "positional"], default=None,
                        help="trading style: intraday (default) or positional")
         p.add_argument("--option-strategy", default=None, help="option strategy: long_call, long_put, etc.")

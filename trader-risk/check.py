@@ -60,6 +60,7 @@ so trader-broker only shows an order as ready if THIS exact order passed today.
 
 import argparse
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import json
 import os
@@ -157,6 +158,28 @@ IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
 class RiskError(Exception):
     pass
+
+
+def _parse_tick_val(val):
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        d = Decimal(str(val).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not d.is_finite() or d <= 0:
+        return None
+    return d
+
+
+def _is_on_tick(price_val, tick_dec):
+    try:
+        d_px = Decimal(str(price_val).strip())
+    except (InvalidOperation, ValueError):
+        return False
+    if not d_px.is_finite() or d_px <= 0:
+        return False
+    return (d_px % tick_dec) == Decimal(0)
 
 
 def get_market_profile(a=None, orders=None, cfg=None):
@@ -510,8 +533,35 @@ def _sub_unit(x):
 _cent = _sub_unit
 
 
-def _p(x):
-    return "%.2f" % float(x)
+def _price_scale(x=None, tick=None):
+    scale = 2
+    if tick is not None:
+        try:
+            td = Decimal(str(tick).strip()).normalize()
+            if td.is_finite() and td > 0 and td.as_tuple().exponent < 0:
+                scale = max(scale, -td.as_tuple().exponent)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    if x is not None:
+        try:
+            vd = Decimal(str(x).strip()).normalize()
+            if vd.is_finite() and vd.as_tuple().exponent < 0:
+                v_exp = -vd.as_tuple().exponent
+                if v_exp <= 4:
+                    scale = max(scale, v_exp)
+        except (InvalidOperation, ValueError, AttributeError):
+            pass
+    return scale
+
+
+def _p(x, tick=None):
+    scale = _price_scale(x, tick=tick)
+    try:
+        d = Decimal(str(x).strip())
+        q = Decimal("1").scaleb(-scale)
+        return format(d.quantize(q, rounding=ROUND_HALF_UP), "f")
+    except (InvalidOperation, ValueError, AttributeError):
+        return "%.*f" % (scale, float(x))
 
 
 def account(cfg, portfolio, prices):
@@ -589,7 +639,7 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None, market=None, simulated=False, source_doc=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None, market=None, simulated=False, source_doc=None, instruments_path=None, instruments_cache=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its market date is "today"
@@ -604,6 +654,25 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     now_local = to_local(now_utc, market=market)
     now_et = to_eastern(now_utc)
     today = today or now_local.date().isoformat()
+    inst_cache = instruments_cache
+    inst_cache_err = None
+    if inst_cache is None and market == "IN" and instruments:
+        explicit_inst = instruments_path is not None
+        inst_path = instruments_path or getattr(instruments, "DEFAULT_CACHE_PATH", None)
+        if explicit_inst and (not inst_path or not os.path.isfile(inst_path)):
+            inst_cache_err = "Instrument cache not found at: %s" % inst_path
+        elif inst_path and os.path.isfile(inst_path):
+            try:
+                inst_cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=today)
+            except Exception as exc:
+                inst_cache = None
+                inst_cache_err = str(exc)
+    elif inst_cache is not None and market == "IN" and instruments:
+        try:
+            inst_cache = instruments.normalize_instrument_cache_payload(inst_cache, allow_none_tick=True)
+        except Exception as exc:
+            inst_cache = None
+            inst_cache_err = str(exc)
     acct_prices = {
         k: v for k, v in prices.items()
         if price_times is None or price_times.get(k) is None or price_times[k] <= now_utc
@@ -817,8 +886,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 ref, ref_from = max(cands, key=lambda x: x[0])
                 ref = _cent(ref)
                 if live and ref_from == "price" and plan_entry and live > plan_entry + CENT:
+                    tick_hint = _parse_tick_val(o.get("tick_size")) or _parse_tick_val(plan.get("tick_size"))
                     info.append("%s last %s is above the plan's entry %s: the risk is measured from %s"
-                                % (sym, _p(ref), _p(plan_entry), _p(ref)))
+                                % (sym, _p(ref, tick=tick_hint), _p(plan_entry, tick=tick_hint), _p(ref, tick=tick_hint)))
                 if live is not None and price_times is not None and price_times.get(sym) is not None:
                     if price_times[sym] <= now_utc:
                         permitted_data_times.append(price_times[sym])
@@ -862,20 +932,140 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             later.append("price: no price for %s to size a %s-share order; add it to "
                          "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
 
-        # Trade-to-Trade (T2T) check for Indian equities
+        # Trade-to-Trade (T2T) and authoritative tick-size resolution for Indian instruments
+        eff_tick_dec = None
+        inst = None
+        _price_leg_keys = (
+            "limit_price",
+            "stop_price",
+            "take_profit_limit_price",
+            "stop_loss_stop_price",
+            "stop_loss_limit_price",
+            "trail_price",
+        )
+        has_price_legs = any(o.get(pk) is not None for pk in _price_leg_keys)
+        # Market flatten/exit orders transmit no limit/stop price on an exchange tick grid,
+        # so they must not be blocked solely because instrument metadata is missing or stale.
+        is_unpriced_market_exit = (
+            kind == "exit"
+            and typ == "market"
+            and not has_price_legs
+            and not bracket
+            and not is_gtt_oco
+        )
+        if market == "IN":
+            req_exch = o.get("exchange") or plan.get("exchange") or c.get("exchange")
+            if not req_exch:
+                raw_o_sym = str(o.get("symbol") or "").strip().upper()
+                if raw_o_sym.endswith(".BO") or raw_o_sym.startswith("BSE:"):
+                    req_exch = "BSE"
+                elif raw_o_sym.endswith(".NS") or raw_o_sym.startswith("NSE:"):
+                    req_exch = "NSE"
+            if req_exch:
+                req_exch = str(req_exch).strip().upper()
+
+            if inst_cache_err:
+                if is_unpriced_market_exit:
+                    warns.append("tick_size: instrument cache unavailable for market exit (%s)" % inst_cache_err)
+                else:
+                    reasons.append("tick_size: failed to load instrument cache: %s" % inst_cache_err)
+            elif instruments and inst_cache is not None:
+                instr_err_cls = getattr(instruments, "InstrumentMetadataError", Exception)
+                try:
+                    canon_sym = symbols_in.normalize_symbol(sym) if symbols_in else sym
+                except Exception:
+                    canon_sym = sym
+                try:
+                    inst = instruments.resolve_instrument(
+                        o.get("symbol") or canon_sym,
+                        cache_payload=inst_cache,
+                        require_intraday=False,
+                        exchange=req_exch,
+                    )
+                except instr_err_cls as exc:
+                    if is_unpriced_market_exit:
+                        warns.append("tick_size: %s (ignored for market exit)" % exc)
+                    else:
+                        reasons.append("tick_size: %s" % exc)
+                    inst = None
+            elif isinstance(inst_cache, dict):
+                try:
+                    canon_sym = symbols_in.normalize_symbol(sym) if symbols_in else sym
+                except Exception:
+                    canon_sym = sym
+                if req_exch and isinstance(inst_cache.get("instruments_by_exchange"), dict):
+                    inst = (inst_cache["instruments_by_exchange"].get(req_exch) or {}).get(canon_sym)
+                if inst is None:
+                    cand = (inst_cache.get("instruments") or {}).get(canon_sym)
+                    if cand and (not req_exch or not cand.get("exchange") or str(cand.get("exchange")).upper() == req_exch):
+                        inst = cand
+                if inst is None:
+                    if is_unpriced_market_exit:
+                        warns.append(
+                            "tick_size: symbol %s%s not found in instrument cache (ignored for market exit)"
+                            % (canon_sym, (" (%s)" % req_exch) if req_exch else "")
+                        )
+                    else:
+                        reasons.append(
+                            "tick_size: symbol %s%s not found in instrument cache"
+                            % (canon_sym, (" (%s)" % req_exch) if req_exch else "")
+                        )
+
+            inst_tick_dec = _parse_tick_val(inst.get("tick_size")) if isinstance(inst, dict) else None
+            if isinstance(inst, dict) and "tick_size" in inst and inst_tick_dec is None and not any(r.startswith("tick_size:") for r in reasons):
+                if is_unpriced_market_exit:
+                    warns.append("tick_size: missing or invalid instrument tick_size %r for %s (ignored for market exit)" % (inst.get("tick_size"), sym))
+                else:
+                    reasons.append("tick_size: missing or invalid instrument tick_size %r for %s" % (inst.get("tick_size"), sym))
+
+            ord_tick_dec = None
+            plan_tick_dec = None
+            if "tick_size" in o:
+                ord_tick_dec = _parse_tick_val(o.get("tick_size"))
+                if ord_tick_dec is None:
+                    reasons.append("tick_size: missing or invalid order tick_size %r for %s" % (o.get("tick_size"), sym))
+            if "tick_size" in plan:
+                plan_tick_dec = _parse_tick_val(plan.get("tick_size"))
+                if plan_tick_dec is None:
+                    reasons.append("tick_size: missing or invalid plan tick_size %r for %s" % (plan.get("tick_size"), sym))
+            if ord_tick_dec is not None and plan_tick_dec is not None and ord_tick_dec != plan_tick_dec:
+                reasons.append(
+                    "tick_size: order tick_size %s disagrees with plan tick_size %s for %s"
+                    % (ord_tick_dec, plan_tick_dec, sym)
+                )
+            if inst_tick_dec is not None:
+                if ord_tick_dec is not None and ord_tick_dec != inst_tick_dec:
+                    reasons.append(
+                        "tick_size: order tick_size %s disagrees with instrument tick_size %s for %s"
+                        % (ord_tick_dec, inst_tick_dec, sym)
+                    )
+                if plan_tick_dec is not None and plan_tick_dec != inst_tick_dec:
+                    reasons.append(
+                        "tick_size: plan tick_size %s disagrees with instrument tick_size %s for %s"
+                        % (plan_tick_dec, inst_tick_dec, sym)
+                    )
+            eff_tick_dec = (
+                inst_tick_dec if inst_tick_dec is not None
+                else (ord_tick_dec if ord_tick_dec is not None else plan_tick_dec)
+            )
+            if kind == "exit" and has_price_legs and eff_tick_dec is None and not any(r.startswith("tick_size:") for r in reasons):
+                reasons.append("tick_size: cannot authoritatively resolve tick_size for priced exit %s" % sym)
+            if eff_tick_dec is not None:
+                for pk in ("limit_price", "stop_price", "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price", "trail_price"):
+                    if o.get(pk) is not None and not _is_on_tick(o.get(pk), eff_tick_dec):
+                        reasons.append(
+                            "tick_size: %s %s is not a valid multiple of tick size %s for %s"
+                            % (pk, o.get(pk), eff_tick_dec, sym)
+                        )
+
         if market == "IN" and kind == "entry":
             is_t2t = bool(o.get("is_trade_to_trade") or plan.get("is_trade_to_trade"))
             series = o.get("series") or plan.get("series") or ""
-            if not is_t2t and instruments:
-                try:
-                    inst = instruments.get_instrument(sym)
-                    if inst:
-                        if inst.get("is_trade_to_trade"):
-                            is_t2t = True
-                        if not series and inst.get("series"):
-                            series = inst["series"]
-                except Exception:
-                    pass
+            if not is_t2t and inst:
+                if inst.get("is_trade_to_trade"):
+                    is_t2t = True
+                if not series and inst.get("series"):
+                    series = inst["series"]
             if is_t2t or (series and str(series).upper() in ("BE", "BZ", "T")):
                 later.append("trade-to-trade: intraday day trading is prohibited on %s (SEBI rules: series %s requires gross delivery settlement)"
                              % (sym, series or "T2T"))
@@ -926,7 +1116,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         lot_size = int(o.get("lot_size") or plan.get("lot_size") or 1)
         if lot_size <= 1 and market == "IN" and instruments and (is_opt or is_fut or (symbols_in and symbols_in.is_derivative_symbol(sym))):
             try:
-                fo_lot = instruments.get_fo_lot_size(sym)
+                fo_lot = instruments.get_fo_lot_size(sym, cache_payload=inst_cache)
                 if fo_lot and fo_lot > 1:
                     lot_size = int(fo_lot)
             except Exception:
@@ -968,10 +1158,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             target = _f(o.get("take_profit_limit_price")) or _f(plan.get("target"))
             if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
-                             "the broker uses" % (_p(leg_stop), _p(plan_stop)))
+                             "the broker uses" % (_p(leg_stop, tick=eff_tick_dec), _p(plan_stop, tick=eff_tick_dec)))
             if stop and not leg_stop:
                 warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
-                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
+                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop, tick=eff_tick_dec))
             if not stop:
                 if c.get("require_stop", True):
                     later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
@@ -979,28 +1169,29 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 else:
                     warns.append("no stop: the max loss is not capped, so it is not counted in the daily loss")
             elif ref:
-                if (long and stop >= ref - CENT) or (not long and stop <= ref + CENT):
+                tol = min(CENT, float(eff_tick_dec) / 4.0) if (market == "IN" and eff_tick_dec is not None) else CENT
+                if (long and stop >= ref - tol) or (not long and stop <= ref + tol):
                     later.append("stop: the stop %s must be %s the entry %s for a %s"
-                                 % (_p(stop), "below" if long else "above", _p(ref), side))
+                                 % (_p(stop, tick=eff_tick_dec), "below" if long else "above", _p(ref, tick=eff_tick_dec), side))
                 else:
-                    risk_c = int(round(abs(ref - stop) * 100))
-                    risk_ps = risk_c / 100.0
+                    risk_dec = abs(Decimal(str(ref)) - Decimal(str(stop)))
+                    risk_ps = float(risk_dec)
                     shares = q if q is not None else ((value or 0) / ref)
                     max_loss = round(shares * risk_ps, 2)
                     cap = max_loss_trade
                     if cap and max_loss > cap + CENT:
                         later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss, market=market), money(cap, market=market)))
+                                     "per trade" % (_num(shares), _p(risk_ps, tick=eff_tick_dec), money(max_loss, market=market), money(cap, market=market)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
-                        if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
+                        if (long and target <= ref + tol) or (not long and target >= ref - tol):
                             later.append("target: the target %s must be %s the entry %s"
-                                         % (_p(target), "above" if long else "below", _p(ref)))
+                                         % (_p(target, tick=eff_tick_dec), "above" if long else "below", _p(ref, tick=eff_tick_dec)))
                         else:
-                            rr = round(int(round(abs(target - ref) * 100)) / float(risk_c), 2)
+                            rr = round(float(abs(Decimal(str(target)) - Decimal(str(ref))) / risk_dec), 2)
                             if min_rr and rr < min_rr - 1e-9:
                                 later.append("reward:risk: %.2f (target %s, entry %s, stop %s) is under your "
-                                             "minimum %s" % (rr, _p(target), _p(ref), _p(stop), _num(min_rr)))
+                                             "minimum %s" % (rr, _p(target, tick=eff_tick_dec), _p(ref, tick=eff_tick_dec), _p(stop, tick=eff_tick_dec), _num(min_rr)))
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
@@ -1043,8 +1234,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                              % (pdt_n, ", ".join(pdt_list)))
             if stop and ref and risk_ps:
                 info.append("entry %s (%s), stop %s, target %s: risk %s a share"
-                            % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
-                               _p(target) if target else "none", _p(risk_ps)))
+                            % (_p(ref, tick=eff_tick_dec), REF_WORDS.get(ref_from, ref_from), _p(stop, tick=eff_tick_dec),
+                               _p(target, tick=eff_tick_dec) if target else "none", _p(risk_ps, tick=eff_tick_dec)))
                 info.append("max loss %s%s, reward:risk %s%s"
                             % (money(max_loss, market=market), (" (limit %s)" % money(max_loss_trade, market=market))
                                if max_loss_trade else "",
@@ -1094,12 +1285,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - q
                 elif ref and value is not None:
                     acct["shares"][sym] = held - value / ref
+        entry_ref_scale = _price_scale(ref, tick=eff_tick_dec) if ref else 2
         res_item = {
             "index": i, "symbol": sym, "side": side, "kind": kind,
             "amount": money(_f(notional) or 0, market=market) if notional is not None else ("%s shares" % qty),
             "currency": "INR" if market == "IN" else "USD",
             "value": round(value, 2) if value is not None else None,
-            "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
+            "entry_ref": round(ref, entry_ref_scale) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
             "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
@@ -1228,7 +1420,8 @@ def main(argv=None):
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
     ap.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
-    ap.add_argument("--instruments", default="trader/state/instruments.json", help="path to instruments cache")
+    ap.add_argument("--exchange", choices=["NSE", "BSE"], help="exchange for Indian instruments (NSE or BSE)")
+    ap.add_argument("--instruments", default=None, help="path to instruments cache")
     ap.add_argument("--now", help="override the application clock to this market time for backtests/tests, e.g. \"2026-10-19 10:15\" (marks signals non-live)")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in market local time)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
@@ -1241,10 +1434,12 @@ def main(argv=None):
         doc = read_json(orders_file, "orders file (run trader-budget first)")
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
-            raise RiskError("no orders in %s" % a.orders)
+            raise RiskError("no orders in %s" % orders_file)
         cfg = read_json(a.config, "config", required=False) or {}
         if getattr(a, "allow_off_hours", False):
             cfg["allow_off_hours"] = True
+        if getattr(a, "exchange", None):
+            cfg["exchange"] = a.exchange
         market = getattr(a, "market", None) or get_market_profile(a, orders, cfg)
         now = parse_now(a.now, market=market)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
@@ -1256,6 +1451,7 @@ def main(argv=None):
         res = check(
             orders, cfg, portfolio, prices, state, a.today, now, times,
             market=market, simulated=bool(a.now), source_doc=doc if isinstance(doc, dict) else None,
+            instruments_path=getattr(a, "instruments", None),
         )
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
@@ -1267,7 +1463,7 @@ def main(argv=None):
             check_ts = now if a.now else datetime.datetime.now(datetime.timezone.utc).replace(
                 microsecond=0, tzinfo=None)
             rec["checked_at"] = check_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-            rec["orders_file"] = a.orders
+            rec["orders_file"] = orders_file
             tmp = a.out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(rec, fh, indent=2)

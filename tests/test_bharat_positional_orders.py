@@ -154,6 +154,7 @@ def _in_plan(**overrides):
         "trading_style": "positional",
         "market": "IN",
         "currency": "INR",
+        "tick_size": 0.05,
     }
     plan.update(overrides)
     return plan
@@ -361,7 +362,7 @@ class PositionalOrderSemanticsTests(unittest.TestCase):
         # US market positional request must fail rather than emitting intraday Alpaca bracket
         with self.assertRaises(budget_mod.SizeError):
             budget_mod.size_trade(
-                _in_plan(symbol="TSLA", market="US", currency="USD"),
+                _in_plan(symbol="TSLA", market="US", currency="USD", tick_size=0.01),
                 {"budget": 5000, "paper": True, "broker": "alpaca", "market": "US"},
                 today="2026-10-19",
             )

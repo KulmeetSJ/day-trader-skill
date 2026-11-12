@@ -1936,9 +1936,9 @@ def main(argv=None):
     p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--json", action="store_true")
     p.add_argument("--market", choices=["US", "IN"], help="market profile: US (Nasdaq/NYSE) or IN (NSE/BSE)")
-    p.add_argument("--index", default="NIFTY50",
+    p.add_argument("--index", default=None,
                    help="Indian index constituent list: NIFTY50, NIFTY100, NIFTY200, NIFTY500, BANKNIFTY, FINNIFTY, SENSEX, BSE100, INDICES, ALL, or FNO")
-    p.add_argument("--exchange", choices=["NSE", "BSE", "ALL"], default="NSE", help="exchange for cash market equities")
+    p.add_argument("--exchange", choices=["NSE", "BSE", "ALL"], default=None, help="exchange for cash market equities")
     p.add_argument("--instruments", default="trader/state/instruments.json",
                    help="path to authoritative instrument master cache")
     p.add_argument("--config", default="trader/config.json", help="path to config JSON")
