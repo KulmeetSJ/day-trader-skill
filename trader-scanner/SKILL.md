@@ -1,6 +1,6 @@
 ---
 name: trader-scanner
-description: Chart Scanner. Scans US and Indian markets for daily setups (20-day closing-high breakouts, bull flags, reclaimed 20-day moving average, oversold, oversold bounces, plus MA crossover, trend following, and RSI momentum) and intraday opening-range breakouts on 5-minute bars. Builds the US Nasdaq Trader universe or Indian NSE/BSE index and custom watchlists, supports Upstox/Yahoo/offline Indian market providers, and writes trader/watchlist.json for trader-news and trader-entry.
+description: Chart Scanner. Scans US and Indian markets at any hour for actionable intraday setups via scan.py intraday (breakout_intraday, vwap_reclaim, ema_alignment, rsi_momentum, orb on 1m/5m/15m/30m/1h bars with entry_zone and anti-chasing), daily setups (20-day breakouts, bull flags, reclaim MA20, oversold, MA/trend/RSI), opening-range breakouts, and Indian benchmark indices (NIFTY, BANKNIFTY, FINNIFTY, SENSEX; analytical only). Supports Upstox/Yahoo/offline providers and writes trader/intraday_scan.json or trader/watchlist.json.
 ---
 
 # trader-scanner (The Chart Scanner)

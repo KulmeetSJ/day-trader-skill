@@ -383,6 +383,174 @@ class IntradayEngineTests(unittest.TestCase):
             with self.assertRaises(budget.SizeError):
                 budget.size_trade(idx_plan, dict(budget.DEFAULTS, budget=100000.0, max_loss=2000.0, market="IN"), market="IN")
 
+    def test_nifty50_chase_block_and_breakout_reconciliation(self):
+        # Exact NIFTY50 chase-block figures: curr=25299.35, zone_high=25278.45, trigger=25266.90, atr14=13.7107
+        ac = entry.compute_anti_chasing(
+            25299.35,
+            {"low": 25263.45, "high": 25278.45, "anchor": 25266.90},
+            trig={"c": 25266.90, "l": 25251.10},
+            atr_val=13.7107,
+            px_source="current_quote",
+            market="IN",
+            eff_tick=0.05,
+            explicit_tick=True,
+            side="buy",
+        )
+        self.assertTrue(ac["chase_blocked"])
+        self.assertEqual(ac["extension_atr"], 1.52)
+        self.assertEqual(ac["extension_atr_from_trigger"], 2.37)
+        self.assertEqual(ac["extension_pct_over_zone"], 0.08)
+
+        # Full breakout_intraday evaluation where current price chases past entry_zone.high
+        base_t = _ist_utc(2026, 11, 12, 9, 15)
+        bars = _build_session_bars(base_t, 12, 300, base_price=25250.0, step_delta=0.5, spread=6.0)
+        for b in bars:
+            b["h"] = 25260.0
+            b["l"] = 25245.0
+            b["c"] = 25252.0
+            b["v"] = 100000
+        # Trigger bar closes cleanly above breakout level with volume confirmation
+        t_trig = bars[-1]["t"] + 300
+        trig_bar = {"t": t_trig, "o": 25255.0, "h": 25269.0, "l": 25251.10, "c": 25266.90, "v": 220000}
+        # Next completed bar stays extended above zone high without breaking invalidation
+        ext_bar = {"t": t_trig + 300, "o": 25270.0, "h": 25305.0, "l": 25268.0, "c": 25299.35, "v": 180000}
+        now = datetime.fromtimestamp(ext_bar["t"] + 310, tz=timezone.utc)
+        ch, _ = _make_v8_chart("NIFTY", bars + [trig_bar, ext_bar], interval="5m", market="IN", prev_close=25240.0)
+        res = entry.evaluate(ch, now, setup="breakout_intraday", interval="5m", market="IN", lookback_bars=12)
+        # NIFTY spot is analytical-only, while analytical chase-block & reference metrics must reconcile
+        self.assertEqual(res["decision_state"], "NO TRADE")
+        self.assertEqual(res["sub_state"], "ANALYTICAL_ONLY_INDEX")
+        self.assertTrue(res["anti_chasing"]["chase_blocked"])
+        self.assertIsNone(res["sizing_preview"])
+        # Same bars on a tradable equity surface sub_state == EXTENDED explicitly
+        ch_eq, _ = _make_v8_chart("RELIANCE", bars + [trig_bar, ext_bar], interval="5m", market="IN", prev_close=25240.0)
+        res_eq = entry.evaluate(ch_eq, now, setup="breakout_intraday", interval="5m", market="IN", lookback_bars=12)
+        self.assertEqual(res_eq["decision_state"], "NO TRADE")
+        self.assertEqual(res_eq["sub_state"], "EXTENDED")
+        # Displayed entry_reference must anchor to trigger close (not chased curr_px)
+        self.assertEqual(res["entry_reference_source"], "trigger_close")
+        self.assertEqual(res["entry_reference"], res["trigger"]["price"])
+        # Displayed extension_atr matches distance above zone high, not trigger close
+        atr14 = res["indicators"]["atr14"]
+        ez_high = res["entry_zone"]["high"]
+        expected_ext_atr = round((res["anti_chasing"]["current_price"] - ez_high) / atr14, 2)
+        self.assertEqual(res["anti_chasing"]["extension_atr"], expected_ext_atr)
+        # Displayed risk_per_unit, targets and R-multiple must algebraically reconcile
+        rpu = res["risk_per_unit"]
+        self.assertEqual(round(res["entry_reference"] - res["stop_preview"], 2), rpu)
+        self.assertEqual(
+            res["reward_risk"],
+            round((res["targets_preview"]["t2_2r"] - res["entry_reference"]) / rpu, 2),
+        )
+
+    def test_nifty50_orb_invalidation_vs_stop_and_reconciliation(self):
+        # Replicate NIFTY50 15m OR: low=25145.0, high=25341.6 -> or_mid=25243.30
+        t0 = _ist_utc(2026, 11, 12, 9, 15)
+        or_bars = [
+            {"t": int(t0.timestamp()), "o": 25200.0, "h": 25260.0, "l": 25145.0, "c": 25220.0, "v": 150000},
+            {"t": int(t0.timestamp()) + 300, "o": 25220.0, "h": 25310.0, "l": 25210.0, "c": 25295.0, "v": 160000},
+            {"t": int(t0.timestamp()) + 600, "o": 25295.0, "h": 25341.6, "l": 25280.0, "c": 25325.0, "v": 170000},
+        ]
+        # Trigger closes at 25348.30 with low=25326.20 -> setup invalidation=25326.20, OR-mid stop=25243.30
+        trig_bar = {"t": int(t0.timestamp()) + 900, "o": 25330.0, "h": 25352.0, "l": 25326.20, "c": 25348.30, "v": 200000}
+
+        # Case A: Inside entry zone (at trigger close 25348.30)
+        now_valid = datetime.fromtimestamp(trig_bar["t"] + 310, tz=timezone.utc)
+        ch_ok, _ = _make_v8_chart("NIFTY", or_bars + [trig_bar], interval="5m", market="IN", prev_close=25190.0)
+        res_ok = entry.evaluate(ch_ok, now_valid, setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(res_ok["invalidation_level"], 25326.20)
+        self.assertEqual(res_ok["stop_preview"], 25243.30)
+        self.assertEqual(res_ok["stop_preview_source"], "or_midpoint")
+        self.assertNotEqual(res_ok["invalidation_level"], res_ok["stop_preview"])
+        self.assertEqual(res_ok["entry_reference"], 25348.30)
+        self.assertEqual(res_ok["risk_per_unit"], 105.0)
+        self.assertEqual(res_ok["targets_preview"]["t1_1r"], 25453.30)
+        self.assertEqual(res_ok["targets_preview"]["t2_2r"], 25558.30)
+        self.assertEqual(res_ok["reward_risk"], 2.0)
+
+        # Case B: Pullback below zone.low (25330.00) but strictly above invalidation (25326.20)
+        pb_bar = {"t": trig_bar["t"] + 300, "o": 25345.0, "h": 25346.0, "l": 25328.0, "c": 25330.0, "v": 140000}
+        ch_pb, _ = _make_v8_chart("NIFTY", or_bars + [trig_bar, pb_bar], interval="5m", market="IN", prev_close=25190.0)
+        res_pb = entry.evaluate(ch_pb, datetime.fromtimestamp(pb_bar["t"] + 310, tz=timezone.utc),
+                                setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(res_pb["sub_state"], "ANALYTICAL_ONLY_INDEX")
+        self.assertFalse(res_pb["anti_chasing"]["chase_blocked"])
+        self.assertEqual(res_pb["entry_reference"], 25330.0)
+        self.assertEqual(res_pb["stop_preview"], 25243.30)
+        self.assertEqual(res_pb["risk_per_unit"], 86.7)
+        self.assertEqual(res_pb["targets_preview"]["t2_2r"], 25503.40)
+        self.assertEqual(res_pb["reward_risk"], 2.0)
+
+        # Same pullback bars on tradable equity surface ENTRY CONFIRMED / ACTIONABLE_IN_ZONE
+        ch_pb_eq, _ = _make_v8_chart("RELIANCE", or_bars + [trig_bar, pb_bar], interval="5m", market="IN", prev_close=25190.0)
+        res_pb_eq = entry.evaluate(ch_pb_eq, datetime.fromtimestamp(pb_bar["t"] + 310, tz=timezone.utc),
+                                   setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(res_pb_eq["decision_state"], "ENTRY CONFIRMED")
+        self.assertEqual(res_pb_eq["sub_state"], "ACTIONABLE_IN_ZONE")
+
+        # Case C: Price drops to 25299.35 <= 25326.20 invalidation -> must NOT emit phantom 2.0R or T2 25411.45
+        inv_bar = {"t": trig_bar["t"] + 300, "o": 25340.0, "h": 25342.0, "l": 25295.0, "c": 25299.35, "v": 180000}
+        ch_inv, _ = _make_v8_chart("NIFTY", or_bars + [trig_bar, inv_bar], interval="5m", market="IN", prev_close=25190.0)
+        res_inv = entry.evaluate(ch_inv, datetime.fromtimestamp(inv_bar["t"] + 310, tz=timezone.utc),
+                                 setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(res_inv["decision_state"], "NO TRADE")
+        self.assertIsNone(res_inv["entry_reference"])
+        self.assertIsNone(res_inv["stop_preview"])
+        self.assertIsNone(res_inv["risk_per_unit"])
+        self.assertIsNone(res_inv["targets_preview"])
+        self.assertIsNone(res_inv["reward_risk"])
+        self.assertIsNone(res_inv["sizing_preview"])
+        ch_inv_eq, _ = _make_v8_chart("RELIANCE", or_bars + [trig_bar, inv_bar], interval="5m", market="IN", prev_close=25190.0)
+        res_inv_eq = entry.evaluate(ch_inv_eq, datetime.fromtimestamp(inv_bar["t"] + 310, tz=timezone.utc),
+                                    setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(res_inv_eq["sub_state"], "INVALIDATED")
+
+    def test_risk_reward_plan_long_short_positions_and_invalid_atr(self):
+        # Long: non-tick entry/stop normalized cleanly, exact R-multiple reconciliation
+        long_plan = entry.compute_risk_reward_plan(100.23, 98.11, side="buy", tick=0.05)
+        self.assertIsNotNone(long_plan)
+        self.assertEqual(long_plan["entry_reference"], 100.25)
+        self.assertEqual(long_plan["stop_price"], 98.10)
+        self.assertEqual(long_plan["risk_per_unit"], 2.15)
+        self.assertEqual(long_plan["t1_1r"], 102.40)
+        self.assertEqual(long_plan["t2_2r"], 104.55)
+        self.assertEqual(long_plan["reward_risk"], 2.0)
+
+        # Long invalid positions: stop >= entry or near-zero risk
+        self.assertIsNone(entry.compute_risk_reward_plan(100.0, 100.0, side="buy", tick=0.05))
+        self.assertIsNone(entry.compute_risk_reward_plan(100.0, 102.0, side="buy", tick=0.05))
+        self.assertIsNone(entry.compute_risk_reward_plan(25000.0, 24995.0, side="buy", tick=0.05))
+
+        # Short: stop ceiled above entry, targets downward
+        short_plan = entry.compute_risk_reward_plan(250.00, 254.02, side="sell", tick=0.05)
+        self.assertIsNotNone(short_plan)
+        self.assertEqual(short_plan["entry_reference"], 250.00)
+        self.assertEqual(short_plan["stop_price"], 254.05)
+        self.assertEqual(short_plan["risk_per_unit"], 4.05)
+        self.assertEqual(short_plan["t1_1r"], 245.95)
+        self.assertEqual(short_plan["t2_2r"], 241.90)
+        self.assertEqual(short_plan["reward_risk"], 2.0)
+        self.assertIsNone(entry.compute_risk_reward_plan(250.0, 249.0, side="sell", tick=0.05))
+
+        # Short anti-chasing: extended below zone.low vs inside zone
+        zone = {"low": 248.0, "high": 250.5, "anchor": 250.0}
+        ac_short_ext = entry.compute_anti_chasing(245.0, zone, trig={"c": 249.5}, atr_val=2.0, side="sell", eff_tick=0.05, explicit_tick=True)
+        self.assertTrue(ac_short_ext["chase_blocked"])
+        self.assertEqual(ac_short_ext["extension_atr"], 1.5)
+        self.assertEqual(ac_short_ext["extension_atr_from_trigger"], 2.25)
+        ac_short_ok = entry.compute_anti_chasing(249.0, zone, trig={"c": 249.5}, atr_val=2.0, side="sell", eff_tick=0.05, explicit_tick=True)
+        self.assertFalse(ac_short_ok["chase_blocked"])
+        self.assertIsNone(ac_short_ok["extension_atr"])
+
+        # Missing / zero / negative / NaN / Inf ATR must fail safely without NaN propagation
+        for bad_atr in (None, 0, 0.0, -5.0, float("nan"), float("inf"), float("-inf"), "bad"):
+            ac_bad = entry.compute_anti_chasing(105.0, {"low": 99.0, "high": 101.0}, trig={"c": 100.0}, atr_val=bad_atr)
+            self.assertTrue(ac_bad["chase_blocked"])
+            self.assertIsNone(ac_bad["extension_atr"])
+            self.assertEqual(ac_bad["extension_pct_over_zone"], 3.96)
+            self.assertIsNone(entry.compute_risk_reward_plan(bad_atr, 95.0, side="buy"))
+            self.assertIsNone(entry.compute_risk_reward_plan(100.0, bad_atr, side="buy"))
+
 
 if __name__ == "__main__":
     unittest.main()

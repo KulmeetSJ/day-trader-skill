@@ -57,13 +57,18 @@ def _trading_days_before(end_date, count, market="IN"):
 def _make_daily_chart(sym, closes_by_date, market="IN", rmt=None, gran="1d"):
     ts_list, o_list, h_list, l_list, c_list, v_list = [], [], [], [], [], []
     hr, mn = (9, 15) if market == "IN" else (9, 30)
-    for d, close in closes_by_date:
+    for item in closes_by_date:
+        if len(item) >= 3:
+            d, close, high = item[0], float(item[1]), float(item[2])
+        else:
+            d, close = item[0], float(item[1])
+            high = close
         ts = _ist_ts(d.year, d.month, d.day, hr, mn) if market == "IN" else _us_ts(d.year, d.month, d.day, hr, mn)
         ts_list.append(ts)
         o_list.append(round(close * 0.995, 2))
-        h_list.append(round(close * 1.005, 2))
+        h_list.append(high)
         l_list.append(round(close * 0.99, 2))
-        c_list.append(float(close))
+        c_list.append(close)
         v_list.append(2500000)
     ysym = ("%s.NS" % sym) if (market == "IN" and not sym.endswith((".NS", ".BO"))) else sym
     meta = {

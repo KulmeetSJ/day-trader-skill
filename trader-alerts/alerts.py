@@ -954,15 +954,23 @@ def cmd_readiness(a):
         for u in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
             try:
                 exch_u = "BSE" if u in ("SENSEX", "BANKEX") else "NSE"
-                exp = calendar_in.get_next_expiry(as_of_date=ref_d, underlying=u, exchange=exch_u)
+                if hasattr(instruments, "resolve_underlying_derivatives_meta"):
+                    meta_u = instruments.resolve_underlying_derivatives_meta(
+                        u, cache_payload=inst_payload, exchange=exch_u, as_of_date=ref_d
+                    )
+                    exp = meta_u["expiry_date"]
+                    lot = meta_u["lot_size"] or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
+                    step = meta_u["strike_interval"]
+                else:
+                    exp = calendar_in.get_next_expiry(as_of_date=ref_d, underlying=u, exchange=exch_u)
+                    lot = instruments.get_fo_lot_size(u, cache_payload=inst_payload, exchange=exch_u) or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
+                    step = instruments.get_strike_interval(u, cache_payload=inst_payload, exchange=exch_u)
                 dte = calendar_in.days_to_expiry(exp, as_of_date=ref_d)
-                lot = instruments.get_fo_lot_size(u, cache_payload=inst_payload) or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
-                step = instruments.get_strike_interval(u)
                 deriv_items.append("%s [%s] (exp %s, %dd, lot %d, step %.0f)" % (u, exch_u, exp.strftime("%Y-%m-%d"), dte, lot, step))
             except Exception as e:
                 deriv_items.append("%s (err: %s)" % (u, e))
         deriv_detail = ", ".join(deriv_items)
-        deriv_note = "Authoritative expiry calendars (NSE Tuesday / BSE Friday), strike steps and contract lot sizes verified."
+        deriv_note = "Authoritative expiry schedules (BOD instrument master + NSE/BSE calendars), strike steps and contract lot sizes verified."
     else:
         deriv_detail = "US Equity / Options"
         deriv_note = "Standard US equity trading."

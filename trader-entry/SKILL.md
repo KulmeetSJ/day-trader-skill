@@ -1,21 +1,16 @@
 ---
 name: trader-entry
 description: >-
-  Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
-  Reads free Yahoo 1-minute or 5-minute bars (or India provider/offline data),
-  builds the opening range (the first 15 minutes by default) and calls the
-  entry on the first completed bar that CLOSES above the range high, above a
-  given price level, above a prior 20-day daily breakout high, or matching
-  ma_crossover, trend, rsi_momentum, or simulated options_orb rules, with an
-  optional volume check. Supports US and Indian (NSE/BSE, IST, authoritative
-  tick-size normalization) markets, says waiting and how far, triggered with
-  time and price, expired, no-data, or not open yet, and writes
-  trader/entry.json for /trader-exit. Long side only. It never places an
-  order. Use when the user says "tell me when to get in", "watch TSLA", "has
-  it broken out", "did it break the opening range", "entry signal", "time my
-  entry", "check my watchlist", or after /trader-scanner and /trader-news,
-  before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level|breakout_20d|ma_crossover|trend|rsi_momentum|options_orb] [--interval 5m|1m]"
+  Intraday Entry Engine. Evaluates actionable setups at any session hour
+  (09:45, 11:30, 14:00) on 1m/5m/15m/30m/1h bars across US and Indian
+  (NSE/BSE, IST, tick-size normalized) markets. Supports breakout_intraday,
+  vwap_reclaim, ema_alignment, orb, level, breakout_20d, ma_crossover, trend,
+  rsi_momentum, and simulated options_orb without requiring opening-range
+  bars for non-ORB setups. Distinguishes ENTRY CONFIRMED, ENTRY CANDIDATE,
+  SETUP, and NO TRADE (EXTENDED anti-chasing, INVALIDATED, STALE_DATA),
+  reports entry_zone, invalidation_level, stop/target previews, and writes
+  trader/entry.json for /trader-exit. Long side only; never places an order.
+argument-hint: "[TICKER] [--setup breakout_intraday|vwap_reclaim|ema_alignment|orb|level|breakout_20d|rsi_momentum|options_orb] [--interval 1m|5m|15m|30m|1h]"
 ---
 
 # trader-entry

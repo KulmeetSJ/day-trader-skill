@@ -602,7 +602,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
                 daily_bars.append({
                     "t": _ist_epoch(d.isoformat(), 15, 30),
                     "o": close_v - 1.0,
-                    "h": close_v + 0.5,
+                    "h": close_v,
                     "l": close_v - 1.5,
                     "c": close_v,
                     "v": 100000,
@@ -846,7 +846,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
                 close_v = 1320.00 + added * 0.25 if added < 34 else 1335.43
                 daily_bars.append({
                     "t": _ist_epoch(d.isoformat(), 15, 30),
-                    "o": close_v - 1.0, "h": close_v + 0.5, "l": close_v - 1.5,
+                    "o": close_v - 1.0, "h": close_v, "l": close_v - 1.5,
                     "c": close_v, "v": 100000,
                 })
                 added += 1

@@ -21,11 +21,18 @@ exit_mod = load("trader-exit", "exit")
 budget_mod = load("trader-budget", "size")
 risk_mod = load("trader-risk", "check")
 ticket_mod = load("trader-broker", "ticket")
+instruments_mod = load("trader-alerts", "instruments")
 
 
 class TestBharatOptionsE2E(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self._inst_orig = []
+        missing_p = os.path.join(self.temp_dir, "missing_instruments.json")
+        for m in {instruments_mod, getattr(exit_mod, "instruments", None), getattr(budget_mod, "instruments", None)}:
+            if m is not None and hasattr(m, "DEFAULT_CACHE_PATH"):
+                self._inst_orig.append((m, m.DEFAULT_CACHE_PATH))
+                m.DEFAULT_CACHE_PATH = missing_p
         self.entry_path = os.path.join(self.temp_dir, "entry.json")
         self.plan_path = os.path.join(self.temp_dir, "plan.json")
         self.orders_path = os.path.join(self.temp_dir, "orders.json")
@@ -58,6 +65,8 @@ class TestBharatOptionsE2E(unittest.TestCase):
             json.dump(self.cfg, fh, indent=2)
 
     def tearDown(self):
+        for m, orig_p in self._inst_orig:
+            m.DEFAULT_CACHE_PATH = orig_p
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_full_options_lifecycle(self):

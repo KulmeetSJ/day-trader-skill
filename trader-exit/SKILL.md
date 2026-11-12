@@ -1,21 +1,15 @@
 ---
 name: trader-exit
 description: >-
-  Exit Planner. Sets your stop and your target before you enter, so you know
-  when to get out. Reads the entry from trader-entry (or a price you give),
-  puts the stop at the opening-range midpoint by default (or the range low,
-  breakout-invalidation, your price, a percent, or a multiple of ATR),
-  rounds to the exchange tick size (0.01 USD in US; authoritative NSE/BSE
-  tick size in INR including sub-paisa precision), and sets the target at 2R
-  (or 1R, 1.5R, or your price). Supports intraday flat-by cutoffs and Indian
-  positional delivery holds. Refuses a stop at or above the entry, a target
-  at or below it, or a stop too tight to survive the spread, and says why.
-  Writes trader/plan.json for the Time Machine, the Budget Manager and Price
-  Alerts. Long side only. Use when the user says "where's my stop", "set my
-  stop and target", "plan the exit", "when do I get out", "stop loss",
-  "what's my R", "risk reward", or right after /trader-entry triggers, before
-  /trader-timemachine.
-argument-hint: "[--stop or-mid|or-low|breakout-invalidation|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
+  Exit & Position Manager. Plans pre-entry stops/targets (or-mid, or-low,
+  breakout-invalidation, price, pct, ATR; US 0.01 USD and IN authoritative
+  INR tick sizes; 2R/1R/target) and evaluates open positions at any session
+  hour via exit.py manage/check. Outputs HOLD, UPDATE TRAILING STOP, PARTIAL
+  EXIT, EXIT (stop/VWAP/trend/flat-by/expiry), or fail-closed NO_ACTION on
+  stale/missing data. Respects intraday flat-by cutoffs without forcing
+  evening square-off on positional delivery holds. Writes trader/plan.json for
+  /trader-timemachine, /trader-budget, and /trader-alerts. Long side only.
+argument-hint: "[plan|manage] [--stop ...] [--target 2R|1R|price:X] [--interval 1m|5m|15m|30m|1h]"
 ---
 
 # trader-exit

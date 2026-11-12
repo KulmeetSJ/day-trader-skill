@@ -556,14 +556,269 @@ def parse_bse_equity_csv(csv_path_or_text):
     return records
 
 
-def get_strike_interval(underlying, spot_price=None):
+def _normalize_expiry_date(val):
+    """Normalize an expiry field (ISO string, date, or epoch s/ms) to IST YYYY-MM-DD."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, datetime.datetime):
+        return val.date().isoformat()
+    if isinstance(val, datetime.date):
+        return val.isoformat()
+    if isinstance(val, (int, float)):
+        num = float(val)
+        if not math.isfinite(num) or num <= 0:
+            return None
+        if num > 1e11:
+            num = num / 1000.0
+        dt_utc = datetime.datetime.fromtimestamp(num, tz=datetime.timezone.utc)
+        dt_ist = dt_utc.astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+        return dt_ist.date().isoformat()
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return _normalize_expiry_date(float(s))
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    for fmt in ("%d-%m-%Y", "%d-%b-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _lookup_cached_record(sym, cache_payload=None, exchange=None):
+    """Locate canonical equity/index/derivatives metadata record from cache_payload or disk."""
+    payload = cache_payload
+    if payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
+        try:
+            payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict):
+        return None, None
+    req_exch = str(exchange).strip().upper() if exchange else None
+    dmeta = payload.get("derivatives_meta") or {}
+    by_exch = payload.get("instruments_by_exchange") or {}
+    insts = payload.get("instruments") or {}
+
+    if req_exch and req_exch in by_exch and sym in by_exch[req_exch]:
+        return by_exch[req_exch][sym], payload
+    if req_exch and isinstance(dmeta.get("%s:%s" % (req_exch, sym)), dict):
+        return dmeta["%s:%s" % (req_exch, sym)], payload
+    if sym in dmeta and (not req_exch or str(dmeta[sym].get("exchange") or "").upper() == req_exch):
+        return dmeta[sym], payload
+    if sym in insts:
+        rec = insts[sym]
+        if not req_exch or not rec.get("exchange") or str(rec.get("exchange")).upper() == req_exch:
+            return rec, payload
+    if not req_exch:
+        for ex_b in by_exch.values():
+            if isinstance(ex_b, dict) and sym in ex_b:
+                return ex_b[sym], payload
+    return None, payload
+
+
+def _aggregate_derivatives_metadata_from_records(records, as_of_date=None):
+    """Aggregate authoritative F&O expiry schedule, front lot_size, and strike interval per underlying."""
+    ref_d = None
+    if as_of_date is not None:
+        try:
+            ref_d = calendar_in._resolve_date(as_of_date).isoformat()
+        except Exception:
+            ref_d = None
+    if ref_d is None:
+        ref_d = datetime.date.today().isoformat()
+
+    grouped = {}
+    for rec in (records or []):
+        if not isinstance(rec, dict):
+            continue
+        seg = str(rec.get("segment") or "").upper()
+        itype = str(rec.get("instrument_type") or "").upper()
+        tsym = str(rec.get("canonical_symbol") or rec.get("trading_symbol") or rec.get("symbol") or "").strip().upper()
+        is_deriv = (
+            seg.endswith("_FO")
+            or seg in ("NSE_FO", "BSE_FO", "NFO", "BFO")
+            or itype in ("FUT", "CE", "PE", "OPTIDX", "OPTSTK", "FUTIDX", "FUTSTK")
+            or is_derivative_symbol(tsym)
+        )
+        if not is_deriv:
+            continue
+        ex = str(rec.get("exchange") or ("BSE" if seg.startswith("BSE") else "NSE")).upper()
+        raw_u = str(rec.get("underlying_symbol") or "").strip().upper()
+        if not raw_u and tsym:
+            parsed = parse_derivative_symbol(tsym)
+            raw_u = str((parsed or {}).get("underlying") or "").strip().upper()
+        if not raw_u:
+            continue
+        try:
+            canon_u = normalize_symbol(raw_u)
+        except Exception:
+            canon_u = raw_u
+        exp_str = _normalize_expiry_date(rec.get("expiry"))
+        if not exp_str:
+            continue
+
+        raw_lot = rec.get("lot_size") or rec.get("fo_lot_size")
+        lot_v = None
+        if raw_lot is not None and not isinstance(raw_lot, bool):
+            try:
+                lv = int(float(raw_lot))
+                if lv > 0:
+                    lot_v = lv
+            except (TypeError, ValueError):
+                pass
+        strike_v = None
+        if itype in ("CE", "PE", "OPTIDX", "OPTSTK") or ("CE" in itype or "PE" in itype):
+            raw_k = rec.get("strike_price")
+            if raw_k is None:
+                raw_k = rec.get("strike")
+            if raw_k is not None and not isinstance(raw_k, bool):
+                try:
+                    kv = float(raw_k)
+                    if math.isfinite(kv) and kv > 0:
+                        strike_v = kv
+                except (TypeError, ValueError):
+                    pass
+
+        bucket = grouped.setdefault((ex, canon_u), {
+            "underlying": canon_u,
+            "exchange": ex,
+            "lots_by_exp": {},
+            "opt_strikes_by_exp": {},
+            "opt_exps": set(),
+            "fut_exps": set(),
+        })
+        if itype in ("CE", "PE", "OPTIDX", "OPTSTK"):
+            bucket["opt_exps"].add(exp_str)
+        elif itype in ("FUT", "FUTIDX", "FUTSTK"):
+            bucket["fut_exps"].add(exp_str)
+        if lot_v is not None:
+            bucket["lots_by_exp"].setdefault(exp_str, []).append(lot_v)
+        if strike_v is not None:
+            bucket["opt_strikes_by_exp"].setdefault(exp_str, set()).add(strike_v)
+
+    by_ex_key = {}
+    by_canon = {}
+    for (ex, canon_u), b in grouped.items():
+        all_exps = sorted(b["opt_exps"] | b["fut_exps"] | set(b["lots_by_exp"].keys()))
+        active_exps = [e for e in all_exps if e >= ref_d] or all_exps
+        if not active_exps:
+            continue
+        next_exp = active_exps[0]
+        opt_or_all = sorted(e for e in b["opt_exps"] if e >= ref_d) or active_exps
+        first_month = opt_or_all[0][:7]
+        in_first_month = [e for e in opt_or_all if e[:7] == first_month]
+        schedule = "weekly" if len(in_first_month) > 1 else "monthly"
+
+        lot_by_exp = {}
+        for e in active_exps:
+            vals = b["lots_by_exp"].get(e) or []
+            if vals:
+                # Pick minimum/modal lot size in active front contracts
+                lot_by_exp[e] = min(vals)
+        front_lot = lot_by_exp.get(next_exp)
+        if front_lot is None and lot_by_exp:
+            front_lot = next(iter(lot_by_exp.values()))
+
+        # Derive smallest positive strike increment from option strikes
+        strike_step = None
+        for exp_cand in [next_exp] + active_exps:
+            ks = sorted(b["opt_strikes_by_exp"].get(exp_cand) or ())
+            if len(ks) >= 2:
+                diffs = [round(ks[i + 1] - ks[i], 4) for i in range(len(ks) - 1) if round(ks[i + 1] - ks[i], 4) > 0]
+                if diffs:
+                    strike_step = min(diffs)
+                    break
+
+        summary = {
+            "canonical_symbol": canon_u,
+            "exchange": ex,
+            "is_fo_eligible": True,
+            "next_expiry": next_exp,
+            "expiries": active_exps,
+            "expiry_schedule": schedule,
+            "fo_lot_size": front_lot,
+            "lot_size_by_expiry": lot_by_exp,
+            "strike_interval": strike_step,
+            "metadata_source": "bod_master",
+        }
+        by_ex_key[(ex, canon_u)] = summary
+        prev = by_canon.get(canon_u)
+        if prev is None or (ex == "NSE" and prev.get("exchange") != "NSE"):
+            by_canon[canon_u] = summary
+    return by_ex_key, by_canon
+
+
+def _apply_derivatives_summary_to_master(instruments, instruments_by_exchange, by_ex_key, ts=None, eff=None):
+    """Merge aggregated BOD derivatives metadata onto master maps and build compact derivatives_meta."""
+    dmeta = {}
+    for (ex, canon_u), summ in (by_ex_key or {}).items():
+        dmeta["%s:%s" % (ex, canon_u)] = dict(summ)
+        if canon_u not in dmeta or (ex == "NSE" and dmeta[canon_u].get("exchange") != "NSE"):
+            dmeta[canon_u] = dict(summ)
+
+        def _merge_rec(rec):
+            out = dict(rec)
+            if summ.get("fo_lot_size"):
+                out["fo_lot_size"] = int(summ["fo_lot_size"])
+                out["is_fo_eligible"] = True
+            if summ.get("next_expiry"):
+                out["next_expiry"] = summ["next_expiry"]
+            if summ.get("expiries"):
+                out["expiries"] = list(summ["expiries"])
+            if summ.get("expiry_schedule"):
+                out["expiry_schedule"] = summ["expiry_schedule"]
+            if summ.get("lot_size_by_expiry"):
+                out["lot_size_by_expiry"] = dict(summ["lot_size_by_expiry"])
+            if summ.get("strike_interval"):
+                out["strike_interval"] = float(summ["strike_interval"])
+            if summ.get("metadata_source"):
+                out["derivatives_source"] = summ["metadata_source"]
+            return out
+
+        ex_bucket = instruments_by_exchange.setdefault(ex, {})
+        if canon_u in ex_bucket:
+            ex_bucket[canon_u] = _merge_rec(ex_bucket[canon_u])
+        elif canon_u in INDEX_INSTRUMENTS and str(INDEX_INSTRUMENTS[canon_u].get("exchange") or "NSE").upper() == ex:
+            seed = dict(INDEX_INSTRUMENTS[canon_u])
+            if ts:
+                seed["source_timestamp"] = ts
+            if eff:
+                seed["effective_date"] = eff
+            ex_bucket[canon_u] = _merge_rec(seed)
+
+        if canon_u in instruments:
+            cur_ex = str(instruments[canon_u].get("exchange") or ex).upper()
+            if cur_ex == ex:
+                instruments[canon_u] = _merge_rec(instruments[canon_u])
+        elif canon_u in INDEX_INSTRUMENTS and str(INDEX_INSTRUMENTS[canon_u].get("exchange") or "NSE").upper() == ex:
+            seed = dict(INDEX_INSTRUMENTS[canon_u])
+            if ts:
+                seed["source_timestamp"] = ts
+            if eff:
+                seed["effective_date"] = eff
+            instruments[canon_u] = _merge_rec(seed)
+    return dmeta
+
+
+def get_strike_interval(underlying, spot_price=None, cache_payload=None, exchange=None):
     """Authoritatively determine the strike price step interval for an instrument.
 
-    For indices, standard regulatory strike steps apply (e.g. NIFTY=50, BANKNIFTY=100).
-    For equities, if not explicitly configured in instrument metadata, intervals follow
-    standard exchange price brackets.
+    Prefers cached/BOD contract metadata when available; falls back to regulatory
+    index defaults or spot price brackets for equities.
     """
     sym = normalize_symbol(underlying)
+    cached, _ = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exchange)
+    if isinstance(cached, dict) and cached.get("strike_interval"):
+        try:
+            val = float(cached["strike_interval"])
+            if math.isfinite(val) and val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
     if sym in INDEX_INSTRUMENTS:
         return INDEX_INSTRUMENTS[sym].get("strike_interval", 50.0)
 
@@ -590,29 +845,108 @@ def get_strike_interval(underlying, spot_price=None):
     return 20.0  # Safe default for mid/large-cap equities
 
 
-def get_fo_lot_size(symbol, cache_payload=None):
-    """Authoritatively resolve the derivative contract lot size for a security, derivative, or index."""
+def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None):
+    """Authoritatively resolve derivative contract lot size, checking BOD/cache first."""
+    raw = str(symbol or "").strip().upper()
+    exp_norm = _normalize_expiry_date(expiry) if expiry else None
     sym = normalize_symbol(symbol)
-    if is_derivative_symbol(sym):
-        parsed = parse_derivative_symbol(sym)
-        if parsed and parsed.get("underlying"):
-            sym = normalize_symbol(parsed["underlying"])
+    deriv_canon = None
+    if is_derivative_symbol(raw):
+        parsed = parse_derivative_symbol(raw)
+        if parsed:
+            deriv_canon = parsed.get("canonical_symbol")
+            if parsed.get("underlying"):
+                sym = normalize_symbol(parsed["underlying"])
+            if not exp_norm and parsed.get("expiry_date"):
+                exp_norm = parsed["expiry_date"]
+
+    # Check exact derivative contract record first when cached
+    if deriv_canon:
+        exact_rec, loaded = _lookup_cached_record(deriv_canon, cache_payload=cache_payload, exchange=exchange)
+        if isinstance(exact_rec, dict) and (exact_rec.get("lot_size") or exact_rec.get("fo_lot_size")):
+            lv = exact_rec.get("lot_size") or exact_rec.get("fo_lot_size")
+            if int(lv) > 0:
+                return int(lv)
+        if cache_payload is None and loaded is not None:
+            cache_payload = loaded
+
+    inst, _ = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exchange)
+    if isinstance(inst, dict):
+        by_exp = inst.get("lot_size_by_expiry")
+        if exp_norm and isinstance(by_exp, dict) and by_exp.get(exp_norm):
+            return int(by_exp[exp_norm])
+        if inst.get("fo_lot_size"):
+            return int(inst["fo_lot_size"])
+
     if sym in INDEX_INSTRUMENTS:
         return INDEX_INSTRUMENTS[sym]["fo_lot_size"]
 
-    payload = cache_payload
-    if payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
-        try:
-            payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
-        except Exception:
-            payload = None
-
-    if payload and "instruments" in payload:
-        inst = payload["instruments"].get(sym)
-        if inst and inst.get("fo_lot_size"):
-            return int(inst["fo_lot_size"])
-
     return None
+
+
+def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange=None, as_of_date=None):
+    """Resolve expiry, schedule, lot_size, and strike_interval together from BOD/cache first."""
+    sym = normalize_symbol(underlying)
+    exch = str(
+        exchange
+        or (INDEX_INSTRUMENTS.get(sym, {}).get("exchange"))
+        or ("BSE" if sym in ("SENSEX", "BANKEX") else "NSE")
+    ).strip().upper()
+    ref_d = calendar_in._resolve_date(as_of_date)
+    ref_iso = ref_d.isoformat()
+
+    cached, loaded = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exch)
+    if cache_payload is None and loaded is not None:
+        cache_payload = loaded
+
+    expiries = []
+    if isinstance(cached, dict) and isinstance(cached.get("expiries"), list):
+        expiries = sorted(
+            e for e in (_normalize_expiry_date(x) for x in cached["expiries"])
+            if e and e >= ref_iso
+        )
+    if not expiries and isinstance(cached, dict) and cached.get("next_expiry"):
+        ne = _normalize_expiry_date(cached.get("next_expiry"))
+        if ne and ne >= ref_iso:
+            expiries = [ne]
+
+    if expiries:
+        next_exp_str = expiries[0]
+        exp_dt = datetime.date.fromisoformat(next_exp_str)
+        schedule = cached.get("expiry_schedule") or (
+            "weekly" if sum(1 for e in expiries if e[:7] == next_exp_str[:7]) > 1 else "monthly"
+        )
+        source = cached.get("derivatives_source") or cached.get("metadata_source") or "instrument_cache"
+    else:
+        exp_dt = calendar_in.get_next_expiry(as_of_date=ref_d, expiry_type=None, underlying=sym, exchange=exch)
+        next_exp_str = exp_dt.isoformat()
+        expiries = [next_exp_str]
+        schedule = (
+            cached.get("expiry_schedule")
+            if (isinstance(cached, dict) and cached.get("expiry_schedule"))
+            else ("weekly" if calendar_in.has_weekly_expiry(sym, exchange=exch) else "monthly")
+        )
+        source = "calendar_fallback"
+
+    lot_size = get_fo_lot_size(sym, cache_payload=cache_payload, expiry=next_exp_str, exchange=exch)
+    strike_step = get_strike_interval(sym, cache_payload=cache_payload, exchange=exch)
+    lot_by_exp = (
+        dict(cached.get("lot_size_by_expiry"))
+        if (isinstance(cached, dict) and isinstance(cached.get("lot_size_by_expiry"), dict))
+        else {}
+    )
+    return {
+        "underlying": sym,
+        "exchange": exch,
+        "expiry": next_exp_str,
+        "expiry_date": exp_dt,
+        "expiries": expiries,
+        "expiry_schedule": schedule,
+        "lot_size": lot_size,
+        "lot_size_by_expiry": lot_by_exp,
+        "strike_interval": strike_step,
+        "source": source,
+    }
 
 
 def parse_fo_lots_csv(csv_path_or_text):
@@ -843,7 +1177,7 @@ def build_master_from_provider_records(records, fo_lots=None, effective_date=Non
         if is_index and idx_meta.get("strike_interval") is not None:
             entry["strike_interval"] = idx_meta["strike_interval"]
         if raw_rec.get("expiry") is not None:
-            entry["expiry"] = raw_rec.get("expiry")
+            entry["expiry"] = _normalize_expiry_date(raw_rec.get("expiry")) or raw_rec.get("expiry")
         if raw_rec.get("strike_price") is not None:
             entry["strike_price"] = raw_rec.get("strike_price")
 
@@ -857,6 +1191,9 @@ def build_master_from_provider_records(records, fo_lots=None, effective_date=Non
         if canon not in flat or (ex == "NSE" and flat[canon].get("exchange") != "NSE"):
             flat[canon] = entry
 
+    by_ex_key, _ = _aggregate_derivatives_metadata_from_records(records, as_of_date=eff)
+    dmeta = _apply_derivatives_summary_to_master(flat, by_exch, by_ex_key, ts=ts, eff=eff)
+
     return {
         "metadata_version": "1.0",
         "effective_date": eff,
@@ -866,6 +1203,7 @@ def build_master_from_provider_records(records, fo_lots=None, effective_date=Non
         "count": len(flat),
         "instruments": flat,
         "instruments_by_exchange": by_exch,
+        "derivatives_meta": dmeta,
     }
 
 
@@ -1003,17 +1341,15 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None, exc
             out = _normalize_cache_record_tick(
                 exact, cache_payload=cache_payload, allow_none=False, sym_hint=parsed["canonical_symbol"]
             )
+            norm_exp = _normalize_expiry_date(out.get("expiry"))
+            if norm_exp:
+                out["expiry"] = norm_exp
+            out.setdefault("underlying", underlying)
+            out.setdefault("strike_interval", get_strike_interval(underlying, cache_payload=cache_payload, exchange=inferred_exch))
             out.setdefault("expiry_source", "contract_master")
             return out
 
-    # Resolve underlying metadata
-    lot_size = get_fo_lot_size(underlying, cache_payload=cache_payload)
-    if not lot_size:
-        raise LotSizeResolutionError("Cannot resolve F&O lot size for underlying: %r" % underlying)
-
-    strike_interval = get_strike_interval(underlying)
-
-    # Resolve expiry date
+    # Resolve expiry date first so expiry-specific BOD lot_size & strike_interval match together
     year = parsed["expiry_yy"]
     month = parsed["expiry_month"]
     day = parsed["expiry_day"]
@@ -1021,10 +1357,15 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None, exc
         expiry_date = "%04d-%02d-%02d" % (year, month, day)
         expiry_source = "symbol_explicit"
     else:
-        # Monthly contract: resolve last trading day based on underlying convention
         exp_dt = calendar_in.get_monthly_expiry(year, month, exchange=inferred_exch, underlying=underlying)
         expiry_date = exp_dt.strftime("%Y-%m-%d")
         expiry_source = "exchange_fallback_rule"
+
+    lot_size = get_fo_lot_size(underlying, cache_payload=cache_payload, expiry=expiry_date, exchange=inferred_exch)
+    if not lot_size:
+        raise LotSizeResolutionError("Cannot resolve F&O lot size for underlying: %r" % underlying)
+
+    strike_interval = get_strike_interval(underlying, cache_payload=cache_payload, exchange=inferred_exch)
 
     return {
         "canonical_symbol": parsed["canonical_symbol"],
@@ -1248,6 +1589,57 @@ def sync_masters(dest_path=DEFAULT_CACHE_PATH, offline_dir=None, exchange="NSE")
         by_exch["BSE"] = bse_records
 
     payload = build_instrument_master(equity_records, fo_lots=fo_lots, by_exchange_records=by_exch or None)
+
+    # 4. Enrich with authoritative Upstox BOD derivatives metadata (NSE/BSE JSON.gz) when available
+    bod_records = []
+    import gzip as _gzip
+    import io as _io
+    bod_exchanges = ["NSE", "BSE"] if str(exchange or "NSE").upper() in ("NSE", "BSE", "ALL") else [str(exchange).upper()]
+    for bx in bod_exchanges:
+        raw_bytes = None
+        if offline_dir and os.path.isdir(offline_dir):
+            for fname in ("%s.json.gz" % bx, "%s.json" % bx):
+                fp = os.path.join(offline_dir, fname)
+                if os.path.isfile(fp):
+                    try:
+                        with open(fp, "rb") as fh:
+                            raw_bytes = fh.read()
+                        break
+                    except Exception:
+                        pass
+        elif not offline_dir:
+            url = "https://assets.upstox.com/market-quote/instruments/exchange/%s.json.gz" % bx
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw_bytes = resp.read()
+            except Exception:
+                raw_bytes = None
+        if raw_bytes:
+            try:
+                if raw_bytes[:2] == b"\x1f\x8b":
+                    raw_text = _gzip.GzipFile(fileobj=_io.BytesIO(raw_bytes)).read().decode("utf-8", errors="replace")
+                else:
+                    raw_text = raw_bytes.decode("utf-8", errors="replace")
+                parsed_rows = json.loads(raw_text)
+                if isinstance(parsed_rows, list):
+                    for r in parsed_rows:
+                        if isinstance(r, dict) and (
+                            str(r.get("segment") or "").upper().endswith("_FO")
+                            or str(r.get("instrument_type") or "").upper() in ("FUT", "CE", "PE")
+                        ):
+                            bod_records.append(r)
+            except Exception:
+                pass
+    if bod_records:
+        by_ex_key, _ = _aggregate_derivatives_metadata_from_records(bod_records, as_of_date=payload.get("effective_date"))
+        dmeta = _apply_derivatives_summary_to_master(
+            payload["instruments"], payload["instruments_by_exchange"], by_ex_key,
+            ts=payload.get("generated_at"), eff=payload.get("effective_date"),
+        )
+        payload["derivatives_meta"] = dmeta
+        payload["provider"] = "upstox_bod"
+
     save_instrument_cache(payload, cache_path=dest_path)
     return payload
 

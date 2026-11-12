@@ -16,16 +16,16 @@ for _sub in ("trader-alerts", "trader-scanner", "trader-entry", "trader-exit", "
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import symbols_in
-import instruments
-import data_in
-import visuals
-import scan
-import entry
-import exit as exit_mod
-import size as size_mod
-import check as risk_check
-import ticket
+import symbols_in  # type: ignore  # noqa: E402
+import instruments  # type: ignore  # noqa: E402
+import data_in  # type: ignore  # noqa: E402
+import visuals  # type: ignore  # noqa: E402
+import scan  # type: ignore  # noqa: E402
+import entry  # type: ignore  # noqa: E402
+import exit as exit_mod  # type: ignore  # noqa: E402
+import size as size_mod  # type: ignore  # noqa: E402
+import check as risk_check  # type: ignore  # noqa: E402
+import ticket  # type: ignore  # noqa: E402
 
 
 def _make_bars_doc(symbol="NIFTY", count=60, start_price=24000.0, step=15.0, volume=0,

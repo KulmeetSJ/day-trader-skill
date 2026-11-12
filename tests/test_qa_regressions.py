@@ -391,8 +391,14 @@ class TestQARegressions(unittest.TestCase):
     # Bug 11: F&O derivative contract lot_size resolution via instruments -----
 
     def test_fo_lot_size_resolves_derivative_contracts_and_size_trade_cache(self):
-        self.assertEqual(inst_mod.get_fo_lot_size("NIFTY26NOV24000CE"), 25)
-        self.assertIsNone(inst_mod.get_fo_lot_size("UNKNOWNCO26OCT100CE"))
+        missing_cache = os.path.join(self.tmp, "missing_cache.json")
+        orig_cache = inst_mod.DEFAULT_CACHE_PATH
+        inst_mod.DEFAULT_CACHE_PATH = missing_cache
+        try:
+            self.assertEqual(inst_mod.get_fo_lot_size("NIFTY26NOV24000CE"), 25)
+            self.assertIsNone(inst_mod.get_fo_lot_size("UNKNOWNCO26OCT100CE"))
+        finally:
+            inst_mod.DEFAULT_CACHE_PATH = orig_cache
 
         inst_path = os.path.join(self.tmp, "inst_master.json")
         with open(inst_path, "w", encoding="utf-8") as fh:

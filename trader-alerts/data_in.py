@@ -2122,11 +2122,15 @@ class SimulatedMarketDataProvider(MarketDataProvider):
             except Exception:
                 spot = 24000.0 if canonical in ("NIFTY", "^NSEI") else 2800.0
 
-        exp_dt = calendar_in.get_next_expiry(expiry or datetime.date.today(), underlying=canonical, exchange=exchange)
+        if expiry:
+            exp_dt = calendar_in.get_next_expiry(expiry, underlying=canonical, exchange=exchange)
+            step = instruments.get_strike_interval(canonical, spot_price=spot, exchange=exchange)
+        else:
+            meta_d = instruments.resolve_underlying_derivatives_meta(canonical, exchange=exchange)
+            exp_dt = meta_d["expiry_date"]
+            step = meta_d["strike_interval"] or instruments.get_strike_interval(canonical, spot_price=spot, exchange=exchange)
         days = max(1, calendar_in.days_to_expiry(exp_dt))
         t_years = days / 365.0
-
-        step = instruments.get_strike_interval(canonical, spot_price=spot)
         base_atm = round(spot / step) * step
 
         strikes_data = {}
@@ -3698,8 +3702,8 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         ref_dt = cutoff_dt if cutoff_dt is not None else now_dt
         exp_str = str(expiry)[:10] if expiry else None
         if not exp_str:
-            exp_dt = calendar_in.get_next_expiry(as_of_date=ref_dt, underlying=canon)
-            exp_str = exp_dt.isoformat() if isinstance(exp_dt, datetime.date) else str(exp_dt)[:10]
+            meta_d = instruments.resolve_underlying_derivatives_meta(canon, exchange=exch, as_of_date=ref_dt)
+            exp_str = meta_d["expiry"]
 
         resp = self._request_json(
             "/v2/option/chain",

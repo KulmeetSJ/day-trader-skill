@@ -801,15 +801,38 @@ def get_weekly_expiries(year, month, weekday=None, exchange="NSE", underlying=No
     return expiries
 
 
-def get_next_expiry(as_of_date=None, expiry_type="weekly", underlying="NIFTY", exchange="NSE"):
+WEEKLY_EXPIRY_UNDERLYINGS = {
+    "NSE": frozenset({"NIFTY"}),
+    "BSE": frozenset({"SENSEX"}),
+}
+
+
+def has_weekly_expiry(underlying="NIFTY", exchange="NSE"):
+    """Return True only for exchange benchmark indices with active weekly F&O contracts."""
+    u = str(underlying or "").strip().upper()
+    if u in ("^NSEI", "NIFTY50", "NIFTY 50"):
+        u = "NIFTY"
+    elif u in ("^NSEBANK", "NIFTY BANK", "NIFTYBANK"):
+        u = "BANKNIFTY"
+    elif u in ("^BSESN", "BSE SENSEX"):
+        u = "SENSEX"
+    exch = str(exchange or ("BSE" if u in ("SENSEX", "BANKEX") else "NSE")).strip().upper()
+    return u in WEEKLY_EXPIRY_UNDERLYINGS.get(exch, frozenset())
+
+
+def get_next_expiry(as_of_date=None, expiry_type=None, underlying="NIFTY", exchange="NSE"):
     """Find the earliest active expiry date on or after as_of_date.
 
-    - expiry_type: 'weekly' or 'monthly'
-    - underlying: used to determine exchange convention (e.g. SENSEX -> Friday, NIFTY -> Tuesday)
+    - expiry_type: 'weekly', 'monthly', or None (auto: weekly ONLY for NIFTY/SENSEX;
+      monthly for BANKNIFTY, FINNIFTY, MIDCPNIFTY, BANKEX, and equity derivatives)
+    - underlying: used to determine exchange & weekly vs monthly convention
     - exchange: 'NSE' or 'BSE'
     """
     as_of = _resolve_date(as_of_date)
     underlying_clean = str(underlying or "").strip().upper()
+    eff_type = str(expiry_type).lower() if expiry_type else (
+        "weekly" if has_weekly_expiry(underlying_clean, exchange=exchange) else "monthly"
+    )
     weekday = get_fallback_expiry_weekday(exchange=exchange, underlying=underlying_clean)
 
     # Check the current month and subsequent months
@@ -817,7 +840,7 @@ def get_next_expiry(as_of_date=None, expiry_type="weekly", underlying="NIFTY", e
     curr_month = as_of.month
 
     for _ in range(3):
-        if expiry_type.lower() == "monthly":
+        if eff_type == "monthly":
             exp = get_monthly_expiry(curr_year, curr_month, weekday=weekday, exchange=exchange, underlying=underlying_clean)
             if exp >= as_of:
                 return exp
@@ -865,6 +888,6 @@ def days_to_expiry(expiry_date, as_of_date=None, trading_days_only=False, exchan
 def is_expiry_day(check_date=None, underlying="NIFTY", exchange="NSE"):
     """Return True if check_date is a contract expiry day for the given instrument."""
     dt = _resolve_date(check_date)
-    next_exp = get_next_expiry(as_of_date=dt, expiry_type="weekly", underlying=underlying, exchange=exchange)
+    next_exp = get_next_expiry(as_of_date=dt, expiry_type=None, underlying=underlying, exchange=exchange)
     return next_exp == dt
 

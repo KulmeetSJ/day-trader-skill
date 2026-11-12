@@ -57,7 +57,7 @@ def _yahoo_chart_payloads(sym="RELIANCE"):
                 "timestamp": d_ts,
                 "indicators": {"quote": [{
                     "open": [c * 0.995 for c in closes],
-                    "high": [c * 1.005 for c in closes],
+                    "high": [float(c) for c in closes],
                     "low": [c * 0.99 for c in closes],
                     "close": closes,
                     "volume": [2500000 for _ in closes],
