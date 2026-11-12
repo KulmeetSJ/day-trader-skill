@@ -2,22 +2,17 @@
 name: trader-risk
 description: >-
   Risk Manager. Checks every trade against your limits and stops anything
-  over them, before it can reach the broker. For a day trade: a stop is
-  required, the loss at the stop must fit your max loss per trade (measured
-  from the higher of the plan's entry and a fresh price), reward:risk must
-  meet your minimum, the day's total risk must fit your daily loss limit, no
-  more than your trades per day, and no new entries outside your entry
-  window or when the market is closed. It also enforces US and Indian market
-  safeguards: authoritative tick-size grid and exchange checks, T2T delivery
-  restrictions, F&O lot multiples, positional GTT OCO validation, blocked
-  tickers, order size, position cap, cash buffer, margin, short sales,
-  naked options and crypto, malformed orders, duplicates and daily order
-  limits. Getting out is never blocked by a day limit or missing cache on
-  an unpriced market exit. Prints PASS or BLOCK with the reason and records
-  verdicts so trader-broker only shows an order that passed. Use when the user
-  says "check my order", "is this safe", "risk check", "does this break my
-  rules", "can I take this trade", "how much have I risked today", or before
-  /trader-broker, always.
+  over them before it reaches the broker. Enforces required stops, max loss
+  per trade (entry vs fresh price), min R:R, daily loss/trade limits, entry
+  windows, and market hours. Also validates US and Indian NSE/BSE
+  safeguards: authoritative tick sizes, T2T blocks, F&O lot multiples,
+  positional GTT OCO legs, blocked tickers, position/cash caps,
+  short/margin/options/crypto rules, duplicates, and malformed orders.
+  Unpriced market exits bypass day limits and missing cache errors. Prints
+  PASS or BLOCK and records verdicts for trader-broker. Use when asked
+  "check my order", "is this safe", "risk check", "does this break my rules",
+  "can I take this trade", "how much have I risked today", or before
+  /trader-broker.
 argument-hint: "[path to orders.json]"
 ---
 

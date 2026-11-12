@@ -1,22 +1,17 @@
 ---
 name: trader-broker
 description: >-
-  Order Executor. Sends approved orders to your broker in US mode (paper
-  trading by default, never without your yes), and renders paper-only tickets
-  for Indian NSE/BSE trades (intraday MIS brackets or multi-session CNC/NRML
-  GTT OCO). Shows each order as a plain ticket (with stop-loss, take-profit,
-  max loss at the stop, INR/USD tick precision, and estimated Indian charges
-  when applicable) plus the exact JSON for Alpaca's place_stock_order in US
-  mode, records your yes word for word (with symbol-normalized qty checks),
-  then Claude's own Allow once / Deny card asks again. Builds the sell ticket
-  that closes a day trade by your flat-by time, records fills, and logs each
-  trade's max loss so trader-risk can hold the daily limit. Covers Alpaca's
-  official MCP server in Claude Desktop (paper by default, keys in env vars,
-  never in chat) and Interactive Brokers; Upstox integration in this pack is
-  strictly read-only market data with zero live Indian broker order routing.
-  Use when the user says "place the order", "buy it", "execute", "send it to
-  my broker", "close my position", "flatten", "get me out", "connect Alpaca",
-  "set up paper trading", or after /trader-risk passes.
+  Order Executor. Renders plain tickets (stop-loss, take-profit, max loss,
+  USD/INR tick precision, and estimated Indian charges) for trader-risk
+  approved orders. Outputs Alpaca place_stock_order JSON in US mode (paper
+  by default, never without your explicit yes and Allow once approval), and
+  paper-only MIS brackets or CNC/NRML GTT OCO tickets for Indian NSE/BSE
+  trades (Upstox is read-only data with zero order routing). Records yes
+  replies, fills, flatten exit tickets before flat-by, and daily max loss.
+  Covers Alpaca MCP (env var keys) and Interactive Brokers. Use when asked
+  to "place the order", "buy it", "execute", "send it to my broker", "close
+  my position", "flatten", "get me out", "connect Alpaca", "set up paper
+  trading", or after /trader-risk passes.
 argument-hint: "[order number]"
 ---
 

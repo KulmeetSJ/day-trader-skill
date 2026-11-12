@@ -29,6 +29,26 @@ def frontmatter(path):
     return (m.group(1) if m else ""), text
 
 
+def extract_description(fm):
+    """Extract the YAML description string (single-line or block scalar)."""
+    lines = fm.splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith("description:"):
+            rest = line.split(":", 1)[1].strip()
+            if rest in (">-", ">", "|", "|-"):
+                buf = []
+                for sub in lines[idx + 1:]:
+                    if sub.startswith((" ", "\t")):
+                        buf.append(sub.strip())
+                    elif sub == "":
+                        buf.append("")
+                    else:
+                        break
+                return " ".join(buf).strip()
+            return rest.strip("\"'")
+    return ""
+
+
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
@@ -69,7 +89,9 @@ class Repo(unittest.TestCase):
             fm, text = frontmatter(os.path.join(ROOT, s, "SKILL.md"))
             self.assertIn("name: %s\n" % s, fm + "\n", s)
             self.assertRegex(fm, r"description: ", s)
-            self.assertGreater(len(fm), 200, "%s description is too thin" % s)
+            desc = extract_description(fm)
+            self.assertGreater(len(desc), 200, "%s description is too thin" % s)
+            self.assertLessEqual(len(desc), 1024, "%s description exceeds 1024 chars (%d)" % (s, len(desc)))
             self.assertGreater(len(text.splitlines()), 60, s)
 
     def test_order_path_skills_carry_the_safety_rule(self):
