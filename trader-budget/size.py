@@ -850,8 +850,20 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             deriv_meta = symbols_in.parse_derivative_symbol(sym)
             if deriv_meta:
                 asset_type = "OPTIONS" if deriv_meta.get("instrument_type") == "OPT" else "FUTURES"
+        elif market == "IN" and symbols_in and symbols_in.is_index_symbol(sym):
+            asset_type = "INDEX"
         else:
             asset_type = "EQUITY"
+
+    if str(asset_type).upper() == "INDEX" or (
+        market == "IN" and symbols_in and symbols_in.is_index_symbol(sym)
+        and not symbols_in.is_derivative_symbol(sym) and not plan.get("option_contract")
+        and asset_type not in ("OPTIONS", "FUTURES")
+    ):
+        raise SizeError(
+            "%s is a benchmark spot index (analytical only, not a directly tradable equity); "
+            "size an index F&O derivative contract instead" % sym
+        )
 
     if asset_type == "OPTIONS":
         if not c.get("allow_options"):

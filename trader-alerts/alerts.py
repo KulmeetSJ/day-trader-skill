@@ -70,11 +70,13 @@ try:
     import symbols_in
     import instruments
     import data_in
+    import visuals
 except ImportError:
     calendar_in = None
     symbols_in = None
     instruments = None
     data_in = None
+    visuals = None
 
 # Cross-skill scanner helper lives in ../trader-scanner (added to sys.path above)
 try:
@@ -658,8 +660,16 @@ def rules_from_plan(plan, cfg_flat_by=None):
         v = plan.get(key)
         if not isinstance(v, (int, float)) or v <= 0:
             raise AlertError("the plan has no %s (run trader-exit)" % key)
+        eff = float(v)
         label = plan.get("%s_label" % key)
-        out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
+        if key == "stop":
+            ts = plan.get("trailing_stop")
+            if isinstance(ts, (int, float)) and float(ts) > eff:
+                eff = float(ts)
+                t_lbl = plan.get("trailing_stop_label") or "trailing"
+                word = "plan trailing stop"
+                label = t_lbl
+        out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": eff,
                     "note": word + (": " + label if label else "")})
     is_in = str(plan.get("market", "")).upper() in ("IN", "INDIA") or plan.get("currency") == "INR"
     default_flat = "15:20" if is_in else "15:55"
@@ -1184,7 +1194,7 @@ def cmd_quote_in(a):
 
     cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
     cfg = _read(cfg_path, {}) or {}
-    exch = cfg.get("exchange") or "NSE"
+    default_exch = getattr(a, "exchange", None) or cfg.get("exchange") or "NSE"
     eff_source = a.source or "yahoo"
 
     if data_in:
@@ -1199,6 +1209,8 @@ def cmd_quote_in(a):
         for s in raw_syms:
             try:
                 c_sym = symbols_in.normalize_symbol(s) if symbols_in else s.upper()
+                idx_meta = symbols_in.get_index_metadata(c_sym) if symbols_in else None
+                exch = getattr(a, "exchange", None) or (idx_meta["exchange"] if idx_meta else default_exch)
                 q = data_in._call_with_optional_now(
                     provider.get_quote, c_sym, exchange=exch, now=now_ist if a.now else None
                 )
@@ -1224,6 +1236,8 @@ def cmd_quote_in(a):
         query_syms = []
         for c_sym in canonical_syms:
             if symbols_in and src == "yahoo":
+                idx_meta = symbols_in.get_index_metadata(c_sym)
+                exch = getattr(a, "exchange", None) or (idx_meta["exchange"] if idx_meta else default_exch)
                 y_sym = symbols_in.to_yahoo_symbol(c_sym, exchange=exch)
             else:
                 y_sym = c_sym
@@ -1295,8 +1309,9 @@ def cmd_history_in(a):
 
     cfg_path = getattr(a, "config", "trader/config.json") or "trader/config.json"
     cfg = _read(cfg_path, {}) or {}
-    exch = cfg.get("exchange") or "NSE"
     c_sym = symbols_in.normalize_symbol(a.symbol) if symbols_in else a.symbol.upper()
+    idx_meta = symbols_in.get_index_metadata(c_sym) if symbols_in else None
+    exch = getattr(a, "exchange", None) or (idx_meta["exchange"] if idx_meta else (cfg.get("exchange") or "NSE"))
     try:
         provider = (
             data_in.OfflineMarketDataProvider(a.offline)
@@ -1320,8 +1335,16 @@ def cmd_history_in(a):
     if a.write and data:
         _write(a.write, data)
 
+    chart_path = getattr(a, "chart", None)
+    if chart_path and visuals and data and data.get("bars"):
+        svg = visuals.render_candlestick_svg(data, show_vwap=True)
+        visuals.write_svg(chart_path, svg)
+
     if a.json:
-        print(json.dumps(data, indent=2))
+        out_doc = dict(data)
+        if chart_path and visuals and data and data.get("bars"):
+            out_doc["chart_path"] = chart_path
+        print(json.dumps(out_doc, indent=2))
     else:
         bars = data.get("bars", [])
         tier = data.get("tier", "HISTORICAL")
@@ -1342,6 +1365,8 @@ def cmd_history_in(a):
             drop_str = ", ".join("%s: %d" % (k, v) for k, v in dropped.items() if v > 0)
             if drop_str:
                 print("Dropped bars: %s" % drop_str)
+        if chart_path and visuals and bars:
+            print("Chart written: %s" % chart_path)
     return 0 if data.get("bars") else 1
 
 
@@ -1689,13 +1714,17 @@ def main(argv=None):
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--write", nargs="?", const="trader/prices.json", metavar="PATH",
                    help="save to prices.json (default trader/prices.json)")
+    p.add_argument("--exchange", default=None, help="exchange override for --market IN (NSE or BSE)")
     p = sub.add_parser("history", help="historical intraday or daily bars")
     net(p)
     p.add_argument("symbol")
-    p.add_argument("--interval", default="5m", help="bar interval (1m, 5m, 1d; default 5m)")
+    p.add_argument("--exchange", default=None, help="exchange override for --market IN (NSE or BSE)")
+    p.add_argument("--interval", default="5m", help="bar interval (1m, 5m, 15m, 1h, 1d; default 5m)")
     p.add_argument("--range", dest="range_str", default="5d", help="range to fetch (e.g. 1d, 5d, 1mo, 1y; default 5d)")
     p.add_argument("--write", nargs="?", const="trader/history.json", metavar="PATH",
                    help="save to history.json (default trader/history.json)")
+    p.add_argument("--chart", metavar="PATH", default=None,
+                   help="opt-in: render candlestick SVG chart from fetched bars to PATH")
     p = sub.add_parser("check", help="check every rule, ring what hit")
     net(p)
     p.add_argument("--rules", default="trader/alerts.json")

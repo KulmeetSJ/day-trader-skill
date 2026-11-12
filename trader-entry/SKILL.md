@@ -160,6 +160,19 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
   reset it.
 - Never call an entry early because a bar looks like it will close above.
 
+## Intraday Decision Engine (anytime evaluation)
+
+`entry.py check` evaluates live or on-demand intraday market state at any time during an active session (e.g., `09:45`, `11:30`, `14:00`) using `1m`, `5m`, `15m`, `30m`, or `1h` bars:
+
+- **Setups without opening-range prerequisites**: `breakout_intraday` (intraday swing high breakout via `--lookback-bars`), `vwap_reclaim` (session VWAP reclaim), `ema_alignment` (EMA9 > EMA21 > VWAP / rising EMA stack), `rsi_momentum` (`momentum`), alongside `orb`, `level`, `breakout_20d`, `ma_crossover`, `trend`, and `options_orb`.
+- **Actionable decision states**: `ENTRY CONFIRMED`, `ENTRY CANDIDATE`, `SETUP`, or `NO TRADE` (`EXTENDED` anti-chasing protection beyond `entry_zone`, `INVALIDATED`, `STALE_DATA`, `NO_DATA`, `EXPIRED`, `MARKET_CLOSED`, `ANALYTICAL_ONLY_INDEX`).
+- **Decision fields**: `entry_zone` (`low`/`high`), `invalidation_level`, `stop_preview`, `targets_preview`, `reward_risk`, `sizing_preview`, separated `candle_context` (`completed_candle`, `forming_candle`, `current_quote`), and opt-in repeated-run deduplication via `--state PATH` (`NEW` / `UPDATED` / `UNCHANGED`).
+- **Evaluation mode**: Runs on-invocation against latest completed bars and fail-closes (`NO TRADE` / `STALE_DATA`) when data is stale or unavailable.
+
+## Opt-in visualisations
+
+Default output is text/JSON only. Only when the user explicitly requests a chart, render an entry/candlestick SVG via `../trader-alerts/visuals.py` from already-fetched bars and `trader/entry.json` (see `guides/trader-visuals.md`).
+
 ## What it never does
 
 It never places an order, never sizes a position, never sets the stop (that

@@ -859,7 +859,20 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             else:
                 warns.append("futures order: leveraged derivative instrument")
         elif sym:
-            if market == "IN":
+            is_spot_idx = (
+                str(o.get("asset_type") or "").upper() == "INDEX"
+                or (
+                    symbols_in
+                    and symbols_in.is_index_symbol(sym)
+                    and not symbols_in.is_derivative_symbol(sym)
+                )
+            )
+            if is_spot_idx:
+                reasons.append(
+                    "asset: %s is a spot index (analytical only, not a tradable equity); "
+                    "use an index F&O derivative contract instead" % sym
+                )
+            elif market == "IN":
                 if "/" in sym or not TICKER_IN.match(sym):
                     reasons.append("asset: %s does not look like an Indian stock ticker (NSE/BSE); "
                                     "this pack trades stocks and ETFs only" % sym)

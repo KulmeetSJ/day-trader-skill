@@ -60,16 +60,19 @@ try:
     import symbols_in  # type: ignore
     import instruments  # type: ignore
     import data_in  # type: ignore
+    import visuals  # type: ignore
 except ImportError:
     calendar_in = None
     symbols_in = None
     instruments = None
     data_in = None
+    visuals = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 BACKOFF = 5.0
 HOSTS = ("query2", "query1")
-INTERVALS = {"1m": 60, "5m": 300}
+INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+DEFAULT_EXIT_STATE = "trader/state/exit_decisions.json"
 DEFAULTS = {"flat_by": "15:55", "min_reward_risk": 1.0}
 DEFAULTS_IN = {"flat_by": "15:20", "min_reward_risk": 1.0}
 ATR_BARS = 14
@@ -310,6 +313,10 @@ def session(d, market="US"):
             is_trade, _status, _reason = calendar_in.is_trading_day_in(d)
             if not is_trade:
                 return None
+            sp = calendar_in.get_special_session(d.isoformat(), exchange="NSE")
+            if sp and sp.get("open_time") and sp.get("close_time"):
+                return (parse_hhmm(sp["open_time"], "special open", market="IN"),
+                        parse_hhmm(sp["close_time"], "special close", market="IN"))
             return NSE_OPEN, NSE_CLOSE
         if d.weekday() >= 5:
             return None
@@ -581,7 +588,7 @@ def read_text(path):
 _ORIG_YAHOO_GET = yahoo_get
 
 
-def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=None):
+def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=None, with_volume=False):
     ysym = (symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else sym.upper().replace(".", "-"))
     if offline:
         path = offline
@@ -612,7 +619,9 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=
         use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
         ref_utc = now_utc or utc_now()
         back = (to_local(ref_utc, market=market).date() - day).days
-        rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        rng = "5d" if (with_volume and back <= 0 and prov.provider_name != "offline") else (
+            "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        )
         if prov.provider_name == "yahoo" and interval == "1m" and back > 6:
             raise PlanError("Yahoo keeps 1-minute bars for about a week")
         if use_legacy_mock:
@@ -629,11 +638,23 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=
                 )
             except Exception as e:
                 raise PlanError(str(e))
+            if with_volume:
+                ch = data_in.to_entry_chart(payload)
+                if now_utc is None and prov.supports(data_in.CAPABILITY_LIVE_QUOTES) and str(ch.get("provider") or "").lower() not in ("yahoo", "offline", "simulated"):
+                    try:
+                        q = prov.get_quote(sym, exchange=exch)
+                        if isinstance(q, dict) and q.get("price") is not None:
+                            ch["current_quote"] = q
+                    except Exception:
+                        pass
+                return ch
             return data_in.to_exit_chart(payload)
     else:
         ref_utc = now_utc or utc_now()
         back = (to_local(ref_utc, market=market).date() - day).days
-        rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        rng = "5d" if (with_volume and back <= 0 and yahoo_get is _ORIG_YAHOO_GET) else (
+            "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+        )
         if interval == "1m" and back > 6:
             raise PlanError("Yahoo keeps 1-minute bars for about a week")
         text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (ysym, rng, interval))
@@ -669,9 +690,12 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=
         c = at("close", i)
         if t is None or c is None:
             continue
-        h, lo = at("high", i), at("low", i)
-        bars.append({"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo),
-                     "c": float(c)})
+        o_v, h, lo, v_v = at("open", i), at("high", i), at("low", i), at("volume", i)
+        bar = {"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo), "c": float(c)}
+        if with_volume:
+            bar["o"] = float(c if o_v is None else o_v)
+            bar["v"] = int(0 if v_v is None else v_v)
+        bars.append(bar)
     dt_raw = meta.get("regularMarketTime")
     if now_utc is not None and market == "IN":
         step = INTERVALS.get(interval, 300)
@@ -682,7 +706,17 @@ def load_chart(sym, interval, day, offline=None, market="US", cfg=None, now_utc=
             dt_raw = latest_close if (dt_raw is None or int(dt_raw) > cutoff_ts) else int(dt_raw)
         elif dt_raw is not None and int(dt_raw) > cutoff_ts:
             dt_raw = None
-    return {"bars": bars, "data_time": dt_raw, "provider": "offline" if offline else "yahoo"}
+    out_ch = {"bars": bars, "data_time": dt_raw, "provider": "offline" if offline else "yahoo"}
+    if offline:
+        out_ch["is_offline"] = True
+        out_ch["data_tier"] = "FIXTURE"
+        out_ch["data_status"] = "FIXTURE"
+        out_ch["is_live"] = False
+    else:
+        out_ch["data_tier"] = "DELAYED"
+        out_ch["data_status"] = "DELAYED"
+        out_ch["is_live"] = False
+    return out_ch
 
 
 def session_bars(chart, day, interval, upto_slot=None, now_utc=None, market="US"):
@@ -886,12 +920,25 @@ def build_plan(a, now_utc=None):
                     "strike": deriv_meta.get("strike"),
                     "option_type": deriv_meta.get("option_type")
                 }
+    elif (
+        market == "IN"
+        and symbols_in
+        and symbols_in.is_index_symbol(info["symbol"])
+        and asset_type not in ("OPTIONS", "FUTURES")
+        and not option_contract
+    ):
+        asset_type = "INDEX"
+        idx_meta = symbols_in.get_index_metadata(info["symbol"])
+        if idx_meta and not cli_exch and not doc_exch:
+            req_exchange = idx_meta["exchange"]
 
     # Instrument metadata resolution (tick size, lot size, T2T)
     tick_size = None
     lot_size = 1
     resolved_exchange = req_exchange or ("NSE" if market == "IN" else None)
     if market == "IN":
+        if str(asset_type).upper() == "INDEX":
+            tick_size = TICK_IN
         doc_tick = doc_meta.get("tick_size") if isinstance(doc_meta, dict) and "tick_size" in doc_meta else None
         if isinstance(doc_meta, dict) and "tick_size" in doc_meta:
             if doc_tick is None or isinstance(doc_tick, bool):
@@ -910,7 +957,9 @@ def build_plan(a, now_utc=None):
         inst_path = raw_inst_arg or (getattr(instruments, "DEFAULT_CACHE_PATH", None) if instruments else None) or "trader/state/instruments.json"
         if explicit_inst and not os.path.exists(inst_path):
             raise PlanError("Instrument cache not found at: %s" % inst_path)
-        if instruments and inst_path and os.path.exists(inst_path):
+        if str(asset_type).upper() == "INDEX":
+            tick_size = doc_tick or TICK_IN
+        elif instruments and inst_path and os.path.exists(inst_path):
             instr_err = instruments.InstrumentMetadataError
             try:
                 cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=info.get("date"))
@@ -1045,6 +1094,9 @@ def build_plan(a, now_utc=None):
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
     if asset_type:
         plan["asset_type"] = asset_type
+    if str(asset_type or "").upper() == "INDEX":
+        plan["is_tradable_equity"] = False
+        plan["analytical_only"] = True
     if option_contract:
         plan["option_contract"] = option_contract
         if not lot_size or lot_size == 1:
@@ -1094,6 +1146,8 @@ def build_plan(a, now_utc=None):
         plan.setdefault("is_fixture", True)
         plan.setdefault("data_tier", "FIXTURE")
     warnings = []
+    if str(asset_type or "").upper() == "INDEX":
+        warnings.append("Analytical plan for spot index (not a directly tradable equity); use index F&O derivatives for execution.")
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
     mrr = cfg_market.get("min_reward_risk")
@@ -1131,8 +1185,9 @@ def describe(plan):
         if plan.get("entry_bar") is not None:
             when += " (bar %d)" % plan["entry_bar"]
     p_tick = plan.get("tick_size")
+    iv_labels = {"1m": "1-minute", "5m": "5-minute", "15m": "15-minute", "30m": "30-minute", "1h": "1-hour"}
     out = ["Exit plan: %s long, %s, %s on %s bars" % (
-        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute")]
+        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, iv_labels.get(plan["interval"], plan["interval"]))]
     out.append("  Entry         %s%s" % (money(plan["entry"], market=market, tick=p_tick), when))
     out.append("  Stop          %s  %s%s" % (money(plan["stop"], market=market, tick=p_tick), plan["stop_label"],
                                              (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
@@ -1201,6 +1256,541 @@ def cmd_show(a):
     return 0
 
 
+# ---------------------------------------------------------------- intraday position manager
+
+def _manage_ema(closes, period):
+    if visuals is not None:
+        return visuals.compute_ema(closes, period)
+    n = int(period)
+    if n <= 0 or not closes or len(closes) < n:
+        return [None] * len(closes or [])
+    vals = [None] * (n - 1)
+    prev = sum(float(x) for x in closes[:n]) / float(n)
+    vals.append(prev)
+    k = 2.0 / float(n + 1)
+    for c in closes[n:]:
+        prev = (float(c) - prev) * k + prev
+        vals.append(prev)
+    return vals
+
+
+def _manage_vwap(bars):
+    if not bars:
+        return None
+    if visuals is not None:
+        return visuals.compute_vwap(bars)
+    tot_v = sum(float(b.get("v") or 0) for b in bars)
+    if tot_v <= 0:
+        return None
+    out, cpv, cv = [], 0.0, 0.0
+    for b in bars:
+        v = float(b.get("v") or 0)
+        tp = (float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0
+        if v > 0:
+            cpv += tp * v
+            cv += v
+        out.append((cpv / cv) if cv > 0 else None)
+    return out
+
+
+def _manage_rsi(closes, period=14):
+    if visuals is not None:
+        return visuals.compute_rsi(closes, period=period)
+    return None
+
+
+def _manage_tick(position, market="US", cfg=None, instruments_path=None, exchange=None):
+    raw_tick = position.get("tick_size")
+    if raw_tick is not None and not isinstance(raw_tick, bool):
+        try:
+            d = Decimal(str(raw_tick))
+            if d.is_finite() and d > 0:
+                return d
+        except Exception:
+            pass
+    if market == "IN" and instruments is not None:
+        inst_p = instruments_path or "trader/state/instruments.json"
+        if os.path.exists(inst_p):
+            try:
+                master = instruments.load_master(inst_p)
+                ex = exchange or position.get("exchange") or (cfg or {}).get("exchange") or "NSE"
+                rec = instruments.resolve_instrument(position["symbol"], exchange=ex, master=master)
+                if rec and rec.get("tick_size"):
+                    return Decimal(str(rec["tick_size"]))
+            except Exception:
+                pass
+    return TICK_IN if market == "IN" else CENT
+
+
+def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=None,
+                      trail_atr_k=1.5, trail_activate_r=1.0, allow_partial=False,
+                      partial_at_r=1.0, simulated=False, instruments_path=None):
+    """Evaluate one open long position against current market conditions at now_utc.
+
+    Returns dict with decision action:
+      EXIT | PARTIAL EXIT | UPDATE TRAILING STOP | HOLD | NO_ACTION
+    """
+    if not isinstance(position, dict) or not position.get("symbol"):
+        raise PlanError("position must contain 'symbol'")
+    sym = str(position["symbol"]).upper()
+    market = market or position.get("market") or ((cfg or {}).get("market")) or (
+        "IN" if sym.endswith((".NS", ".BO", "-EQ")) else "US"
+    )
+    if str(market).upper() == "INDIA":
+        market = "IN"
+    cfg = cfg or dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
+    if interval not in INTERVALS:
+        raise PlanError("--interval must be one of %s" % ", ".join(INTERVALS))
+    step = INTERVALS[interval]
+    tick = _manage_tick(position, market=market, cfg=cfg, instruments_path=instruments_path,
+                        exchange=position.get("exchange"))
+    local = to_local(now_utc, market=market)
+    day = local.date()
+    now_ts = int((now_utc.replace(tzinfo=None) - EPOCH).total_seconds())
+    qty = float(position.get("shares") if position.get("shares") is not None else (position.get("qty") or 0))
+    entry_px = float(position.get("avg_cost") if position.get("avg_cost") is not None else (position.get("entry") or 0))
+    stop_px = position.get("stop")
+    trailing_stop = position.get("trailing_stop")
+    active_stop = None
+    if stop_px is not None or trailing_stop is not None:
+        cands = [float(x) for x in (stop_px, trailing_stop) if x is not None and float(x) > 0]
+        active_stop = max(cands) if cands else None
+    target_px = float(position["target"]) if position.get("target") is not None else None
+    style = str(position.get("trading_style") or ("positional" if str(position.get("flat_by") or "").lower() == "positional" else cfg.get("trading_style") or "intraday")).lower()
+    raw_asset = position.get("asset_type")
+    if not raw_asset and market == "IN" and symbols_in and symbols_in.is_derivative_symbol(sym):
+        dmeta = symbols_in.parse_derivative_symbol(sym)
+        if dmeta:
+            raw_asset = "OPTIONS" if dmeta.get("instrument_type") == "OPT" else "FUTURES"
+    asset_type = str(raw_asset or "EQUITY").upper()
+    lot_size = max(1, int(position.get("lot_size") or 1))
+    expiry_str = position.get("expiry")
+    flat_by_raw = position.get("flat_by")
+    flat_by_time = None
+    if style != "positional":
+        fb_str = flat_by_raw if (flat_by_raw and str(flat_by_raw).lower() != "positional") else (
+            cfg.get("flat_by") or (DEFAULTS_IN["flat_by"] if market == "IN" else DEFAULTS["flat_by"])
+        )
+        try:
+            flat_by_time = parse_hhmm(fb_str, "flat_by", market=market)
+        except PlanError:
+            flat_by_time = parse_hhmm("15:20" if market == "IN" else "15:55", "flat_by", market=market)
+
+    s = session(day, market=market)
+    session_open = bool(s and s[0] <= local.time() < s[1])
+    if style != "positional" and s and flat_by_time:
+        close_dt = datetime.datetime.combine(day, s[1])
+        fb_dt = datetime.datetime.combine(day, flat_by_time)
+        if fb_dt >= close_dt:
+            flat_by_time = (close_dt - datetime.timedelta(minutes=5)).time()
+
+    # Extract completed intraday bars (up to now_ts) separated from forming bar and current quote
+    raw_bars = (chart or {}).get("bars") or []
+    completed_all = []
+    session_bars_closed = []
+    forming_bar = None
+    for b in raw_bars:
+        if b.get("t") is None or b.get("c") is None:
+            continue
+        t_val = int(b["t"])
+        if t_val % step:
+            continue
+        et = to_local(utc_of(t_val), market=market)
+        s_day = session(et.date(), market=market)
+        if s_day and not (s_day[0] <= et.time() < s_day[1]):
+            continue
+        if t_val + step <= now_ts:
+            nb = {
+                "t": t_val, "et": et, "end": et + datetime.timedelta(seconds=step),
+                "o": float(b.get("o") if b.get("o") is not None else b["c"]),
+                "h": float(b["h"]), "l": float(b["l"]), "c": float(b["c"]),
+                "v": float(b.get("v") or 0),
+                "date": et.date().isoformat(),
+            }
+            completed_all.append(nb)
+            if et.date() == day:
+                session_bars_closed.append(nb)
+        elif et.date() == day and t_val <= now_ts and forming_bar is None:
+            forming_bar = {
+                "bar_start": hm(et), "bar_end": hm(et + datetime.timedelta(seconds=step)),
+                "close_so_far": float(b["c"]), "is_complete": False,
+            }
+    completed_all.sort(key=lambda x: x["t"])
+    session_bars_closed.sort(key=lambda x: x["t"])
+
+    q_raw = (chart or {}).get("current_quote")
+    quote_px = None
+    quote_ts = None
+    if isinstance(q_raw, dict) and q_raw.get("price") is not None:
+        q_t = q_raw.get("timestamp")
+        if q_t is None or int(q_t) <= now_ts:
+            quote_px = float(q_raw["price"])
+            quote_ts = int(q_t) if q_t is not None else None
+
+    last_closed = session_bars_closed[-1] if session_bars_closed else (completed_all[-1] if completed_all else None)
+    curr_px = quote_px if quote_px is not None else (last_closed["c"] if last_closed else None)
+
+    prov_name = str((chart or {}).get("provider") or "yahoo")
+    d_tier = str((chart or {}).get("data_tier") or "DELAYED").upper()
+    d_stat = str((chart or {}).get("provider_data_status") or (chart or {}).get("data_status") or d_tier).upper()
+    is_fix = bool((chart or {}).get("is_offline"))
+    is_sim = bool((chart or {}).get("is_simulated"))
+    dt_val = (chart or {}).get("data_time")
+    lag_sec = (now_ts - int(dt_val)) if dt_val is not None else (
+        (now_ts - quote_ts) if quote_ts is not None else (
+            (now_ts - (last_closed["t"] + step)) if last_closed else None
+        )
+    )
+    is_stale = bool(
+        session_open and not simulated and not is_fix and not is_sim
+        and (d_stat == "STALE" or (lag_sec is not None and lag_sec > max(1800, step + 600)))
+    )
+
+    closes_all = [b["c"] for b in completed_all]
+    ema9 = _manage_ema(closes_all, 9) if closes_all else []
+    ema21 = _manage_ema(closes_all, 21) if closes_all else []
+    vwap_s = _manage_vwap(session_bars_closed) if session_bars_closed else None
+    rsi14 = _manage_rsi(closes_all, 14) if closes_all else None
+    atr_val = (visuals.compute_atr(completed_all, 14) if (visuals is not None and len(completed_all) >= 15) else None)
+    if atr_val is None and completed_all:
+        atr_val, _ = atr_of(completed_all, ATR_BARS)
+
+    ema9_v = ema9[-1] if ema9 else None
+    ema21_v = ema21[-1] if ema21 else None
+    vwap_v = vwap_s[-1] if vwap_s else None
+
+    rps = (entry_px - float(stop_px)) if (stop_px is not None and entry_px > float(stop_px)) else (
+        (entry_px - float(active_stop)) if (active_stop is not None and entry_px > float(active_stop)) else None
+    )
+    unrealized_pnl = round((curr_px - entry_px) * qty, 2) if (curr_px is not None and entry_px > 0 and qty > 0) else None
+    r_mult = round((curr_px - entry_px) / rps, 2) if (curr_px is not None and rps and rps > 0) else None
+    loss_cap_key = "max_loss_per_trade_inr" if market == "IN" else "max_loss_per_trade_usd"
+    max_loss_cap = cfg.get(loss_cap_key) or cfg.get("max_loss_per_trade")
+
+    action = "HOLD"
+    reason_code = "TREND_INTACT"
+    reasons = []
+    recommended_stop = None
+    exit_qty = None
+
+    # 1. Hard session / expiry time constraints first (never depend on quote freshness)
+    if style == "intraday" and s and flat_by_time:
+        fb_dt = datetime.datetime.combine(day, flat_by_time)
+        mins_to_flat = (fb_dt - local).total_seconds() / 60.0
+        if mins_to_flat <= 5.0 and local.time() <= s[1]:
+            action = "EXIT"
+            reason_code = "INTRADAY_SQUARE_OFF"
+            reasons.append("Intraday flat-by cutoff %s approached/reached (now %s)" % (hm(flat_by_time), hm(local)))
+    if action == "HOLD" and asset_type in ("OPTIONS", "FUTURES") and expiry_str == day.isoformat() and s:
+        exp_cutoff = parse_hhmm("15:15" if market == "IN" else "15:45", "expiry cutoff", market=market)
+        if local.time() >= exp_cutoff:
+            action = "EXIT"
+            reason_code = "EXPIRY_APPROACHING"
+            reasons.append("%s expires today (%s) and settlement cutoff %s reached" % (asset_type, expiry_str, hm(exp_cutoff)))
+
+    # 2. Fail-closed on missing or stale data during open live session
+    if action == "HOLD" and (curr_px is None or is_stale):
+        action = "NO_ACTION"
+        reason_code = "STALE_DATA" if is_stale else "NO_DATA"
+        reasons.append(
+            "Stale or unavailable intraday data (provider=%s, tier=%s, lag=%ss); manual check required before acting"
+            % (prov_name, d_tier, lag_sec)
+        )
+
+    # 3. Stop-loss / trailing stop breach
+    if action == "HOLD" and active_stop is not None and curr_px is not None:
+        closed_stop_hit = bool(last_closed and (last_closed["c"] <= active_stop or last_closed["l"] <= active_stop))
+        quote_stop_hit = bool(curr_px <= active_stop)
+        if quote_stop_hit or closed_stop_hit:
+            action = "EXIT"
+            reason_code = "TRAILING_STOP_HIT" if (trailing_stop is not None and active_stop == float(trailing_stop) and (stop_px is None or float(trailing_stop) > float(stop_px))) else "STOP_HIT"
+            reasons.append("Price breached active stop %.2f (current %.2f%s)" % (
+                active_stop, curr_px, ", closed bar low %.2f" % last_closed["l"] if last_closed else ""
+            ))
+
+    # 4. Per-trade risk limit breach
+    if action == "HOLD" and unrealized_pnl is not None and max_loss_cap and unrealized_pnl <= -abs(float(max_loss_cap)):
+        action = "EXIT"
+        reason_code = "RISK_LIMIT_BREACH"
+        reasons.append("Unrealized loss %.2f exceeds max_loss_per_trade %.2f" % (unrealized_pnl, float(max_loss_cap)))
+
+    # 5. Trend deterioration / VWAP breakdown on COMPLETED bars (any time of day)
+    if action == "HOLD" and last_closed is not None and last_closed["date"] == day:
+        bear_ema = (ema9_v is not None and ema21_v is not None and last_closed["c"] < ema21_v and ema9_v < ema21_v)
+        below_vwap = (vwap_v is not None and last_closed["c"] < vwap_v)
+        weak_rsi = (rsi14 is not None and rsi14 < 45.0)
+        if (bear_ema and (below_vwap or vwap_v is None)) or (below_vwap and weak_rsi and len(session_bars_closed) >= 3):
+            action = "EXIT"
+            reason_code = "TREND_REVERSAL" if bear_ema else "VWAP_BREAKDOWN"
+            reasons.append("Completed %s bar deteriorated: close %.2f (EMA9=%s, EMA21=%s, VWAP=%s, RSI=%s)" % (
+                hm(last_closed["et"]), last_closed["c"],
+                ("%.2f" % ema9_v) if ema9_v else "n/a",
+                ("%.2f" % ema21_v) if ema21_v else "n/a",
+                ("%.2f" % vwap_v) if vwap_v else "n/a",
+                ("%.1f" % rsi14) if rsi14 else "n/a",
+            ))
+
+    # 6. Target & Partial Exit logic
+    can_partial = bool(allow_partial and int(qty // lot_size) >= 2 and not position.get("partial_done"))
+    if action == "HOLD" and target_px is not None and curr_px is not None:
+        target_hit = (curr_px >= target_px) or bool(last_closed and last_closed["h"] >= target_px)
+        if target_hit:
+            bullish_run = bool(ema9_v and ema21_v and curr_px > ema9_v > ema21_v)
+            if can_partial and bullish_run:
+                half_lots = max(1, int(qty // lot_size) // 2)
+                exit_qty = int(half_lots * lot_size)
+                action = "PARTIAL EXIT"
+                reason_code = "TARGET_PARTIAL_SCALE"
+                cand_stop = float(floor_tick(entry_px, tick))
+                if active_stop is None or cand_stop > active_stop:
+                    recommended_stop = cand_stop
+                reasons.append("Target %.2f reached while trend bullish; scale out %d units and raise stop to breakeven" % (
+                    target_px, exit_qty))
+            else:
+                action = "EXIT"
+                reason_code = "TARGET_HIT"
+                reasons.append("Target %.2f achieved (current %.2f)" % (target_px, curr_px))
+
+    if action == "HOLD" and can_partial and r_mult is not None and r_mult >= float(partial_at_r):
+        half_lots = max(1, int(qty // lot_size) // 2)
+        exit_qty = int(half_lots * lot_size)
+        action = "PARTIAL EXIT"
+        reason_code = "PROFIT_PARTIAL_SCALE"
+        cand_stop = float(floor_tick(entry_px, tick))
+        if active_stop is None or cand_stop > active_stop:
+            recommended_stop = cand_stop
+        reasons.append("Unrealized +%.2fR >= %.2fR; partial exit %d units and protect breakeven" % (
+            r_mult, float(partial_at_r), exit_qty))
+
+    # 7. Trailing stop advancement (strictly tighter / higher stop for long)
+    if action == "HOLD" and curr_px is not None and r_mult is not None and r_mult >= float(trail_activate_r):
+        trail_cands = []
+        if entry_px > 0 and r_mult >= float(trail_activate_r):
+            trail_cands.append(entry_px)
+        if atr_val and atr_val > 0 and last_closed:
+            trail_cands.append(last_closed["c"] - float(trail_atr_k) * float(atr_val))
+        if ema21_v and ema21_v > 0 and curr_px > ema21_v:
+            trail_cands.append(ema21_v - (0.1 * float(atr_val or 0)))
+        valid_cands = [float(floor_tick(x, tick)) for x in trail_cands if x > 0 and x < curr_px - float(tick)]
+        if valid_cands:
+            best_trail = max(valid_cands)
+            if active_stop is None or Decimal(str(best_trail)) >= Decimal(str(active_stop)) + tick:
+                action = "UPDATE TRAILING STOP"
+                reason_code = "TRAILING_STOP_ADVANCE"
+                recommended_stop = best_trail
+                reasons.append("Advance stop from %s to %.2f at +%.2fR" % (
+                    ("%.2f" % active_stop) if active_stop else "none", best_trail, r_mult))
+
+    if action == "HOLD" and not reasons:
+        reasons.append("Position healthy above stop%s; trend intact" % (
+            " (%.2f)" % active_stop if active_stop else ""))
+
+    return {
+        "symbol": sym,
+        "market": market,
+        "currency": "INR" if market == "IN" else "USD",
+        "trading_style": style,
+        "asset_type": asset_type,
+        "action": action,
+        "reason_code": reason_code,
+        "reasons": reasons,
+        "qty": qty,
+        "exit_qty": exit_qty if action == "PARTIAL EXIT" else (qty if action == "EXIT" else 0),
+        "entry": entry_px,
+        "current_price": curr_px,
+        "price_source": "current_quote" if quote_px is not None else ("completed_candle" if last_closed else "unavailable"),
+        "active_stop": active_stop,
+        "recommended_stop": recommended_stop,
+        "target": target_px,
+        "flat_by": "positional" if style == "positional" else (hm(flat_by_time) if flat_by_time else None),
+        "unrealized_pnl": unrealized_pnl,
+        "r_multiple": r_mult,
+        "indicators": {
+            "ema9": round(ema9_v, 4) if ema9_v else None,
+            "ema21": round(ema21_v, 4) if ema21_v else None,
+            "vwap": round(vwap_v, 4) if vwap_v else None,
+            "rsi14": round(rsi14, 2) if rsi14 else None,
+            "atr14": round(atr_val, 4) if atr_val else None,
+        },
+        "candle_context": {
+            "completed_candle": {
+                "bar_start": hm(last_closed["et"]), "bar_end": hm(last_closed["end"]),
+                "close": last_closed["c"], "low": last_closed["l"], "high": last_closed["h"],
+                "is_complete": True,
+            } if last_closed else None,
+            "forming_candle": forming_bar,
+            "current_quote": {"price": quote_px, "timestamp": quote_ts} if quote_px is not None else None,
+        },
+        "data_tier": d_tier,
+        "data_status": d_stat,
+        "provider": prov_name,
+        "evaluated_at": _market_iso(now_utc, market=market),
+        "evaluation_mode": "on_invocation",
+    }
+
+
+def update_exit_state(state_path, evaluations, now_utc, market="US"):
+    """Persist deduplicated exit decisions so repeated checks suppress duplicate HOLD/alert spam."""
+    if not state_path:
+        return evaluations
+    state = {"positions": {}, "history": []}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    state["positions"] = dict(loaded.get("positions") or {})
+                    state["history"] = list(loaded.get("history") or [])
+        except Exception:
+            pass
+    stamp = _market_iso(now_utc, market=market)
+    today = to_local(now_utc, market=market).date().isoformat()
+    for ev in evaluations:
+        sym = ev["symbol"]
+        fp = "|".join(str(x) for x in (
+            today, sym, ev.get("action"), ev.get("reason_code"),
+            ev.get("recommended_stop"), ev.get("exit_qty"), ev.get("trading_style")
+        ))
+        prev = state["positions"].get(sym)
+        if prev is None:
+            chg = "NEW"
+            dedup = False
+        elif prev.get("fingerprint") == fp:
+            chg = "UNCHANGED"
+            dedup = True
+        else:
+            chg = "UPDATED"
+            dedup = False
+        state["positions"][sym] = {
+            "fingerprint": fp, "action": ev.get("action"), "reason_code": ev.get("reason_code"),
+            "active_stop": ev.get("recommended_stop") or ev.get("active_stop"),
+            "last_evaluated_at": stamp,
+        }
+        if not dedup:
+            state["history"].append({
+                "at": stamp, "symbol": sym, "change": chg,
+                "action": ev.get("action"), "reason_code": ev.get("reason_code"),
+                "price": ev.get("current_price"),
+            })
+            state["history"] = state["history"][-200:]
+        ev["signal_change"] = chg
+        ev["deduplicated"] = dedup
+    d = os.path.dirname(state_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+        fh.write("\n")
+    return evaluations
+
+
+def _collect_open_positions(a, cfg, plan_doc=None):
+    positions = []
+    if getattr(a, "symbol", None):
+        sym = a.symbol.upper()
+        p = {
+            "symbol": sym,
+            "shares": float(getattr(a, "qty", None) or 1),
+            "avg_cost": float(a.entry if getattr(a, "entry", None) is not None else ((plan_doc or {}).get("entry") or 0)),
+            "stop": getattr(a, "stop_price", None) if getattr(a, "stop_price", None) is not None else (plan_doc or {}).get("stop"),
+            "trailing_stop": getattr(a, "trailing_stop", None),
+            "target": getattr(a, "target_price", None) if getattr(a, "target_price", None) is not None else (plan_doc or {}).get("target"),
+            "trading_style": getattr(a, "trading_style", None) or (plan_doc or {}).get("trading_style") or cfg.get("trading_style") or "intraday",
+            "asset_type": getattr(a, "asset_type", None) or (plan_doc or {}).get("asset_type") or "EQUITY",
+            "expiry": getattr(a, "expiry", None) or ((plan_doc or {}).get("option_contract") or {}).get("expiry"),
+            "exchange": getattr(a, "exchange", None) or (plan_doc or {}).get("exchange") or cfg.get("exchange"),
+            "tick_size": (plan_doc or {}).get("tick_size"),
+            "lot_size": (plan_doc or {}).get("lot_size") or 1,
+            "flat_by": (plan_doc or {}).get("flat_by"),
+        }
+        positions.append(p)
+        return positions
+    pf_path = getattr(a, "portfolio", "trader/portfolio.json")
+    if os.path.exists(pf_path):
+        pf = read_json(pf_path, "portfolio")
+        for pos in (pf.get("positions") or []) if isinstance(pf, dict) else []:
+            sym = str(pos.get("symbol") or pos.get("ticker") or "").upper()
+            if not sym or float(pos.get("shares") or 0) <= 0:
+                continue
+            merged = dict(pos)
+            merged["symbol"] = sym
+            if plan_doc and str(plan_doc.get("symbol") or "").upper() == sym:
+                for k in ("stop", "target", "trading_style", "flat_by", "tick_size", "lot_size", "asset_type", "exchange"):
+                    if merged.get(k) is None and plan_doc.get(k) is not None:
+                        merged[k] = plan_doc[k]
+                if not merged.get("expiry") and (plan_doc.get("option_contract") or {}).get("expiry"):
+                    merged["expiry"] = plan_doc["option_contract"]["expiry"]
+            positions.append(merged)
+    return positions
+
+
+def describe_management(ev):
+    curr = "\u20b9" if ev.get("market") == "IN" else "$"
+    chg = (" [%s]" % ev["signal_change"]) if ev.get("signal_change") else ""
+    px_txt = ("%s%.2f" % (curr, ev["current_price"])) if ev.get("current_price") is not None else "unavailable"
+    stp_txt = ("%s%.2f" % (curr, ev["active_stop"])) if ev.get("active_stop") is not None else "none"
+    pnl_txt = ("%s%+.2f" % (curr, ev["unrealized_pnl"])) if ev.get("unrealized_pnl") is not None else "n/a"
+    r_txt = ("%+.2fR" % ev["r_multiple"]) if ev.get("r_multiple") is not None else "n/a"
+    lines = [
+        "%s  %s (%s)%s | Current %s | Stop %s | P&L %s (%s) | Style %s" % (
+            ev["symbol"], ev["action"], ev["reason_code"], chg,
+            px_txt, stp_txt, pnl_txt, r_txt, ev.get("trading_style"),
+        )
+    ]
+    for r in ev.get("reasons") or []:
+        lines.append("  Reason: %s" % r)
+    if ev.get("recommended_stop") is not None:
+        lines.append("  New trailing stop: %s%.2f (never move stops further away)" % (curr, ev["recommended_stop"]))
+    if ev["action"] == "EXIT":
+        lines.append("  Next (paper gate): ticket.py flatten --symbol %s -> check.py -> yes -> ticket.approve" % ev["symbol"])
+    elif ev["action"] == "PARTIAL EXIT":
+        lines.append("  Next (paper gate): ticket.py flatten --symbol %s --qty %s -> check.py -> yes -> ticket.approve" % (
+            ev["symbol"], int(ev.get("exit_qty") or 1)))
+    return lines
+
+
+def cmd_manage(a):
+    cfg = read_config(a.config)
+    market = get_market_profile(a, cfg=cfg)
+    cfg = read_config(a.config, market=market)
+    now_utc = parse_now(a.now, market=market)
+    today = to_local(now_utc, market=market).date()
+    plan_doc = read_json(a.plan, "plan") if (getattr(a, "plan", None) and os.path.exists(a.plan)) else None
+    positions = _collect_open_positions(a, cfg, plan_doc=plan_doc)
+    if not positions:
+        if getattr(a, "json", False):
+            print(json.dumps({"positions": [], "note": "No open positions found.", "evaluation_mode": "on_invocation"}, indent=2))
+        else:
+            print("No open positions found. Evaluated on-invocation (%s). Nothing was placed." % now_utc.strftime("%Y-%m-%d %H:%M:%SZ"))
+        return 0
+    results = []
+    for pos in positions:
+        p_market = get_market_profile(a, sym=pos["symbol"], doc=pos, cfg=cfg)
+        ch = load_chart(
+            pos["symbol"], a.interval, today, offline=a.offline, market=p_market,
+            cfg=cfg, now_utc=now_utc if a.now else None, with_volume=True,
+        )
+        ev = evaluate_position(
+            pos, ch, now_utc, interval=a.interval, market=p_market, cfg=cfg,
+            trail_atr_k=a.trail_atr_k, trail_activate_r=a.trail_activate_r,
+            allow_partial=bool(a.allow_partial), simulated=bool(a.now),
+            instruments_path=getattr(a, "instruments", None),
+        )
+        results.append(ev)
+    state_target = getattr(a, "state", None) or (DEFAULT_EXIT_STATE if getattr(a, "write", False) else None)
+    if state_target and not getattr(a, "no_state", False):
+        update_exit_state(state_target, results, now_utc, market=market)
+    if getattr(a, "json", False):
+        print(json.dumps({"positions": results, "evaluation_mode": "on_invocation"}, indent=2))
+    else:
+        print("Open position check (%s, evaluated on-invocation):" % _market_iso(now_utc, market=market))
+        for ev in results:
+            for line in describe_management(ev):
+                print(line)
+        print("Paper workflow only. Nothing was placed.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Exit Planner (trader-exit): the stop and target before the entry.")
     sub = ap.add_subparsers(dest="cmd")
@@ -1218,7 +1808,7 @@ def main(argv=None):
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")
     p.add_argument("--entry-bar", type=int)
-    p.add_argument("--interval", choices=["5m", "1m"])
+    p.add_argument("--interval", choices=["1m", "5m", "15m", "30m", "1h"])
     p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
@@ -1239,12 +1829,41 @@ def main(argv=None):
     p.add_argument("--market", choices=["US", "IN"], help="market profile: US (default) or IN")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
+
+    for sub_name in ("manage", "check"):
+        pm = sub.add_parser(sub_name, help="evaluate open positions for HOLD / EXIT / PARTIAL EXIT / UPDATE TRAILING STOP")
+        pm.add_argument("--portfolio", default="trader/portfolio.json")
+        pm.add_argument("--plan", default="trader/plan.json")
+        pm.add_argument("--symbol", help="evaluate a single symbol")
+        pm.add_argument("--qty", type=float, help="position size when evaluating ad-hoc --symbol")
+        pm.add_argument("--entry", type=float, help="entry price override")
+        pm.add_argument("--stop", dest="stop_price", type=float, help="stop price override")
+        pm.add_argument("--trailing-stop", type=float, help="current trailing stop override")
+        pm.add_argument("--target", dest="target_price", type=float, help="target price override")
+        pm.add_argument("--trading-style", choices=["intraday", "positional"])
+        pm.add_argument("--asset-type", choices=["EQUITY", "FUTURES", "OPTIONS"])
+        pm.add_argument("--expiry", help="expiry date YYYY-MM-DD for derivatives")
+        pm.add_argument("--interval", choices=["1m", "5m", "15m", "30m", "1h"], default="5m")
+        pm.add_argument("--market", choices=["US", "IN"])
+        pm.add_argument("--exchange", choices=["NSE", "BSE"])
+        pm.add_argument("--instruments", default=None)
+        pm.add_argument("--config", default="trader/config.json")
+        pm.add_argument("--offline", metavar="PATH")
+        pm.add_argument("--now")
+        pm.add_argument("--trail-atr-k", type=float, default=1.5)
+        pm.add_argument("--trail-activate-r", type=float, default=1.0)
+        pm.add_argument("--allow-partial", action="store_true")
+        pm.add_argument("--state", metavar="PATH")
+        pm.add_argument("--no-state", action="store_true")
+        pm.add_argument("--write", action="store_true")
+        pm.add_argument("--json", action="store_true")
+
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"plan": cmd_plan, "show": cmd_show}[a.cmd](a)
+        return {"plan": cmd_plan, "show": cmd_show, "manage": cmd_manage, "check": cmd_manage}[a.cmd](a)
     except PlanError as e:
         print("exit.py: %s" % e, file=sys.stderr)
         return 1

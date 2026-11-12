@@ -52,6 +52,10 @@ python3 <SKILL_DIR>/trader-timemachine/timemachine.py run --plan trader/plan.jso
   3. Exact historical sample count and past hit rate.
   4. Whether `--now` or `--offline` was used (`historical` vs `live`).
 
+## Opt-in visualisations
+
+Default output is text/JSON only. Only when the user explicitly requests a chart, render equity curves or trade distributions via `../trader-alerts/visuals.py backtest --timemachine trader/timemachine.json` (see `guides/trader-visuals.md`).
+
 ## What it never does
 
 It never predicts tomorrow's price, never recommends taking a trade, never overrides stop/risk limits, and never places a broker order.

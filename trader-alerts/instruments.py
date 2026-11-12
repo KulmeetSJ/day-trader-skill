@@ -33,7 +33,7 @@ import calendar_in
 DEFAULT_CACHE_PATH = "trader/state/instruments.json"
 HISTORY_DIR = "trader/state/history"
 
-# Authoritative Index Instruments Metadata
+# Authoritative Index Instruments Metadata (analytical benchmarks, not tradable cash equities)
 INDEX_INSTRUMENTS = {
     "NIFTY": {
         "canonical_symbol": "NIFTY",
@@ -41,6 +41,7 @@ INDEX_INSTRUMENTS = {
         "name": "NIFTY 50",
         "series": "INDEX",
         "isin": "IN9002A01018",
+        "upstox_key": "NSE_INDEX|Nifty 50",
         "instrument_type": "INDEX",
         "instrument_identifier": "NIFTY",
         "tick_size": 0.05,
@@ -51,6 +52,7 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
     "BANKNIFTY": {
         "canonical_symbol": "BANKNIFTY",
@@ -58,6 +60,7 @@ INDEX_INSTRUMENTS = {
         "name": "NIFTY BANK",
         "series": "INDEX",
         "isin": "IN9002A01019",
+        "upstox_key": "NSE_INDEX|Nifty Bank",
         "instrument_type": "INDEX",
         "instrument_identifier": "BANKNIFTY",
         "tick_size": 0.05,
@@ -68,6 +71,7 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
     "FINNIFTY": {
         "canonical_symbol": "FINNIFTY",
@@ -75,6 +79,7 @@ INDEX_INSTRUMENTS = {
         "name": "NIFTY FINANCIAL SERVICES",
         "series": "INDEX",
         "isin": "IN9002A01020",
+        "upstox_key": "NSE_INDEX|Nifty Fin Service",
         "instrument_type": "INDEX",
         "instrument_identifier": "FINNIFTY",
         "tick_size": 0.05,
@@ -85,6 +90,7 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
     "MIDCPNIFTY": {
         "canonical_symbol": "MIDCPNIFTY",
@@ -92,6 +98,7 @@ INDEX_INSTRUMENTS = {
         "name": "NIFTY MIDCAP SELECT",
         "series": "INDEX",
         "isin": "IN9002A01021",
+        "upstox_key": "NSE_INDEX|NIFTY MID SELECT",
         "instrument_type": "INDEX",
         "instrument_identifier": "MIDCPNIFTY",
         "tick_size": 0.05,
@@ -102,6 +109,83 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
+    },
+    "NIFTYNXT50": {
+        "canonical_symbol": "NIFTYNXT50",
+        "exchange": "NSE",
+        "name": "NIFTY NEXT 50",
+        "series": "INDEX",
+        "isin": "",
+        "upstox_key": "NSE_INDEX|Nifty Next 50",
+        "instrument_type": "INDEX",
+        "instrument_identifier": "NIFTYNXT50",
+        "tick_size": 0.05,
+        "tick_size_unit": "INR",
+        "lot_size": 1,
+        "fo_lot_size": None,
+        "strike_interval": None,
+        "is_fo_eligible": False,
+        "is_cas_eligible": False,
+        "is_trade_to_trade": False,
+        "is_tradable_equity": False,
+    },
+    "NIFTY100": {
+        "canonical_symbol": "NIFTY100",
+        "exchange": "NSE",
+        "name": "NIFTY 100",
+        "series": "INDEX",
+        "isin": "",
+        "upstox_key": "NSE_INDEX|Nifty 100",
+        "instrument_type": "INDEX",
+        "instrument_identifier": "NIFTY100",
+        "tick_size": 0.05,
+        "tick_size_unit": "INR",
+        "lot_size": 1,
+        "fo_lot_size": None,
+        "strike_interval": None,
+        "is_fo_eligible": False,
+        "is_cas_eligible": False,
+        "is_trade_to_trade": False,
+        "is_tradable_equity": False,
+    },
+    "NIFTY200": {
+        "canonical_symbol": "NIFTY200",
+        "exchange": "NSE",
+        "name": "NIFTY 200",
+        "series": "INDEX",
+        "isin": "",
+        "upstox_key": "NSE_INDEX|Nifty 200",
+        "instrument_type": "INDEX",
+        "instrument_identifier": "NIFTY200",
+        "tick_size": 0.05,
+        "tick_size_unit": "INR",
+        "lot_size": 1,
+        "fo_lot_size": None,
+        "strike_interval": None,
+        "is_fo_eligible": False,
+        "is_cas_eligible": False,
+        "is_trade_to_trade": False,
+        "is_tradable_equity": False,
+    },
+    "NIFTY500": {
+        "canonical_symbol": "NIFTY500",
+        "exchange": "NSE",
+        "name": "NIFTY 500",
+        "series": "INDEX",
+        "isin": "",
+        "upstox_key": "NSE_INDEX|Nifty 500",
+        "instrument_type": "INDEX",
+        "instrument_identifier": "NIFTY500",
+        "tick_size": 0.05,
+        "tick_size_unit": "INR",
+        "lot_size": 1,
+        "fo_lot_size": None,
+        "strike_interval": None,
+        "is_fo_eligible": False,
+        "is_cas_eligible": False,
+        "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
     "SENSEX": {
         "canonical_symbol": "SENSEX",
@@ -109,6 +193,7 @@ INDEX_INSTRUMENTS = {
         "name": "BSE SENSEX",
         "series": "INDEX",
         "isin": "IN9002A01022",
+        "upstox_key": "BSE_INDEX|SENSEX",
         "instrument_type": "INDEX",
         "instrument_identifier": "SENSEX",
         "tick_size": 0.05,
@@ -119,6 +204,7 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
     "BANKEX": {
         "canonical_symbol": "BANKEX",
@@ -126,6 +212,7 @@ INDEX_INSTRUMENTS = {
         "name": "BSE BANKEX",
         "series": "INDEX",
         "isin": "IN9002A01023",
+        "upstox_key": "BSE_INDEX|BANKEX",
         "instrument_type": "INDEX",
         "instrument_identifier": "BANKEX",
         "tick_size": 0.05,
@@ -136,6 +223,7 @@ INDEX_INSTRUMENTS = {
         "is_fo_eligible": True,
         "is_cas_eligible": False,
         "is_trade_to_trade": False,
+        "is_tradable_equity": False,
     },
 }
 
@@ -677,8 +765,9 @@ def build_master_from_provider_records(records, fo_lots=None, effective_date=Non
     for raw_rec in (records or []):
         if not isinstance(raw_rec, dict):
             continue
-        ex = str(raw_rec.get("exchange") or "NSE").upper()
         seg = str(raw_rec.get("segment") or "").upper()
+        ex_fallback = "BSE" if seg.startswith("BSE") else "NSE"
+        ex = str(raw_rec.get("exchange") or ex_fallback).upper()
         itype = str(raw_rec.get("instrument_type") or "").upper()
         raw_sym = str(raw_rec.get("canonical_symbol") or raw_rec.get("trading_symbol") or raw_rec.get("symbol") or "").strip()
         if not raw_sym:
@@ -723,29 +812,36 @@ def build_master_from_provider_records(records, fo_lots=None, effective_date=Non
         except (TypeError, ValueError):
             lot_val = 1
 
+        is_index = seg.endswith("_INDEX") or itype == "INDEX" or is_index_symbol(canon)
         is_t2t = bool(raw_rec.get("is_trade_to_trade", False)) or seg in ("NSE_BE", "BSE_T") or itype in ("BE", "T")
+        idx_meta = INDEX_INSTRUMENTS.get(canon, {}) if is_index else {}
+        ikey_val = raw_rec.get("instrument_key") or idx_meta.get("upstox_key") or ""
         entry = {
             "canonical_symbol": canon,
             "symbol": canon,
             "exchange": ex,
             "segment": seg,
-            "name": raw_rec.get("name") or canon,
-            "series": raw_rec.get("series") or itype or "EQ",
+            "name": raw_rec.get("name") or idx_meta.get("name") or canon,
+            "series": raw_rec.get("series") or itype or ("INDEX" if is_index else "EQ"),
             "isin": raw_rec.get("isin") or "",
-            "instrument_key": raw_rec.get("instrument_key") or "",
+            "instrument_key": ikey_val,
+            "upstox_key": ikey_val,
             "instrument_token": raw_rec.get("instrument_token") or "",
-            "instrument_type": itype or ("EQUITY" if seg.endswith("_EQ") else ""),
+            "instrument_type": itype or ("INDEX" if is_index else ("EQUITY" if seg.endswith("_EQ") else "")),
             "tick_size": tick_inr,
             "tick_size_unit": "INR",
             "lot_size": lot_val,
-            "fo_lot_size": fo_map.get(canon) or (lot_val if is_deriv else None),
-            "is_fo_eligible": bool(canon in fo_map or is_deriv),
-            "is_cas_eligible": bool((canon in fo_map) and ex == "NSE"),
+            "fo_lot_size": fo_map.get(canon) or idx_meta.get("fo_lot_size") or (lot_val if is_deriv else None),
+            "is_fo_eligible": bool(canon in fo_map or is_deriv or idx_meta.get("is_fo_eligible")),
+            "is_cas_eligible": bool((not is_index) and (canon in fo_map) and ex == "NSE"),
             "is_trade_to_trade": is_t2t,
+            "is_tradable_equity": bool((not is_index) and (not is_deriv)),
             "provider": provider,
             "source_timestamp": ts,
             "effective_date": eff,
         }
+        if is_index and idx_meta.get("strike_interval") is not None:
+            entry["strike_interval"] = idx_meta["strike_interval"]
         if raw_rec.get("expiry") is not None:
             entry["expiry"] = raw_rec.get("expiry")
         if raw_rec.get("strike_price") is not None:

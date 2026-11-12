@@ -90,11 +90,13 @@ try:
     import calendar_in  # type: ignore
     import data_in  # type: ignore
     import instruments  # type: ignore
+    import visuals  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
     data_in = None
     instruments = None
+    visuals = None
 
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/KulmeetSJ/day-trader-skill)"
 YAHOO_HOSTS = ("https://query2.finance.yahoo.com", "https://query1.finance.yahoo.com")
@@ -291,10 +293,14 @@ SENSEX_CONSTITUENTS = [
 
 INDEX_INSTRUMENTS_CONSTITUENTS = [
     ("NIFTY", "NIFTY 50 Benchmark Index"),
-    ("BANKNIFTY", "NIFTY Bank Banking Index"),
+    ("BANKNIFTY", "NIFTY Bank Index"),
     ("FINNIFTY", "NIFTY Financial Services Index"),
     ("MIDCPNIFTY", "NIFTY Midcap Select Index"),
-    ("SENSEX", "BSE SENSEX 30 Index"),
+    ("NIFTYNXT50", "NIFTY Next 50 Index"),
+    ("NIFTY100", "NIFTY 100 Index"),
+    ("NIFTY200", "NIFTY 200 Index"),
+    ("NIFTY500", "NIFTY 500 Index"),
+    ("SENSEX", "BSE SENSEX Index"),
     ("BANKEX", "BSE BANKEX Index"),
 ]
 
@@ -1201,7 +1207,8 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strat
             if price is None and bars:
                 price = bars[-1][1]
             vol = meta.get("regularMarketVolume")
-        if price is None or price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
+        is_idx = bool(market == "IN" and symbols_in and symbols_in.is_index_symbol(sym))
+        if price is None or price < min_price or (min_volume > 0 and not is_idx and (vol is None or vol < min_volume)):
             counts["illiquid"] += 1
             continue
         if len(bars) < MIN_DAILY_BARS:
@@ -1213,9 +1220,13 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume, market="US", strat
         closes = [c for _, c in bars]
         tags, nums = find_setups(closes, strategy_cfg=strategy_cfg)
         if tags:
-            hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
-                         "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
-                         "volume": int(vol) if vol is not None else None})
+            hit_doc = {"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
+                       "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
+                       "volume": int(vol) if (vol is not None and (not is_idx or vol > 0)) else None}
+            if is_idx:
+                hit_doc["instrument_type"] = "INDEX"
+                hit_doc["is_tradable_equity"] = False
+            hits.append(hit_doc)
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most traded value first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -1364,7 +1375,8 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
                 vol = 0
             else:
                 vol = meta.get("regularMarketVolume") or 0
-        if bars[-1]["c"] < min_price or vol < min_volume:
+        is_idx = bool(market == "IN" and symbols_in and symbols_in.is_index_symbol(sym))
+        if bars[-1]["c"] < min_price or (not is_idx and vol < min_volume):
             counts["illiquid"] += 1
             continue
         counts["scanned"] += 1
@@ -1390,7 +1402,11 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
         counts["confirmed"] += 1
         h = orb_hit(full, n_range)
         if h:
-            hits.append(dict({"symbol": sym, "setups": ["orb"]}, **h))
+            hit_doc = dict({"symbol": sym, "setups": ["orb"]}, **h)
+            if market == "IN" and symbols_in and symbols_in.is_index_symbol(sym):
+                hit_doc["instrument_type"] = "INDEX"
+                hit_doc["is_tradable_equity"] = False
+            hits.append(hit_doc)
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
     for h in hits:
         del h["_t"]
@@ -1494,13 +1510,32 @@ def read_json(path, what=None, required=False):
         return None
 
 
+def _parse_symbol_list(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if "," in text:
+        parts = [p.strip().upper() for p in text.split(",") if p.strip()]
+    else:
+        upper = text.upper()
+        if symbols_in and symbols_in.is_index_symbol(upper):
+            parts = [symbols_in.normalize_index_name(upper)]
+        else:
+            parts = [s for s in re.split(r"[,\s]+", upper) if s]
+    out = []
+    for p in parts:
+        norm = symbols_in.normalize_index_name(p) if (symbols_in and symbols_in.is_index_symbol(p)) else p
+        out.append(norm)
+    return out
+
+
 def read_symbols(a, offline_syms=None):
     cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"
     cfg = read_json(cfg_path, "config", required=False) or {}
     cfg_syms = cfg.get("symbols")
     cfg_wl = cfg.get("watchlist")
     if getattr(a, "symbols", None):
-        syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
+        syms = _parse_symbol_list(a.symbols)
     elif getattr(a, "watchlist", None):
         syms = symbols_from_file(a.watchlist)
     elif getattr(a, "universe", None):
@@ -1509,14 +1544,19 @@ def read_symbols(a, offline_syms=None):
         syms = symbols_from_file(a.universe)
     elif cfg_syms:
         if isinstance(cfg_syms, list):
-            syms = [str(s).strip().upper() for s in cfg_syms if str(s).strip()]
+            syms = [
+                symbols_in.normalize_index_name(str(s).strip().upper())
+                if (symbols_in and symbols_in.is_index_symbol(str(s).strip().upper()))
+                else str(s).strip().upper()
+                for s in cfg_syms if str(s).strip()
+            ]
         else:
-            syms = [s for s in re.split(r"[,\s]+", str(cfg_syms).upper()) if s]
+            syms = _parse_symbol_list(cfg_syms)
     elif cfg_wl:
         if isinstance(cfg_wl, list):
             syms = [str(s).strip().upper() for s in cfg_wl if str(s).strip()]
         elif isinstance(cfg_wl, str) and not os.path.exists(cfg_wl) and ("," in cfg_wl or " " in cfg_wl):
-            syms = [s for s in re.split(r"[,\s]+", cfg_wl.upper()) if s]
+            syms = _parse_symbol_list(cfg_wl)
         else:
             syms = symbols_from_file(cfg_wl)
     elif offline_syms is not None:
@@ -1925,6 +1965,870 @@ def _p(x):
     return "{:,.2f}".format(x)
 
 
+def _format_ts_ist(ts_val):
+    if ts_val is None:
+        return None
+    if calendar_in:
+        dt = datetime.datetime.fromtimestamp(int(ts_val), tz=datetime.timezone.utc).astimezone(calendar_in.IST)
+        return dt.strftime("%Y-%m-%d %H:%M IST")
+    dt = datetime.datetime.fromtimestamp(int(ts_val), tz=datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+    return dt.strftime("%Y-%m-%d %H:%M IST")
+
+
+def analyze_index_series(sym, series_doc, interval="1d", ema_periods=(20, 50), idx_meta=None, quote=None):
+    """Compute technical trend, momentum, volatility, S/R, and F&O notes for an index from fetched bars."""
+    if not series_doc or visuals is None:
+        return {
+            "symbol": sym,
+            "status": "unavailable",
+            "instrument_type": "INDEX",
+            "is_tradable_equity": False,
+            "analytical_only": True,
+            "error": "No bar data returned for index %s" % sym,
+        }
+    try:
+        bars, vmeta = visuals.normalize_bars_payload(series_doc)
+    except Exception as e:
+        return {
+            "symbol": sym,
+            "status": "unavailable",
+            "instrument_type": "INDEX",
+            "is_tradable_equity": False,
+            "analytical_only": True,
+            "error": str(e),
+        }
+
+    closes = [b["c"] for b in bars]
+    last_bar = bars[-1]
+    last_close = round(float(last_bar["c"]), 2)
+    prev_close = float(bars[-2]["c"]) if len(bars) >= 2 else None
+    change_abs = round(last_close - prev_close, 2) if prev_close is not None else None
+    change_pct = round(((last_close - prev_close) / prev_close) * 100.0, 2) if (prev_close and prev_close > 0) else None
+    quote_price = float(quote["price"]) if (quote and quote.get("price") is not None) else last_close
+    quote_prev = float(quote["previous_close"]) if (quote and quote.get("previous_close") is not None) else prev_close
+    day_chg_pct = (
+        round(((quote_price - quote_prev) / quote_prev) * 100.0, 2)
+        if (quote_prev and quote_prev > 0) else change_pct
+    )
+
+    ema_map = {}
+    for p in ema_periods:
+        if len(closes) >= int(p):
+            es = visuals.compute_ema(closes, int(p))
+            val = es[-1] if es else None
+            ema_map["ema_%d" % int(p)] = round(float(val), 2) if val is not None else None
+        else:
+            ema_map["ema_%d" % int(p)] = None
+
+    p_fast = int(ema_periods[0]) if ema_periods else 20
+    p_slow = int(ema_periods[1]) if len(ema_periods) > 1 else 50
+    ef = ema_map.get("ema_%d" % p_fast)
+    eslow = ema_map.get("ema_%d" % p_slow)
+
+    if ef is not None and eslow is not None:
+        if last_close > ef > eslow:
+            ema_alignment = "bullish_aligned"
+            trend = "uptrend"
+        elif last_close < ef < eslow:
+            ema_alignment = "bearish_aligned"
+            trend = "downtrend"
+        elif ef > eslow:
+            ema_alignment = "bullish_pullback"
+            trend = "uptrend_pullback" if (day_chg_pct or 0) >= 0 else "range_bound"
+        elif ef < eslow:
+            ema_alignment = "bearish_bounce"
+            trend = "downtrend_bounce" if (day_chg_pct or 0) <= 0 else "range_bound"
+        else:
+            ema_alignment = "neutral"
+            trend = "range_bound"
+    elif ef is not None:
+        ema_alignment = "above_ema%d" % p_fast if last_close > ef else "below_ema%d" % p_fast
+        trend = "uptrend" if last_close > ef else "downtrend"
+    elif len(bars) >= 2:
+        ema_alignment = "insufficient_history"
+        trend = "uptrend" if (change_pct or 0) > 0.25 else ("downtrend" if (change_pct or 0) < -0.25 else "range_bound")
+    else:
+        ema_alignment = "insufficient_history"
+        trend = "insufficient_history"
+
+    vwap_series = visuals.compute_vwap(bars)
+    vwap_val = round(float(vwap_series[-1]), 2) if (vwap_series and vwap_series[-1] is not None) else None
+    total_vol = sum(float(b.get("v") or 0) for b in bars)
+    vwap_note = None if vwap_val is not None else "N/A (spot index cash volume unavailable)"
+
+    rsi_val = None
+    if len(closes) >= 15:
+        r_raw = rsi(closes, 14)
+        if r_raw is not None:
+            rsi_val = round(float(r_raw), 1)
+
+    atr_raw = visuals.compute_atr(bars, 14)
+    atr_val = round(float(atr_raw), 2) if atr_raw is not None else None
+    vol_pct = round((atr_val / last_close) * 100.0, 2) if (atr_val is not None and last_close > 0) else None
+
+    if len(bars) >= 2:
+        sup_raw, res_raw = visuals.compute_support_resistance(bars, lookback=min(20, len(bars)))
+        support = round(float(sup_raw), 2) if sup_raw is not None else None
+        resistance = round(float(res_raw), 2) if res_raw is not None else None
+    else:
+        support, resistance = None, None
+
+    breakout_level = None
+    breakdown_level = None
+    breakout_signal = None
+    if len(closes) >= 21:
+        breakout_level = round(max(closes[-21:-1]), 2)
+        breakdown_level = round(min(closes[-21:-1]), 2)
+        if last_close > breakout_level:
+            breakout_signal = "breakout_20_high"
+        elif last_close < breakdown_level:
+            breakout_signal = "breakdown_20_low"
+        else:
+            breakout_signal = "inside_20_range"
+
+    limitations = []
+    if len(bars) < 2:
+        limitations.append("Provider returned only %d bar(s) for interval '%s'; trend/EMA/RSI/S&R cannot be computed reliably." % (len(bars), interval))
+    elif len(bars) < p_slow:
+        limitations.append("Only %d bars available; %d-bar EMA is N/A." % (len(bars), p_slow))
+    if vwap_val is None:
+        limitations.append("Spot index has zero cash volume; VWAP is N/A.")
+
+    has_deriv = bool(idx_meta and idx_meta.get("has_derivatives"))
+    exch = (idx_meta or {}).get("exchange") or series_doc.get("exchange") or vmeta.get("exchange") or "NSE"
+    name = (idx_meta or {}).get("name") or series_doc.get("name") or sym
+    upstox_key = (idx_meta or {}).get("upstox_key") or series_doc.get("instrument_key")
+    last_ts_str = (
+        series_doc.get("last_data_timestamp")
+        or _format_ts_ist(last_bar.get("ts"))
+        or vmeta.get("last_data_timestamp")
+    )
+
+    return {
+        "symbol": sym,
+        "name": name,
+        "exchange": exch,
+        "instrument_type": "INDEX",
+        "is_tradable_equity": False,
+        "analytical_only": True,
+        "has_derivatives": has_deriv,
+        "execution_note": (
+            "Spot index is analytical only (cannot place equity orders). Trade via NSE/BSE index F&O derivatives."
+            if has_deriv else
+            "Spot index is analytical only (no direct equity or derivative execution)."
+        ),
+        "upstox_key": upstox_key,
+        "provider": series_doc.get("provider") or series_doc.get("source") or vmeta.get("provider") or "unknown",
+        "data_status": series_doc.get("data_status") or vmeta.get("data_tier") or "HISTORICAL",
+        "is_live": bool(series_doc.get("is_live") or (quote and quote.get("is_live"))),
+        "interval": interval,
+        "bar_count": len(bars),
+        "last_data_timestamp": last_ts_str,
+        "status": "limited" if len(bars) < 2 else "ok",
+        "price": round(quote_price, 2),
+        "last_bar_close": last_close,
+        "change_abs": change_abs,
+        "change_pct": day_chg_pct,
+        "volume": int(total_vol) if total_vol > 0 else None,
+        "emas": ema_map,
+        "ema_alignment": ema_alignment,
+        "trend": trend,
+        "vwap": vwap_val,
+        "vwap_note": vwap_note,
+        "rsi_14": rsi_val,
+        "atr_14": atr_val,
+        "volatility_pct": vol_pct,
+        "support": support,
+        "resistance": resistance,
+        "breakout_20_high": breakout_level,
+        "breakdown_20_low": breakdown_level,
+        "breakout_signal": breakout_signal,
+        "limitations": limitations,
+    }
+
+
+def summarize_index_breadth(results):
+    """Derive a cross-index market breadth & regime view strictly from analyzed index results."""
+    valid = [r for r in results if r.get("status") == "ok"]
+    limited = [r for r in results if r.get("status") == "limited"]
+    failed = [r for r in results if r.get("status") == "unavailable"]
+    adv = sum(1 for r in valid if (r.get("change_pct") or 0) > 0)
+    dec = sum(1 for r in valid if (r.get("change_pct") or 0) < 0)
+    flat = sum(1 for r in valid if r.get("change_pct") == 0)
+    bull_trend = sum(1 for r in valid if str(r.get("trend") or "").startswith("uptrend"))
+    bear_trend = sum(1 for r in valid if str(r.get("trend") or "").startswith("downtrend"))
+
+    if not valid:
+        regime = "insufficient_data"
+    elif bull_trend > 0 and bear_trend > 0:
+        regime = "mixed_divergent"
+    elif bull_trend >= max(1, (len(valid) * 2 + 2) // 3) and adv >= dec and bear_trend == 0:
+        regime = "broad_bullish"
+    elif bear_trend >= max(1, (len(valid) * 2 + 2) // 3) and dec >= adv and bull_trend == 0:
+        regime = "broad_bearish"
+    elif adv > dec:
+        regime = "mild_bullish"
+    elif dec > adv:
+        regime = "mild_bearish"
+    else:
+        regime = "range_bound"
+
+    by_sym = {r["symbol"]: r for r in valid}
+    divergence_notes = []
+    if "NIFTY" in by_sym and "BANKNIFTY" in by_sym:
+        n_chg = by_sym["NIFTY"].get("change_pct") or 0
+        b_chg = by_sym["BANKNIFTY"].get("change_pct") or 0
+        if (n_chg > 0.2 and b_chg < -0.2) or (n_chg < -0.2 and b_chg > 0.2):
+            divergence_notes.append("NIFTY (%+.2f%%) and BANKNIFTY (%+.2f%%) are diverging." % (n_chg, b_chg))
+    if "NIFTY" in by_sym and "MIDCPNIFTY" in by_sym:
+        n_chg = by_sym["NIFTY"].get("change_pct") or 0
+        m_chg = by_sym["MIDCPNIFTY"].get("change_pct") or 0
+        if abs(m_chg - n_chg) >= 0.75:
+            leader = "Midcaps outperforming" if m_chg > n_chg else "Large-caps outperforming"
+            divergence_notes.append("%s (NIFTY %+.2f%% vs MIDCPNIFTY %+.2f%%)." % (leader, n_chg, m_chg))
+
+    rsis = [r["rsi_14"] for r in valid if r.get("rsi_14") is not None]
+    avg_rsi = round(sum(rsis) / float(len(rsis)), 1) if rsis else None
+    neutral_cnt = max(0, len(valid) - bull_trend - bear_trend)
+
+    return {
+        "analyzed_count": len(valid),
+        "limited_count": len(limited),
+        "failed_count": len(failed),
+        "advancing": adv,
+        "declining": dec,
+        "unchanged": flat,
+        "bullish": bull_trend,
+        "bearish": bear_trend,
+        "neutral": neutral_cnt,
+        "avg_rsi": avg_rsi,
+        "bullish_trend_count": bull_trend,
+        "bearish_trend_count": bear_trend,
+        "regime": regime,
+        "divergence_notes": divergence_notes,
+    }
+
+
+def cmd_indices(a):
+    t0 = time.time()
+    cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"
+    cfg = read_json(cfg_path, "config", required=False) or {}
+    now = parse_now(a.now, market="IN") if getattr(a, "now", None) else parse_now(None, market="IN")
+    interval = getattr(a, "interval", "1d") or "1d"
+    range_str = getattr(a, "range_str", None) or ("3mo" if interval == "1d" else "5d")
+
+    ema_periods = []
+    for tok in str(getattr(a, "ema", "20,50") or "20,50").split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) > 0:
+            ema_periods.append(int(tok))
+    if not ema_periods:
+        ema_periods = [20, 50]
+
+    if getattr(a, "symbols", None):
+        raw_syms = _parse_symbol_list(a.symbols)
+    elif symbols_in:
+        raw_syms = list(symbols_in.BENCHMARK_INDICES)
+    else:
+        raw_syms = [sym for sym, _ in INDEX_INSTRUMENTS_CONSTITUENTS]
+
+    syms = []
+    invalid = {}
+    for s in raw_syms:
+        if symbols_in:
+            if not symbols_in.is_index_symbol(s):
+                invalid[s] = "Not a recognized Indian benchmark index symbol: %s" % s
+                continue
+            canon = symbols_in.normalize_index_name(s)
+        else:
+            canon = s.upper()
+        if canon not in syms:
+            syms.append(canon)
+
+    if not syms and invalid:
+        raise ScanError("; ".join(invalid.values()))
+
+    if data_in is None:
+        raise ScanError("trader-alerts/data_in.py is required for index scanning")
+
+    try:
+        provider = (
+            data_in.OfflineMarketDataProvider(a.offline)
+            if getattr(a, "offline", None)
+            else data_in.get_provider(source=getattr(a, "source", None), config=cfg)
+        )
+    except Exception as e:
+        raise ScanError("Market data provider error: %s" % e)
+
+    provider_name = getattr(provider, "provider_name", "offline" if getattr(a, "offline", None) else "unknown")
+    results = []
+    failed = dict(invalid)
+    series_by_sym = {}
+    now_ist = _to_ist_aware(now) if getattr(a, "now", None) else None
+
+    for k, sym in enumerate(syms):
+        idx_meta = symbols_in.get_index_metadata(sym) if symbols_in else None
+        exch = getattr(a, "exchange", None) or (idx_meta["exchange"] if idx_meta else (cfg.get("exchange") or "NSE"))
+        if k and getattr(a, "pause", 0) and not getattr(a, "offline", None):
+            SLEEP(a.pause)
+        try:
+            if interval == "1d":
+                series = provider.get_historical_data(
+                    sym, range_str=range_str, interval="1d", exchange=exch, now=getattr(a, "now", None)
+                )
+            else:
+                series = provider.get_intraday_data(
+                    sym, interval=interval, range_str=range_str, exchange=exch, now=getattr(a, "now", None)
+                )
+            quote = None
+            try:
+                quote = data_in._call_with_optional_now(provider.get_quote, sym, exchange=exch, now=now_ist)
+            except Exception:
+                quote = None
+            analysis = analyze_index_series(
+                sym, series, interval=interval, ema_periods=tuple(ema_periods), idx_meta=idx_meta, quote=quote
+            )
+            results.append(analysis)
+            if series and series.get("bars"):
+                series_by_sym[sym] = series
+            elif series and series.get("c"):
+                series_by_sym[sym] = series
+        except Exception as e:
+            err_msg = str(e)
+            failed[sym] = err_msg
+            results.append({
+                "symbol": sym,
+                "name": (idx_meta or {}).get("name") or sym,
+                "exchange": exch,
+                "instrument_type": "INDEX",
+                "is_tradable_equity": False,
+                "analytical_only": True,
+                "status": "unavailable",
+                "error": err_msg,
+            })
+
+    breadth = summarize_index_breadth(results)
+    ok_results = [r for r in results if r.get("status") == "ok"]
+    data_statuses = [r.get("data_status") for r in results if r.get("status") in ("ok", "limited") and r.get("data_status")]
+    overall_status = data_statuses[0] if data_statuses else "UNAVAILABLE"
+    last_ts_vals = [r.get("last_data_timestamp") for r in results if r.get("last_data_timestamp")]
+
+    doc = {
+        "created_by": "trader-scanner",
+        "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": "indices",
+        "market": "IN",
+        "provider": provider_name,
+        "data_tier": overall_status,
+        "data_status": overall_status,
+        "is_live": any(bool(r.get("is_live")) for r in results),
+        "interval": interval,
+        "range": range_str,
+        "last_data_timestamp": max(last_ts_vals) if last_ts_vals else None,
+        "ema_periods": ema_periods,
+        "breadth": breadth,
+        "indices": results,
+        "failed": failed,
+        "note": "Spot indices are analytical instruments only (not tradable equities). Use NSE/BSE F&O contracts for execution.",
+    }
+    if getattr(a, "now", None):
+        doc["simulated_at"] = _market_iso(now, market="IN")
+
+    chart_path = getattr(a, "chart", None)
+    chart_written = None
+    if chart_path and visuals and series_by_sym:
+        if (len(syms) == 1 and syms[0] in series_by_sym) or len(series_by_sym) == 1:
+            only_sym = syms[0] if (len(syms) == 1 and syms[0] in series_by_sym) else next(iter(series_by_sym))
+            s_doc = dict(series_by_sym[only_sym])
+            r_match = next((r for r in results if r.get("symbol") == only_sym), None)
+            if r_match:
+                s_doc.setdefault("last_data_timestamp", r_match.get("last_data_timestamp"))
+                s_doc.setdefault("data_tier", r_match.get("data_status"))
+                s_doc.setdefault("provider", r_match.get("provider"))
+            svg = visuals.render_candlestick_svg(s_doc, ema_periods=tuple(ema_periods), show_vwap=True)
+            visuals.write_svg(chart_path, svg)
+            chart_written = chart_path
+        else:
+            svg = visuals.render_index_comparison_svg(doc)
+            visuals.write_svg(chart_path, svg)
+            chart_written = chart_path
+    if chart_written:
+        doc["chart_path"] = chart_written
+
+    out_path = getattr(a, "out", "trader/index_scan.json")
+    if not getattr(a, "no_write", False) and out_path:
+        write_json(out_path, doc)
+
+    if getattr(a, "json", False):
+        print(json.dumps(dict(doc, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0 if (ok_results or any(r.get("status") == "limited" for r in results)) else 1
+
+    if not getattr(a, "quiet", False):
+        local = to_local(now, market="IN")
+        print("Indian Index Scan, %s IST | provider=%s status=%s | interval=%s (%s)" % (
+            local.strftime("%a %Y-%m-%d %H:%M"), provider_name, overall_status, interval, range_str))
+        print("Breadth: %d advancing, %d declining, %d flat | regime=%s" % (
+            breadth["advancing"], breadth["declining"], breadth["unchanged"], breadth["regime"]))
+        if breadth["divergence_notes"]:
+            for note in breadth["divergence_notes"]:
+                print("  Regime note: %s" % note)
+        print("%-12s %-5s %10s %8s %-14s %-16s %6s %8s" % (
+            "Index", "Exch", "Price", "Chg%", "Trend", "EMA Align", "RSI14", "VWAP"))
+        print("-" * 88)
+        for r in results:
+            if r.get("status") == "unavailable":
+                print("%-12s %-5s  UNAVAILABLE: %s" % (r["symbol"], r.get("exchange", "-"), r.get("error", "")))
+                continue
+            chg_s = ("%+.2f%%" % r["change_pct"]) if r.get("change_pct") is not None else "N/A"
+            rsi_s = ("%.1f" % r["rsi_14"]) if r.get("rsi_14") is not None else "N/A"
+            vwap_s = _p(r["vwap"]) if r.get("vwap") is not None else "N/A"
+            print("%-12s %-5s %10s %8s %-14s %-16s %6s %8s" % (
+                r["symbol"], r["exchange"], _p(r["price"]), chg_s,
+                r.get("trend", "-"), r.get("ema_alignment", "-"), rsi_s, vwap_s))
+            if r.get("limitations"):
+                print("  Note (%s): %s" % (r["symbol"], "; ".join(r["limitations"])))
+        if chart_written:
+            print("Chart written: %s" % chart_written)
+        if not getattr(a, "no_write", False) and out_path:
+            print("Wrote %s." % out_path)
+    return 0 if (ok_results or any(r.get("status") == "limited" for r in results)) else 1
+
+
+_ENTRY_MOD_CACHE = None
+
+
+def _load_entry_mod():
+    """Load sibling trader-entry/entry.py cleanly without mutating global module state."""
+    global _ENTRY_MOD_CACHE
+    if _ENTRY_MOD_CACHE is not None:
+        return _ENTRY_MOD_CACHE
+    import importlib.util
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    epath = os.path.join(base, "trader-entry", "entry.py")
+    if not os.path.exists(epath):
+        raise ScanError("trader-entry/entry.py not found at %s" % epath)
+    spec = importlib.util.spec_from_file_location("_trader_entry_shared", epath)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _ENTRY_MOD_CACHE = mod
+    return mod
+
+
+def _series_to_entry_chart(entry_mod, sym, s, market="US", interval="5m", is_offline=False, in_provider=None):
+    """Convert normalized scanner series dict into a parsed trader-entry chart dict."""
+    ts = list(s.get("t") or [])
+    cs = list(s.get("c") or [])
+    os_ = list(s.get("o") or cs)
+    hs = list(s.get("h") or cs)
+    ls = list(s.get("l") or cs)
+    vs = list(s.get("v") or [0] * len(cs))
+    meta_in = dict(s.get("meta") or {})
+    meta_out = dict(meta_in)
+    meta_out["symbol"] = sym
+    meta_out["dataGranularity"] = interval
+    if s.get("gmtoffset") is not None:
+        meta_out["gmtoffset"] = s["gmtoffset"]
+    if s.get("exchange"):
+        meta_out["exchangeName"] = s["exchange"]
+    if s.get("currency"):
+        meta_out["currency"] = s["currency"]
+    if s.get("instrumentType"):
+        meta_out["instrumentType"] = s["instrumentType"]
+    if cs:
+        meta_out.setdefault("regularMarketPrice", cs[-1])
+    v8 = {
+        "chart": {
+            "result": [{
+                "meta": meta_out,
+                "timestamp": ts,
+                "indicators": {
+                    "quote": [{
+                        "open": os_,
+                        "high": hs,
+                        "low": ls,
+                        "close": cs,
+                        "volume": vs,
+                    }]
+                },
+            }],
+            "error": None,
+        }
+    }
+    chart = entry_mod.parse_chart(json.dumps(v8), sym)
+    chart["market"] = market
+    prov = s.get("provider") or ("offline" if is_offline else (in_provider or "yahoo"))
+    tier = s.get("data_tier") or s.get("data_status") or ("FIXTURE" if is_offline else "DELAYED")
+    dstatus = s.get("data_status") or ("HISTORICAL" if is_offline else "DELAYED")
+    chart["provider"] = prov
+    chart["source"] = s.get("source") or prov
+    chart["data_tier"] = tier
+    chart["provider_data_status"] = dstatus
+    chart["is_live"] = bool(s.get("is_live", False))
+    chart["is_offline"] = bool(is_offline)
+    q = s.get("quote")
+    if isinstance(q, dict) and q.get("price") is not None:
+        chart["current_quote"] = {
+            "price": float(q["price"]),
+            "timestamp": q.get("timestamp"),
+            "last_data_timestamp": q.get("last_data_timestamp"),
+            "provider": q.get("provider") or prov,
+            "data_status": q.get("data_status") or dstatus,
+            "is_live": bool(q.get("is_live", False)),
+        }
+    return chart
+
+
+def update_scan_signal_state(state_path, hits, now_utc, market="US"):
+    """Deduplicate repeated intraday scanner hits against persisted signal state."""
+    state = {"signals": {}, "updated_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if state_path and os.path.exists(state_path):
+        try:
+            with open(state_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and isinstance(loaded.get("signals"), dict):
+                state = loaded
+        except Exception:
+            pass
+    sigs = state.setdefault("signals", {})
+    for hit in hits:
+        key = "%s:%s:%s:%s" % (market, hit.get("symbol"), hit.get("setup"), hit.get("interval"))
+        dec = hit.get("decision") or {}
+        ez = dec.get("entry_zone") or {}
+        trig = hit.get("trigger") or {}
+        sig = [
+            hit.get("decision_state"),
+            hit.get("sub_state"),
+            trig.get("t"),
+            ez.get("low"),
+            ez.get("high"),
+            dec.get("invalidation_level"),
+        ]
+        prev = sigs.get(key)
+        if prev is None:
+            change = "NEW"
+        elif prev.get("signature") != sig:
+            change = "UPDATED"
+        else:
+            change = "UNCHANGED"
+        hit["signal_change"] = change
+        hit["deduplicated"] = (change == "UNCHANGED")
+        sigs[key] = {
+            "signature": sig,
+            "decision_state": hit.get("decision_state"),
+            "last_seen": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "first_seen": (prev or {}).get("first_seen") or now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    state["updated_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if state_path:
+        write_json(state_path, state)
+    return hits
+
+
+_STATE_PRIORITY = {
+    "ENTRY CONFIRMED": 0,
+    "ENTRY CANDIDATE": 1,
+    "SETUP": 2,
+    "NO TRADE": 3,
+}
+
+
+def scan_intraday(symbols, now_utc, strategies=None, interval="5m", range_str=None,
+                  market="US", min_price=0.0, min_volume=0, min_volume_x=None,
+                  or_minutes=15, lookback_bars=12, offline=None, cfg=None,
+                  max_confirm=MAX_CONFIRM, pause=0.0, a=None, include_all=False,
+                  max_chase_pct=None, max_chase_atr=None, state_path=None,
+                  exchange="NSE", instruments_path=None):
+    """Evaluate intraday entry setups at any session time using intraday bars.
+
+    Does not require morning-only opening-range continuity for non-ORB setups
+    (`breakout_intraday`, `vwap_reclaim`, `ema_alignment`, `rsi_momentum`).
+    """
+    entry_mod = _load_entry_mod()
+    if interval not in entry_mod.INTERVALS:
+        raise ScanError("unsupported intraday interval %s (use %s)" % (interval, "/".join(entry_mod.INTERVALS)))
+    strategies = list(strategies or ["breakout_intraday", "vwap_reclaim", "ema_alignment"])
+    rng = range_str or ("2d" if interval == "1m" else "5d")
+    cfg = cfg or (entry_mod.read_config(None, market=market))
+    now_aware = now_utc.replace(tzinfo=datetime.timezone.utc) if now_utc.tzinfo is None else now_utc.astimezone(datetime.timezone.utc)
+    cutoff = int(now_aware.timestamp())
+
+    series_map = {}
+    failed = {}
+    in_provider = _get_in_provider(cfg) if (market == "IN" and offline is None) else None
+
+    # Deduplicate requested symbols while preserving order
+    clean_syms = []
+    seen_s = set()
+    for s in symbols:
+        su = s.strip().upper()
+        if su and su not in seen_s:
+            seen_s.add(su)
+            clean_syms.append(su)
+
+    if offline is not None:
+        for sym in clean_syms:
+            if sym in offline:
+                series_map[sym] = offline[sym]
+            elif market == "IN":
+                ys = to_yahoo(sym, market="IN")
+                if ys in offline:
+                    series_map[sym] = offline[ys]
+                else:
+                    failed[sym] = "not in offline cache"
+            else:
+                failed[sym] = "not in offline cache"
+    elif market == "IN" and in_provider != "yahoo":
+        series_map, prov_failed = _fetch_in_provider_series(
+            in_provider, clean_syms, rng, interval, pause, exchange=exchange, now=now_utc)
+        failed.update(prov_failed)
+    else:
+        candidates = list(clean_syms)
+        if max_confirm and len(candidates) > max_confirm:
+            st1, st1_errs = fetch_spark(candidates, "5d", "1d", pause, a=a, market=market)
+            ranked = []
+            for sym in candidates:
+                is_idx = bool(market == "IN" and symbols_in and symbols_in.is_index_symbol(sym))
+                s1 = st1.get(sym)
+                if not s1 or not s1.get("c"):
+                    if is_idx:
+                        ranked.append((1e18, sym))
+                    continue
+                px = s1["c"][-1]
+                dv = px * (s1["v"][-1] if s1.get("v") else 0)
+                if not is_idx and min_price and px < min_price:
+                    continue
+                ranked.append((dv, sym))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            candidates = [sym for _, sym in ranked[:max_confirm]]
+        for idx_i, sym in enumerate(candidates):
+            try:
+                raw = yahoo_get(chart_path(to_yahoo(sym, market), rng, interval, market))
+                series_map[sym] = parse_chart(raw, sym)
+            except ScanError as e:
+                failed[sym] = str(e)
+            if pause and idx_i < len(candidates) - 1:
+                time.sleep(pause)
+
+    hits = []
+    skipped = {"below_min_price": 0, "below_min_volume": 0, "no_bars": 0}
+    eval_errors = {}
+
+    for sym in clean_syms:
+        s = series_map.get(sym)
+        if not s:
+            continue
+        is_idx = bool(market == "IN" and symbols_in and symbols_in.is_index_symbol(sym))
+        bars_tc = sorted(
+            [(int(t), c) for t, c in zip(s.get("t") or [], s.get("c") or []) if t is not None and int(t) <= cutoff and c is not None],
+            key=lambda x: x[0],
+        )
+        if not bars_tc:
+            skipped["no_bars"] += 1
+            continue
+        last_px = bars_tc[-1][1]
+        bars_v = [v for t, v in zip(s.get("t") or [], s.get("v") or []) if t is not None and int(t) <= cutoff and v is not None]
+        cum_vol = sum(bars_v) if bars_v else 0
+        if not is_idx:
+            if min_price and last_px < min_price:
+                skipped["below_min_price"] += 1
+                continue
+            if min_volume and cum_vol < min_volume:
+                skipped["below_min_volume"] += 1
+                continue
+
+        try:
+            chart = _series_to_entry_chart(
+                entry_mod, sym, s, market=market, interval=interval,
+                is_offline=(offline is not None), in_provider=in_provider)
+        except Exception as e:
+            eval_errors[sym] = str(e)
+            continue
+
+        for strat in strategies:
+            try:
+                res = entry_mod.evaluate(
+                    chart, now_utc, setup=strat, or_minutes=or_minutes,
+                    interval=interval, min_volume_x=min_volume_x, cfg=cfg,
+                    market=market, trading_style="intraday",
+                    exchange=exchange, instruments_path=instruments_path,
+                    lookback_bars=lookback_bars, max_chase_pct=max_chase_pct,
+                    max_chase_atr=max_chase_atr,
+                )
+            except Exception as e:
+                eval_errors["%s:%s" % (sym, strat)] = str(e)
+                continue
+
+            d_state = res.get("decision_state", "NO TRADE")
+            sub_state = res.get("sub_state")
+            is_actionable_or_setup = d_state in ("ENTRY CONFIRMED", "ENTRY CANDIDATE", "SETUP")
+            is_index_analytical = is_idx and res.get("status") in ("triggered", "waiting")
+            if not include_all and not is_actionable_or_setup and not is_index_analytical:
+                continue
+
+            dec = res.get("decision") or {}
+            ind = res.get("indicators") or {}
+            hits.append({
+                "symbol": sym,
+                "setup": res.get("setup") or strat,
+                "interval": interval,
+                "instrument_type": "INDEX" if is_idx else "EQUITY",
+                "is_tradable_equity": (not is_idx),
+                "analytical_only": is_idx,
+                "decision_state": d_state,
+                "sub_state": sub_state,
+                "actionable": bool(dec.get("actionable")),
+                "status": res.get("status"),
+                "price": dec.get("current_price") if dec.get("current_price") is not None else last_px,
+                "level": res.get("level"),
+                "trigger": res.get("trigger"),
+                "decision": dec,
+                "anti_chasing": res.get("anti_chasing"),
+                "sizing_preview": res.get("sizing_preview"),
+                "indicators": ind,
+                "candle_context": res.get("candle_context"),
+                "data_status": res.get("data_status"),
+                "provider_data_status": res.get("provider_data_status"),
+                "provider": res.get("provider"),
+                "is_live": bool(res.get("is_live", False)),
+                "is_live_signal": bool(res.get("is_live_signal", False)),
+            })
+
+    if state_path:
+        update_scan_signal_state(state_path, hits, now_utc, market=market)
+
+    hits.sort(key=lambda h: (
+        _STATE_PRIORITY.get(h.get("decision_state"), 9),
+        0 if not h.get("analytical_only") else 1,
+        -((h.get("decision") or {}).get("reward_risk") or 0.0),
+        h.get("symbol") or "",
+        h.get("setup") or "",
+    ))
+    return {
+        "hits": hits,
+        "evaluated_symbols": len(series_map),
+        "requested_symbols": len(clean_syms),
+        "failed": failed,
+        "eval_errors": eval_errors,
+        "skipped": skipped,
+        "interval": interval,
+        "range": rng,
+        "strategies": strategies,
+        "provider": ("offline" if offline is not None else (in_provider or "yahoo")),
+    }
+
+
+def cmd_intraday(a):
+    t0 = time.time()
+    market = get_market_profile(a)
+    entry_mod = _load_entry_mod()
+    cfg = entry_mod.read_config(getattr(a, "config", None), market=market)
+    now = parse_now(a.now, market=market) if getattr(a, "now", None) else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    if getattr(a, "at", None):
+        if getattr(a, "now", None):
+            raise ScanError("pass --now or --at, not both")
+        t_local = parse_hhmm(a.at, "--at", market=market)
+        d = trading_day(now, market=market)
+        now = local_to_utc(datetime.datetime(d.year, d.month, d.day, t_local.hour, t_local.minute), market=market)
+
+    interval = getattr(a, "interval", "5m") or "5m"
+    setups_raw = getattr(a, "setups", None) or "breakout_intraday,vwap_reclaim,ema_alignment"
+    strategies = [s.strip() for s in setups_raw.split(",") if s.strip()]
+
+    offline = None
+    offline_syms = None
+    offline_errors = {}
+    if getattr(a, "offline", None):
+        offline, offline_errors = load_offline(a.offline, market=market)
+        offline_syms = sorted(offline.keys())
+
+    if getattr(a, "indices", False):
+        if market != "IN" or not symbols_in:
+            raise ScanError("--indices is only supported for India market")
+        raw_idx = (getattr(a, "symbols", None) or "NIFTY,BANKNIFTY,FINNIFTY,INDIAVIX")
+        syms = [s.strip().upper() for s in raw_idx.split(",") if s.strip()]
+    else:
+        syms = read_symbols(a, offline_syms=offline_syms)
+
+    if not syms:
+        raise ScanError("no symbols to scan (pass --symbols, --watchlist, --universe, --indices, or --offline)")
+
+    res = scan_intraday(
+        syms, now, strategies=strategies, interval=interval,
+        range_str=getattr(a, "range", None), market=market,
+        min_price=a.min_price, min_volume=a.min_volume,
+        min_volume_x=getattr(a, "min_volume_x", None),
+        or_minutes=getattr(a, "or_minutes", 15),
+        lookback_bars=getattr(a, "lookback_bars", 12),
+        offline=offline, cfg=cfg, max_confirm=getattr(a, "max_confirm", MAX_CONFIRM),
+        pause=a.pause, a=a, include_all=getattr(a, "include_all", False),
+        max_chase_pct=getattr(a, "max_chase_pct", None),
+        max_chase_atr=getattr(a, "max_chase_atr", None),
+        state_path=getattr(a, "state", None),
+        exchange=getattr(a, "exchange", "NSE"),
+    )
+
+    hits = res["hits"]
+    if offline_errors:
+        merged_failed = dict(offline_errors)
+        merged_failed.update(res.get("failed") or {})
+        res["failed"] = merged_failed
+    local = to_local(now, market=market)
+    tz_lbl = "IST" if market == "IN" else "ET"
+    doc = {
+        "created_by": "trader-scanner",
+        "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": "intraday",
+        "evaluation_mode": "on_invocation",
+        "market": market,
+        "provider": res["provider"],
+        "interval": res["interval"],
+        "range": res["range"],
+        "strategies": res["strategies"],
+        "evaluated_at": _market_iso(now, market=market),
+        "requested_symbols": res["requested_symbols"],
+        "evaluated_symbols": res["evaluated_symbols"],
+        "hit_count": len(hits),
+        "actionable_count": sum(1 for h in hits if h.get("actionable")),
+        "hits": hits,
+        "skipped": res["skipped"],
+        "failed": res["failed"],
+        "eval_errors": res["eval_errors"],
+    }
+    out_path = getattr(a, "out", None) or "trader/intraday_scan.json"
+    should_write = (not getattr(a, "no_write", False)) and bool(out_path)
+    if should_write:
+        write_json(out_path, doc)
+
+    if a.json:
+        print(json.dumps(dict(doc, seconds=round(time.time() - t0, 1)), indent=2))
+        return 0
+
+    if not a.quiet:
+        print("Intraday Scan (%s, %s %s) | provider=%s interval=%s setups=%s" % (
+            market, local.strftime("%Y-%m-%d %H:%M"), tz_lbl,
+            res["provider"], res["interval"], ",".join(res["strategies"])))
+        if not hits:
+            print("No intraday setups matching criteria across %d symbols." % res["evaluated_symbols"])
+        else:
+            print("%-12s %-18s %-15s %-18s %9s %-17s %9s %8s" % (
+                "Symbol", "Setup", "State", "Sub-State", "Price", "Entry Zone", "Stop", "Chg"))
+            print("-" * 102)
+            for h in hits:
+                dec = h.get("decision") or {}
+                ez = dec.get("entry_zone") or {}
+                ez_s = ("%s..%s" % (money(ez["low"], market), money(ez["high"], market))) if (ez.get("low") is not None and ez.get("high") is not None) else "-"
+                stop_s = money(dec["stop_preview"], market) if dec.get("stop_preview") is not None else "-"
+                sub_s = (h.get("sub_state") or "-")[:18]
+                tag = h.get("signal_change") or "-"
+                sym_lbl = h["symbol"] + (" [IDX]" if h.get("analytical_only") else "")
+                print("%-12s %-18s %-15s %-18s %9s %-17s %9s %8s" % (
+                    sym_lbl[:12], str(h["setup"])[:18], str(h["decision_state"])[:15],
+                    sub_s, money(h["price"], market), ez_s[:17], stop_s, tag))
+        if should_write:
+            print("Wrote %s." % out_path)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Chart Scanner (trader-scanner): daily setups and opening-range breakouts.")
     sub = ap.add_subparsers(dest="cmd")
@@ -1973,12 +2877,48 @@ def main(argv=None):
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this local market time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30/15:00)")
+    p = sub.add_parser("intraday", help="evaluate actionable intraday setups at any session time")
+    common(p, 5.0, 0)
+    p.add_argument("--interval", default="5m", help="intraday candle interval: 1m, 5m, 15m, 30m, 1h (default: 5m)")
+    p.add_argument("--range", help="lookback range for warmup bars (default: 2d for 1m, 5d otherwise)")
+    p.add_argument("--setups", "--setup", default="breakout_intraday,vwap_reclaim,ema_alignment",
+                   help="comma-separated intraday setups (breakout_intraday,vwap_reclaim,ema_alignment,rsi_momentum,orb)")
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--lookback-bars", type=int, default=12, help="swing lookback bars for breakout_intraday (default: 12)")
+    p.add_argument("--min-volume-x", type=float, help="minimum volume multiple vs intraday baseline")
+    p.add_argument("--max-chase-pct", type=float, help="anti-chasing max distance percentage above trigger")
+    p.add_argument("--max-chase-atr", type=float, help="anti-chasing max ATR multiple above trigger")
+    p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,
+                   help="charts to evaluate when scanning a large universe (%d; 0 = all)" % MAX_CONFIRM)
+    p.add_argument("--at", help="evaluate as of local market time HH:MM")
+    p.add_argument("--indices", action="store_true", help="scan Indian benchmark indices (analytical only)")
+    p.add_argument("--include-all", action="store_true", help="include NO TRADE symbols in results")
+    p.add_argument("--state", help="JSON file path for repeated-run signal deduplication")
+    p.add_argument("--write", action="store_true", help=argparse.SUPPRESS)
+    p = sub.add_parser("indices", help="analyze Indian market indices (trend, EMA, RSI, S/R, regime)")
+    p.add_argument("--symbols", help="comma-separated index symbols or aliases (default: all 10 major benchmarks)")
+    p.add_argument("--exchange", choices=["NSE", "BSE"], default=None, help="exchange override")
+    p.add_argument("--interval", default="1d", choices=["1m", "5m", "15m", "1h", "1d"],
+                   help="bar interval (default 1d)")
+    p.add_argument("--range", dest="range_str", default=None, help="range to fetch (default 3mo for 1d, 5d intraday)")
+    p.add_argument("--ema", default="20,50", help="comma-separated EMA periods (default 20,50)")
+    p.add_argument("--source", default=None, help="provider override (upstox/yahoo)")
+    p.add_argument("--offline", metavar="PATH", help="offline fixture folder instead of network")
+    p.add_argument("--now", help="override clock (IST)")
+    p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests")
+    p.add_argument("--out", default="trader/index_scan.json", help="output JSON path (default trader/index_scan.json)")
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--config", default="trader/config.json", help="path to config JSON")
+    p.add_argument("--chart", metavar="PATH", default=None,
+                   help="opt-in: render SVG chart (candlestick for 1 index, comparison for multiple) to PATH")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
+        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb, "intraday": cmd_intraday, "indices": cmd_indices}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1

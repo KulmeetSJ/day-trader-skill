@@ -137,6 +137,23 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
   prediction that the price gets there.
 - Long side only. v2 plans longs only.
 
+## Intraday Position & Exit Management (`exit.py manage` / `check`)
+
+Evaluate open trades at any hour during an active session against live or latest intraday candles (`1m|5m|15m|30m|1h`), active stops, VWAP/EMA deterioration, risk targets, and session/expiry constraints:
+
+```
+python3 <SKILL_DIR>/trader-exit/exit.py manage --plan trader/plan.json --config trader/config.json
+python3 <SKILL_DIR>/trader-exit/exit.py manage --symbol RELIANCE --entry 2855.40 --stop 2835.00 --target 2896.20 --qty 26 --market IN --interval 5m --state trader/state/exit_state.json
+```
+
+- **Action taxonomy**: `HOLD`, `UPDATE TRAILING STOP`, `PARTIAL EXIT`, `EXIT`, or fail-closed `NO_ACTION` (`STALE_DATA` / `NO_DATA`).
+- **Trading style & expiry**: Intraday trades enforce `flat_by` cutoffs (`15:55` ET / `15:20` IST or CAS V1 cutoff); positional equity trades (`--trading-style positional`) do not force evening square-off; derivative contracts warn/exit approaching expiry.
+- **On-invocation & deduplicated**: Checks current market conditions whenever invoked and optionally tracks repeat-run transitions (`NEW` / `UPDATED` / `UNCHANGED`) via `--state`.
+
+## Opt-in visualisations
+
+Default output is text/JSON only. Only when the user explicitly requests a chart, render entry/stop/target levels via `../trader-alerts/visuals.py entry-exit` using `trader/plan.json` and fetched bars (see `guides/trader-visuals.md`).
+
 ## What it never does
 
 It never places an order, never sizes a position, never widens a stop to

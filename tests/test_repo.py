@@ -82,7 +82,7 @@ class Repo(unittest.TestCase):
             d for d in os.listdir(ROOT)
             if not d.startswith(".git") and d not in (".agents", ".env", "agents", "dist", "trader")
         )
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "guides", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

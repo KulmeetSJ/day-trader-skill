@@ -185,6 +185,10 @@ split.
 - No projections: never say what a trade will make. A target is a plan, not a forecast.
 - Free Yahoo prices are unofficial and can lag. The broker's price is the one that fills.
 
+## Opt-in visualisations & index safety
+
+Default output is text/JSON only; only generate options payoff / portfolio charts via `../trader-alerts/visuals.py` when explicitly requested (see `guides/trader-visuals.md`). Spot benchmark indices (`NIFTY`, `BANKNIFTY`, `SENSEX`, etc.) are analytical only and refused for equity sizing -- size index F&O derivative contracts instead.
+
 ## What it never does
 
 It never places, approves or schedules an order, never raises a limit on its

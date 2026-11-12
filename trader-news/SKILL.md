@@ -50,6 +50,10 @@ python3 <SKILL_DIR>/trader-news/news.py --tickers AAPL --offline <FIXTURE_DIR> -
 3. Explicitly warn before an entry when fresh earnings releases, trading halts, restatements, M&A news, or dilution/offering announcements appear.
 4. Preserve market timezones (`ET` for US, `IST` for India) and clearly note when `--offline` fixtures or `--now` replay mode is used.
 
+## Opt-in visualisations
+
+Default output is text/tables only. Only when the user explicitly requests a chart, render a catalyst timeline via `../trader-alerts/visuals.py news --news ...` from saved news JSON (see `guides/trader-visuals.md`).
+
 ## What it never does
 
 It never generates trade signals, never overrides a risk limit, and never places a broker order.

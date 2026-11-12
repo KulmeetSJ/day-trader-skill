@@ -66,8 +66,9 @@ python3 <SKILL_DIR>/trader-alerts/alerts.py reset <ALERT_ID>
 Subcommands of `alerts.py`:
 - `clock`: `--now`, `--json`, `--market US|IN`, `--cas`, `--symbol`, `--instruments`
 - `readiness`: `--market US|IN`, `--config`, `--instruments`, `--portfolio`, `--now`, `--json`
-- `quote`: `[symbols ...]`, `--holdings`, `--portfolio`, `--plan`, `--write [PATH]`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
-- `history`: `symbol`, `--interval 1m|5m|1d`, `--range 1d|5d|1mo|1y`, `--write [PATH]`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
+- `quote`: `[symbols ...]`, `--holdings`, `--portfolio`, `--plan`, `--write [PATH]`, `--exchange NSE|BSE`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN` (supports equities, F&O symbols, and Indian benchmark indices like `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `SENSEX`)
+- `history`: `symbol`, `--exchange NSE|BSE`, `--interval 1m|5m|15m|1h|1d`, `--range 1d|5d|1mo|1y`, `--write [PATH]`, `--chart PATH` (opt-in SVG from fetched bars), `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
+- `visuals.py`: standalone opt-in SVG chart CLI (`candlestick`, `entry-exit`, `indices`, `options-payoff`, `portfolio`, `risk`, `backtest`, `fundamentals`, `news`) reusing saved JSON files; follow `guides/trader-visuals.md` and generate charts ONLY when explicitly requested.
 - `check`: `--rules`, `--state`, `--prices-out`, `--no-write`, `--source`, `--config`, `--offline DIR`, `--now`, `--json`, `--market US|IN`
 - `add`: `--rules`, `--state`, `--symbol`, (`--above` | `--below` | `--stop` | `--target` | `--pct` | `--opening-bell` | `--at HH:MM` | `--from-plan`), `--plan`, `--config`, `--label`, `--before-close`, `--date`, `--direction up|down`, `--rearm`, `--note`, `--id`, `--market US|IN`
 - `list`: `--rules`, `--state`, `--market US|IN`
@@ -88,4 +89,5 @@ Subcommands of `alerts.py`:
 
 - Education and market monitoring tools, not financial advice.
 - Upstox integration is strictly read-only for market data and never places orders. Order placement happens only in `trader-broker` after `trader-risk` PASS today and an explicit typed `yes` from the user.
+- `rules_from_plan` (`alerts.py add --from-plan`) honors raised `trailing_stop` values when present in `trader/plan.json`, updating the active stop alert while keeping alert evaluation purely informational.
 - Keep `UPSTOX_ANALYTICS_TOKEN` and all broker credentials in local `.env` or process environment variables only. Never paste or ask for tokens or secrets in chat.

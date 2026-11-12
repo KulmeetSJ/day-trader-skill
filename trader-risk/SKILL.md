@@ -180,6 +180,10 @@ it is after the 3:30 entry cutoff: it is an exit.
 - Free Yahoo prices are unofficial and can lag; the broker's price is the one
   that fills, and a stop can fill worse than its price in a fast market.
 
+## Opt-in visualisations & index safety
+
+Default output is text/JSON only; only render exposure/drawdown charts via `../trader-alerts/visuals.py risk` when explicitly requested (see `guides/trader-visuals.md`). Spot benchmark indices (`asset_type: INDEX`) are analytical only and always BLOCKED as equity orders (use index F&O derivatives instead).
+
 ## What it never does
 
 It never places an order, never edits an order to make it pass, never

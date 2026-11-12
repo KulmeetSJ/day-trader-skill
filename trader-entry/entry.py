@@ -74,11 +74,13 @@ try:
     import symbols_in  # type: ignore
     import instruments  # type: ignore
     import data_in  # type: ignore
+    import visuals  # type: ignore
 except ImportError:
     calendar_in = None
     symbols_in = None
     instruments = None
     data_in = None
+    visuals = None
 
 try:
     import scan as scanner_mod  # type: ignore
@@ -91,7 +93,16 @@ BACKOFF = 5.0    # seconds before the one retry after an HTTP 429
 GRACE = 2        # seconds after a bar closes before watch asks for it
 SETTLE = 60      # seconds a closed bar may wait for Yahoo's data to catch up
 HOSTS = ("query2", "query1")
-INTERVALS = {"1m": 60, "5m": 300}
+INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+INTRADAY_DECISION_SETUPS = (
+    "breakout_intraday",
+    "vwap_reclaim",
+    "ema_alignment",
+    "ma_crossover",
+    "trend",
+    "rsi_momentum",
+)
+DEFAULT_SIGNAL_STATE = "trader/state/signals.json"
 DEFAULTS = {"no_entries_before": "09:45", "no_entries_after": "15:30"}
 DEFAULTS_IN = {"no_entries_before": "09:30", "no_entries_after": "15:00"}
 EPOCH = datetime.datetime(1970, 1, 1)
@@ -823,11 +834,17 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
             raise EntryError("Market data provider error: %s" % e)
         use_legacy_mock = (prov.provider_name == "yahoo" and yahoo_get is not _ORIG_YAHOO_GET)
         today = today or to_local(utc_now(), market=market).date()
+        need_warmup = setup in INTRADAY_DECISION_SETUPS
         if prov.provider_name == "yahoo":
             rng = chart_range(day or today, today, interval)
+            if need_warmup and rng == "1d":
+                rng = "5d"
         else:
             back = (today - (day or today)).days
-            rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
+            if need_warmup and back <= 0:
+                rng = "5d"
+            else:
+                rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
         if use_legacy_mock:
             fetch_sym = symbols_in.to_yahoo_symbol(sym) if symbols_in else yahoo_symbol(sym)
             text = yahoo_get(chart_path(fetch_sym, rng, interval))
@@ -880,10 +897,27 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
                     prov.supports(data_in.CAPABILITY_LIVE_QUOTES)
                     and eff_c_prov not in ("yahoo", "offline", "simulated")
                 )
+                if now is None and ch["is_live_capable"]:
+                    try:
+                        q = prov.get_quote(sym, exchange=exch)
+                        if isinstance(q, dict) and q.get("price") is not None:
+                            ch["current_quote"] = {
+                                "price": float(q["price"]),
+                                "timestamp": q.get("timestamp"),
+                                "last_data_timestamp": q.get("last_data_timestamp"),
+                                "provider": q.get("provider") or eff_c_prov,
+                                "data_status": q.get("data_status"),
+                                "is_live": bool(q.get("is_live", False)),
+                            }
+                    except Exception:
+                        pass
     else:
         today = today or to_local(utc_now(), market=market).date()
         fetch_sym = symbols_in.to_yahoo_symbol(sym) if (market == "IN" and symbols_in) else yahoo_symbol(sym)
-        text = yahoo_get(chart_path(fetch_sym, chart_range(day or today, today, interval), interval))
+        rng = chart_range(day or today, today, interval)
+        if setup in INTRADAY_DECISION_SETUPS and rng == "1d" and yahoo_get is _ORIG_YAHOO_GET:
+            rng = "5d"
+        text = yahoo_get(chart_path(fetch_sym, rng, interval))
         ch = parse_chart(text, sym)
         ch["is_offline"] = False
         ch["provider"] = "yahoo"
@@ -1050,6 +1084,10 @@ def _resolve_entry_tick(symbol, market="US", chart=None, cfg=None, exchange=None
         asset_up = str(chart.get("asset_type") or "").upper()
         if asset_up != "INDEX":
             raise EntryError("Chart metadata for %s specifies missing/invalid tick_size: %r" % (symbol, raw_c_tick))
+    if market == "IN" and symbols_in and symbols_in.is_index_symbol(symbol) and not symbols_in.is_derivative_symbol(symbol):
+        idx_meta = symbols_in.get_index_metadata(symbol)
+        idx_exch = exchange or (chart.get("exchange") if isinstance(chart, dict) else None) or (idx_meta["exchange"] if idx_meta else eff_exch)
+        return _tick_step(market), False, idx_exch
     if market == "IN" and instruments is not None:
         inst_path = instruments_path or (cfg or {}).get("instruments_path") or getattr(instruments, "DEFAULT_CACHE_PATH", None)
         if inst_path and os.path.isfile(inst_path):
@@ -1344,23 +1382,453 @@ def _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open
     return res
 
 
+def _ema_series(closes, period):
+    if visuals is not None:
+        return visuals.compute_ema(closes, period)
+    n = int(period)
+    if n <= 0 or not closes or len(closes) < n:
+        return [None] * len(closes or [])
+    vals = [None] * (n - 1)
+    prev = sum(float(x) for x in closes[:n]) / float(n)
+    vals.append(prev)
+    k = 2.0 / float(n + 1)
+    for c in closes[n:]:
+        prev = (float(c) - prev) * k + prev
+        vals.append(prev)
+    return vals
+
+
+def _vwap_series(bars):
+    if not bars:
+        return None
+    if visuals is not None:
+        return visuals.compute_vwap(bars)
+    total_v = sum(float(b.get("v") or 0) for b in bars)
+    if total_v <= 0:
+        return None
+    out, cpv, cv = [], 0.0, 0.0
+    for b in bars:
+        v = float(b.get("v") or 0)
+        tp = (float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0
+        if v > 0:
+            cpv += tp * v
+            cv += v
+        out.append((cpv / cv) if cv > 0 else None)
+    return out
+
+
+def _atr_val(bars, period=14):
+    if visuals is not None:
+        val = visuals.compute_atr(bars, period=period)
+        if val is not None:
+            return val
+    if not bars or len(bars) < 2:
+        return (float(bars[-1]["h"]) - float(bars[-1]["l"])) if bars else None
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = float(bars[i]["h"]), float(bars[i]["l"]), float(bars[i - 1]["c"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    use = trs[-int(period):]
+    return (sum(use) / float(len(use))) if use else None
+
+
+def _rolling_avg_vol(bars, idx, lookback=20):
+    start = max(0, idx - int(lookback))
+    prev = [float(b.get("v") or 0) for b in bars[start:idx] if float(b.get("v") or 0) > 0]
+    if not prev:
+        return None
+    return sum(prev) / float(len(prev))
+
+
+def _tick_fmt(val, market="US", tick_size=None, explicit_tick=False):
+    if val is None:
+        return None
+    if tick_size is not None and explicit_tick:
+        return _round_tick(val, _tick_step(market, tick_size=tick_size))
+    return r2(val)
+
+
+def _sizing_estimate(entry_px, stop_px, cfg, market="US", is_fo=False, lot_size=1):
+    """Read-only whole-share / lot sizing preview from config without writing orders."""
+    if not isinstance(cfg, dict) or entry_px is None or stop_px is None or entry_px <= stop_px:
+        return None
+    rps = float(entry_px) - float(stop_px)
+    if rps <= 0:
+        return None
+    loss_key = "max_loss_per_trade_inr" if market == "IN" else "max_loss_per_trade_usd"
+    max_order_key = "max_order_inr" if market == "IN" else "max_order_usd"
+    max_loss = cfg.get(loss_key) or cfg.get("max_loss_per_trade")
+    budget = cfg.get("budget")
+    if max_loss is None and budget is None:
+        return None
+    by_risk = int(float(max_loss) // rps) if max_loss else None
+    cash_cap = None
+    if budget is not None:
+        buf_pct = float(cfg.get("cash_buffer_pct") or 0)
+        avail = float(budget) * max(0.0, 1.0 - buf_pct / 100.0)
+        pos_pct = float(cfg.get("max_position_pct") or 100.0)
+        cap_val = min(avail, float(budget) * (pos_pct / 100.0))
+        if cfg.get(max_order_key):
+            cap_val = min(cap_val, float(cfg[max_order_key]))
+        cash_cap = int(cap_val // float(entry_px))
+    caps = [c for c in (by_risk, cash_cap) if c is not None]
+    qty = min(caps) if caps else 0
+    lot = max(1, int(lot_size or 1))
+    if lot > 1:
+        qty = (qty // lot) * lot
+    return {
+        "qty": max(0, int(qty)),
+        "lot_size": lot,
+        "risk_per_unit": round(rps, 4),
+        "estimated_max_loss": round(max(0, int(qty)) * rps, 2),
+        "notional": round(max(0, int(qty)) * float(entry_px), 2),
+    }
+
+
+def _build_candle_context(bars, pending, chart, market="US", eff_tick=0.01, explicit_tick=False):
+    last_b = bars[-1] if bars else None
+    last_doc = None
+    if last_b:
+        last_doc = {
+            "bar_start": hm(last_b["et"]),
+            "bar_end": hm(last_b["end"]),
+            "bar_index": last_b["slot"],
+            "open": _tick_fmt(last_b["o"], market, eff_tick, explicit_tick),
+            "high": _tick_fmt(last_b["h"], market, eff_tick, explicit_tick),
+            "low": _tick_fmt(last_b["l"], market, eff_tick, explicit_tick),
+            "close": _tick_fmt(last_b["c"], market, eff_tick, explicit_tick),
+            "volume": int(last_b.get("v") or 0),
+            "is_complete": True,
+        }
+    form_doc = None
+    if pending:
+        form_doc = {
+            "bar_start": hm(pending["et"]),
+            "bar_end": hm(pending["end"]),
+            "close_so_far": _tick_fmt(pending["c"], market, eff_tick, explicit_tick),
+            "high_so_far": _tick_fmt(pending["h"], market, eff_tick, explicit_tick),
+            "low_so_far": _tick_fmt(pending["l"], market, eff_tick, explicit_tick),
+            "is_complete": False,
+        }
+    q_raw = chart.get("current_quote") if isinstance(chart, dict) else None
+    quote_doc = None
+    if isinstance(q_raw, dict) and q_raw.get("price") is not None:
+        q_ts = q_raw.get("timestamp")
+        quote_doc = {
+            "price": _tick_fmt(q_raw["price"], market, eff_tick, explicit_tick),
+            "timestamp": q_raw.get("last_data_timestamp") or (_market_iso(utc_of(q_ts), market=market) if q_ts else None),
+            "provider": q_raw.get("provider") or chart.get("provider"),
+            "is_live": bool(q_raw.get("is_live", False)),
+            "data_status": q_raw.get("data_status"),
+        }
+    return {
+        "completed_candle": last_doc,
+        "forming_candle": form_doc,
+        "current_quote": quote_doc,
+    }
+
+
+def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, indicators,
+                              local, eval_day, day, step, market, eff_tick, explicit_tick,
+                              cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                              is_simulated, session_is_open, replay_full_session, cutoff,
+                              max_chase_pct=None, max_chase_atr=None):
+    """Assign ENTRY CONFIRMED / ENTRY CANDIDATE / SETUP / NO TRADE + anti-chasing & R:R preview."""
+    tick = _tick_step(market, tick_size=eff_tick)
+    cctx = _build_candle_context(bars, pending, chart, market=market, eff_tick=eff_tick, explicit_tick=explicit_tick)
+    res["candle_context"] = cctx
+    if indicators:
+        res["indicators"] = indicators
+
+    curr_px = None
+    px_source = None
+    if cctx["current_quote"] is not None:
+        curr_px = float(cctx["current_quote"]["price"])
+        px_source = "current_quote"
+    elif bars:
+        curr_px = float(bars[-1]["c"])
+        px_source = "completed_candle"
+
+    atr_val = indicators.get("atr14") if isinstance(indicators, dict) else None
+    if atr_val is None and bars:
+        atr_val = _atr_val(all_bars or bars, period=14)
+    chase_pct_lim = float(max_chase_pct if max_chase_pct is not None else cfg.get("max_chase_pct", 1.5))
+    chase_atr_lim = float(max_chase_atr if max_chase_atr is not None else cfg.get("max_chase_atr", 1.0))
+
+    anchor = None
+    if trig is not None:
+        anchor = float(lvl) if lvl is not None else float(trig["c"])
+    elif lvl is not None:
+        anchor = float(lvl)
+
+    zone = None
+    if anchor is not None and anchor > 0:
+        pct_tol = anchor * (chase_pct_lim / 100.0)
+        atr_tol = (atr_val * chase_atr_lim) if (atr_val is not None and atr_val > 0) else pct_tol
+        tol = max(2.0 * tick, min(pct_tol, atr_tol))
+        z_low = _floor_tick(max(tick, anchor - 0.25 * tol), tick=tick)
+        z_high = _round_tick(anchor + tol, tick=tick)
+        if z_high <= z_low:
+            z_high = _round_tick(z_low + 2.0 * tick, tick=tick)
+        zone = {"low": z_low, "high": z_high, "anchor": _tick_fmt(anchor, market, eff_tick, explicit_tick)}
+    res["entry_zone"] = zone
+
+    inv_level = res.get("invalidation_level")
+    if inv_level is None and trig is not None:
+        inv_anchor = min(float(trig["l"]), float(lvl) if lvl is not None else float(trig["l"]))
+        inv_level = _floor_tick(inv_anchor, tick=tick)
+        if inv_level >= float(trig["c"]):
+            inv_level = _floor_tick(float(trig["c"]) - tick, tick=tick)
+        if inv_level > 0:
+            res["invalidation_level"] = inv_level
+    elif inv_level is None and anchor is not None:
+        ema21_v = (indicators or {}).get("ema21")
+        vwap_v = (indicators or {}).get("vwap")
+        cand_invs = [x for x in (ema21_v, vwap_v) if x is not None and 0 < float(x) < anchor]
+        if cand_invs:
+            inv_level = _floor_tick(max(cand_invs) - tick, tick=tick)
+        elif atr_val:
+            inv_level = _floor_tick(max(tick, anchor - atr_val), tick=tick)
+        if inv_level and inv_level > 0:
+            res["invalidation_level"] = inv_level
+
+    # Stop & target preview aligned to exit rules
+    stop_preview = None
+    orr = res.get("opening_range")
+    ref_entry = curr_px if (curr_px is not None and trig is not None) else (float(trig["c"]) if trig else anchor)
+    if setup in ("orb", "options_orb") and orr and ref_entry is not None:
+        mid_s = _floor_tick((float(orr["high"]) + float(orr["low"])) / 2.0, tick=tick)
+        low_s = _floor_tick(float(orr["low"]), tick=tick)
+        stop_preview = mid_s if mid_s < ref_entry else (low_s if low_s < ref_entry else inv_level)
+    elif inv_level is not None and ref_entry is not None and inv_level < ref_entry:
+        stop_preview = float(inv_level)
+    elif ref_entry is not None and atr_val:
+        stop_preview = _floor_tick(max(tick, ref_entry - atr_val), tick=tick)
+
+    targets_preview = None
+    rr_preview = None
+    if ref_entry is not None and stop_preview is not None and stop_preview < ref_entry:
+        rps = float(ref_entry) - float(stop_preview)
+        if rps / float(ref_entry) >= 0.0005:
+            t1 = _round_tick(ref_entry + rps, tick=tick)
+            t2 = _round_tick(ref_entry + 2.0 * rps, tick=tick)
+            targets_preview = {"t1_1r": t1, "t2_2r": t2}
+            rr_preview = r2((t2 - float(ref_entry)) / rps)
+    res["stop_preview"] = stop_preview
+    res["targets_preview"] = targets_preview
+    res["reward_risk"] = rr_preview
+    lot_sz = ((res.get("option_contract") or {}).get("lot_size") or 1)
+    res["sizing_preview"] = _sizing_estimate(ref_entry, stop_preview, cfg, market=market, lot_size=lot_sz)
+
+    # Post-trigger invalidation & anti-chasing checks
+    invalidated_bar = None
+    if trig is not None and inv_level is not None:
+        for b in bars:
+            if b["slot"] > trig["slot"] and float(b["c"]) < float(inv_level):
+                invalidated_bar = b
+                break
+        if invalidated_bar is None and curr_px is not None and curr_px <= float(inv_level):
+            invalidated_bar = {"et": local, "c": curr_px}
+
+    ext_pct = None
+    ext_atr = None
+    is_extended = False
+    if trig is not None and curr_px is not None and zone is not None:
+        if curr_px > float(zone["high"]):
+            is_extended = True
+            ext_pct = r2(100.0 * (curr_px / float(zone["high"]) - 1.0))
+            if atr_val and atr_val > 0:
+                ext_atr = r2((curr_px - float(trig["c"])) / atr_val)
+
+    anti_chase = {
+        "chase_blocked": bool(is_extended),
+        "current_price": _tick_fmt(curr_px, market, eff_tick, explicit_tick),
+        "price_source": px_source,
+        "entry_zone_high": zone["high"] if zone else None,
+        "extension_pct_over_zone": ext_pct,
+        "extension_atr": ext_atr,
+    }
+    res["anti_chasing"] = anti_chase
+
+    # Decide actionable classification
+    no_trade_reason = None
+    sub_state = None
+    d_state = "NO TRADE"
+
+    if res.get("analytical_only"):
+        d_state = "NO TRADE"
+        sub_state = "ANALYTICAL_ONLY_INDEX"
+        no_trade_reason = "Spot index is analytical only (use NSE/BSE index F&O or --setup options_orb for tradable contracts)"
+    elif res.get("status") == "no-data" or (setup == "vwap_reclaim" and (indicators or {}).get("vwap_unavailable")):
+        d_state = "NO TRADE"
+        sub_state = "STALE_DATA" if data_status == "stale" else "NO_DATA"
+        no_trade_reason = res.get("reason") or "required market data unavailable"
+    elif res.get("phase") == "closed" and not replay_full_session and not session_is_open:
+        d_state = "NO TRADE"
+        sub_state = "MARKET_CLOSED"
+        no_trade_reason = res.get("reason") or "market closed"
+    elif res.get("status") == "expired" or (local >= cutoff and not replay_full_session):
+        d_state = "NO TRADE"
+        sub_state = "EXPIRED"
+        no_trade_reason = res.get("reason") or "entry window expired"
+    elif session_is_open and data_status == "stale" and not is_fixture and not is_simulated:
+        d_state = "NO TRADE"
+        sub_state = "STALE_DATA"
+        no_trade_reason = "stale market data during live session; fail-closed blocking new entry"
+    elif trig is not None:
+        if invalidated_bar is not None:
+            d_state = "NO TRADE"
+            sub_state = "INVALIDATED"
+            no_trade_reason = (
+                "setup triggered at %s (%.2f) but subsequently invalidated below %.2f (current %.2f)"
+                % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(inv_level), float(curr_px))
+            )
+        elif is_extended:
+            d_state = "NO TRADE"
+            sub_state = "EXTENDED"
+            no_trade_reason = (
+                "do not chase: triggered at %s (%.2f), current price %.2f is +%s%% above entry zone upper bound %.2f"
+                % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px),
+                   ext_pct if ext_pct is not None else 0.0, float(zone["high"]))
+            )
+        else:
+            d_state = "ENTRY CONFIRMED"
+            sub_state = "ACTIONABLE_IN_ZONE"
+    else:
+        # waiting / forming / pre-open
+        forming_px = pending["c"] if pending else None
+        probe_px = curr_px if cctx["current_quote"] is not None else forming_px
+        near_lvl = False
+        if lvl is not None and bars and float(bars[-1]["c"]) >= float(lvl) * 0.995:
+            near_lvl = True
+        if probe_px is not None and lvl is not None and float(probe_px) > float(lvl):
+            near_lvl = True
+        if res.get("phase") in ("open", "forming") and near_lvl:
+            d_state = "ENTRY CANDIDATE"
+            sub_state = "TESTING_TRIGGER_ZONE"
+        elif res.get("phase") in ("open", "forming", "pre-open"):
+            d_state = "SETUP"
+            sub_state = "BUILDING"
+        else:
+            d_state = "NO TRADE"
+            sub_state = "INACTIVE"
+            no_trade_reason = res.get("reason") or "no active intraday setup"
+
+    res["decision_state"] = d_state
+    res["sub_state"] = sub_state
+    res["decision"] = {
+        "state": d_state,
+        "sub_state": sub_state,
+        "actionable": (d_state == "ENTRY CONFIRMED"),
+        "chase_blocked": bool(is_extended),
+        "no_trade_reason": no_trade_reason,
+        "evaluation_mode": "on_invocation",
+        "current_price": _tick_fmt(curr_px, market, eff_tick, explicit_tick),
+        "entry_zone": zone,
+        "invalidation_level": res.get("invalidation_level"),
+        "stop_preview": stop_preview,
+        "targets_preview": targets_preview,
+        "reward_risk": rr_preview,
+    }
+    return res
+
+
+def update_signal_state(state_path, sym, setup, interval, res, now_utc):
+    """Persist point-in-time evaluation & deduplicate identical repeated session signals."""
+    if not state_path:
+        res["signal_change"] = "NEW"
+        res["deduplicated"] = False
+        return res
+    state = {"signals": {}, "history": []}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    state["signals"] = dict(loaded.get("signals") or {})
+                    state["history"] = list(loaded.get("history") or [])
+        except Exception:
+            pass
+    key = "%s|%s|%s|%s" % (sym.upper(), setup, interval, res.get("date"))
+    trig = res.get("trigger") or {}
+    sub_state = (res.get("decision") or {}).get("sub_state")
+    fp_parts = (
+        res.get("decision_state"),
+        sub_state,
+        res.get("status"),
+        trig.get("bar_start"),
+        res.get("level"),
+        res.get("invalidation_level"),
+    )
+    fp = "|".join("" if x is None else str(x) for x in fp_parts)
+    prev = state["signals"].get(key)
+    if prev is None:
+        change = "NEW"
+        deduped = False
+    elif prev.get("fingerprint") == fp:
+        change = "UNCHANGED"
+        deduped = True
+    else:
+        change = "UPDATED"
+        deduped = False
+    stamp = _market_iso(now_utc, market=res.get("market", "US"))
+    entry_rec = {
+        "fingerprint": fp,
+        "decision_state": res.get("decision_state"),
+        "sub_state": sub_state,
+        "status": res.get("status"),
+        "trigger_bar": trig.get("bar_start"),
+        "last_evaluated_at": stamp,
+        "seen_count": (int(prev.get("seen_count", 1)) + 1) if isinstance(prev, dict) else 1,
+    }
+    state["signals"][key] = entry_rec
+    if not deduped:
+        state["history"].append({
+            "at": stamp,
+            "symbol": sym.upper(),
+            "setup": setup,
+            "interval": interval,
+            "change": change,
+            "decision_state": res.get("decision_state"),
+            "sub_state": sub_state,
+            "price": (res.get("decision") or {}).get("current_price"),
+        })
+        state["history"] = state["history"][-200:]
+    write_json(state_path, state)
+    res["signal_change"] = change
+    res["deduplicated"] = deduped
+    return res
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
              min_volume_x=None, cfg=None, market=None, trading_style="intraday",
              option_strategy=None, strike_selection="ATM", simulated=False,
-             tick_size=None, exchange=None, instruments_path=None):
-    """Pure function: the setup's status at now_utc from one session's bars."""
+             tick_size=None, exchange=None, instruments_path=None,
+             lookback_bars=12, max_chase_pct=None, max_chase_atr=None):
+    """Pure function: the setup's status and actionable intraday decision at now_utc."""
     market = market or chart.get("market") or "US"
     cfg = cfg or dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
+    if setup == "momentum":
+        setup = "rsi_momentum"
     if interval not in INTERVALS:
-        raise EntryError("--interval is 5m or 1m")
+        raise EntryError("--interval is %s" % "/".join(INTERVALS))
+    gran = str((chart.get("meta") or {}).get("dataGranularity") or "").lower()
+    if gran and gran in INTERVALS and gran != interval:
+        raise EntryError("%s has %s bars, not %s: use --interval %s" % (chart.get("symbol", ""), gran, interval, gran))
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    valid_setups = ("orb", "level", "breakout_20d", "ma_crossover", "trend", "rsi_momentum", "options_orb")
+    valid_setups = (
+        "orb", "level", "breakout_20d", "breakout_intraday",
+        "vwap_reclaim", "ema_alignment", "ma_crossover", "trend",
+        "rsi_momentum", "options_orb",
+    )
     if setup not in valid_setups:
-        raise EntryError("--setup is orb, level, breakout_20d, ma_crossover, trend, rsi_momentum, or options_orb")
+        raise EntryError("--setup is %s" % ", ".join(valid_setups))
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
+    if setup == "breakout_intraday" and int(lookback_bars or 0) < 2:
+        raise EntryError("--lookback-bars must be >= 2 for breakout_intraday")
     n_or = or_minutes * 60 // step
     local = to_local(now_utc, market=market)
     day = local.date()
@@ -1384,6 +1852,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if explicit_tick:
             res["tick_size"] = eff_tick
         res["_explicit_tick"] = explicit_tick
+        if symbols_in and symbols_in.is_index_symbol(chart.get("symbol", "")) and not symbols_in.is_derivative_symbol(chart.get("symbol", "")) and setup != "options_orb":
+            res["asset_type"] = "INDEX"
+            res["is_tradable_equity"] = False
+            res["analytical_only"] = True
     if is_clock_override:
         res["clock_override"] = True
     if is_sim_run:
@@ -1391,9 +1863,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     now_ts = ts_of(now_utc)
     raw_bars = chart.get("bars", [])
     if market == "IN":
-        chart_bars = [b for b in raw_bars if b.get("t") is not None and (int(b["t"]) + step <= now_ts)]
+        chart_bars = [b for b in raw_bars if b.get("t") is not None and int(b["t"]) <= now_ts]
         permitted_dt = max(
-            (min(now_ts, int(b["t"]) + step) for b in chart_bars if not (int(b["t"]) % step)),
+            (min(now_ts, int(b["t"]) + step) for b in chart_bars if not (int(b["t"]) % step) and (int(b["t"]) + step <= now_ts)),
             default=None,
         )
         dt = chart.get("data_time")
@@ -1486,6 +1958,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 if b20_ref.get("daily_close") is not None:
                     res["daily_close"] = b20_ref["daily_close"]
                 res["signal_freshness"] = "stale" if (b20_ref.get("err_kind") == "stale" or is_fixture) else "unavailable"
+            res["decision_state"] = "NO TRADE"
+            res["decision"] = {
+                "state": "NO TRADE", "sub_state": "MARKET_CLOSED", "actionable": False,
+                "chase_blocked": False, "no_trade_reason": res.get("reason"),
+                "evaluation_mode": "on_invocation", "current_price": None,
+                "entry_zone": None, "invalidation_level": res.get("invalidation_level"),
+                "stop_preview": None, "targets_preview": None, "reward_risk": None,
+            }
             return res
 
     if eval_day != day:
@@ -1509,14 +1989,21 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
 
     by_slot = {}
+    warmup_bars = []
     for b in chart_bars:
         if b["t"] % step:
             continue                       # Yahoo's live tick (10:49:45) is not a bar
         et = to_local(utc_of(b["t"]), market=market)
+        if et.date() < eval_day and (int(b["t"]) + step <= now_ts):
+            s_prev = session(et.date(), market=market)
+            if s_prev and (s_prev[0] <= et.time() < s_prev[1]):
+                warmup_bars.append(dict(b, et=et, end=et + datetime.timedelta(seconds=step), slot=-1))
+            continue
         if et.date() != eval_day or not (open_dt <= et < close_dt):
             continue
         slot = int((et - open_dt).total_seconds()) // step
         by_slot[slot] = dict(b, et=et, end=et + datetime.timedelta(seconds=step), slot=slot)
+    warmup_bars.sort(key=lambda x: x["t"])
 
     data_tier, data_status, is_live_data, provider_name, is_simulated = _classify_market_data(
         chart, market, day, eval_day, local, open_dt, close_dt, now_ts, dt,
@@ -1579,6 +2066,15 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     "HISTORICAL" if (replay_full_session or eval_day < day or data_tier == "HISTORICAL") else "DELAYED"
                 ))
                 res["signal_freshness"] = "stale"
+                res["decision_state"] = "NO TRADE"
+                res["sub_state"] = "STALE_DATA"
+                res["decision"] = {
+                    "state": "NO TRADE", "sub_state": "STALE_DATA", "actionable": False,
+                    "chase_blocked": False, "no_trade_reason": res.get("reason"),
+                    "evaluation_mode": "on_invocation", "current_price": None,
+                    "entry_zone": None, "invalidation_level": res.get("invalidation_level"),
+                    "stop_preview": None, "targets_preview": None, "reward_risk": None,
+                }
                 return res
             res.update(status="no-data", phase="open" if session_is_open else "closed", reason=b20["reason"])
             res["breakout_level"] = None
@@ -1586,6 +2082,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res["invalidation_level"] = None
             _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
             res["signal_freshness"] = "unavailable"
+            res["decision_state"] = "NO TRADE"
+            res["decision"] = {
+                "state": "NO TRADE", "sub_state": "NO_DATA", "actionable": False,
+                "chase_blocked": False, "no_trade_reason": res.get("reason"),
+                "evaluation_mode": "on_invocation", "current_price": None,
+                "entry_zone": None, "invalidation_level": None,
+                "stop_preview": None, "targets_preview": None, "reward_risk": None,
+            }
             return res
 
     bars, pending = [], None
@@ -1602,7 +2106,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 res["lag_note"] = ("Yahoo's last trade is %s, before the %s bar's close: it counts once Yahoo "
                                    "catches up (a minute at most)" % (to_local(utc_of(dt), market=market).strftime("%H:%M:%S"),
                                                                        short(b["et"])))
-        elif market != "IN" and b["et"] <= local:
+        elif b["et"] <= local:
+            pending = b
             res["forming"] = {"bar_start": hm(b["et"]), "closes": ampm(b["end"]), "price": r2(b["c"])}
     res["_bars"] = bars
     res["bars_closed"] = len(bars)
@@ -1625,10 +2130,44 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     "the %s opens at %s; awaiting completed intraday bar close above 20-day breakout level %s%.2f"
                     % (exchange, open_label, curr, b20["breakout_level"])
                 ))
-            return res
+            return _assess_intraday_decision(
+                res, chart, bars, warmup_bars + bars, res.get("breakout_level"), None, pending, None,
+                local, eval_day, day, step, market, eff_tick, explicit_tick,
+                cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                is_simulated, session_is_open, replay_full_session, cutoff,
+                max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+            )
         res.update(phase="pre-open", reason="the %s opens at %s%s" % (
             exchange, open_label, " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
-        return res
+        return _assess_intraday_decision(
+            res, chart, bars, warmup_bars + bars, None, None, pending, None,
+            local, eval_day, day, step, market, eff_tick, explicit_tick,
+            cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+            is_simulated, session_is_open, replay_full_session, cutoff,
+            max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+        )
+
+    all_bars = warmup_bars + bars
+    all_closes = [float(b["c"]) for b in all_bars]
+    off = len(warmup_bars)
+    ema9_all = _ema_series(all_closes, 9)
+    ema21_all = _ema_series(all_closes, 21)
+    ema50_all = _ema_series(all_closes, 50)
+    ema9_s = ema9_all[off:] if bars else []
+    ema21_s = ema21_all[off:] if bars else []
+    ema50_s = ema50_all[off:] if bars else []
+    vwap_s = _vwap_series(bars) if bars else None
+    rsi14_v = (visuals.compute_rsi(all_closes, 14) if visuals is not None else rsi_val(all_closes)) if all_closes else None
+    atr14_v = _atr_val(all_bars, 14) if all_bars else None
+    ind_snapshot = {
+        "ema9": _tick_fmt(ema9_s[-1], market, eff_tick, explicit_tick) if ema9_s and ema9_s[-1] is not None else None,
+        "ema21": _tick_fmt(ema21_s[-1], market, eff_tick, explicit_tick) if ema21_s and ema21_s[-1] is not None else None,
+        "ema50": _tick_fmt(ema50_s[-1], market, eff_tick, explicit_tick) if ema50_s and ema50_s[-1] is not None else None,
+        "vwap": _tick_fmt(vwap_s[-1], market, eff_tick, explicit_tick) if vwap_s and vwap_s[-1] is not None else None,
+        "rsi14": r2(rsi14_v),
+        "atr14": round(float(atr14_v), 4) if atr14_v is not None else None,
+        "vwap_unavailable": bool(bars and vwap_s is None),
+    }
 
     or_bars = [b for b in bars if b["slot"] < n_or]
     avg_vol = (sum(b["v"] for b in or_bars) / float(len(or_bars))) if or_bars else None
@@ -1643,32 +2182,57 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if not replay_full_session and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
-            return res
+            return _assess_intraday_decision(
+                res, chart, bars, all_bars, None, None, pending, ind_snapshot,
+                local, eval_day, day, step, market, eff_tick, explicit_tick,
+                cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                is_simulated, session_is_open, replay_full_session, cutoff,
+                max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+            )
         if not or_bars:
             no_or_msg = (
                 "Insufficient historical data before cutoff (%s): no opening-range bars available" % res["now"]
                 if market == "IN" else "Yahoo sent no bars for the opening range"
             )
             res.update(status="no-data", phase="open" if session_is_open else "closed", reason=no_or_msg)
-            return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+            _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+            return _assess_intraday_decision(
+                res, chart, bars, all_bars, None, None, pending, ind_snapshot,
+                local, eval_day, day, step, market, eff_tick, explicit_tick,
+                cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                is_simulated, session_is_open, replay_full_session, cutoff,
+                max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+            )
         lvl = max(b["h"] for b in or_bars)
     elif setup == "level":
         lvl = float(level)
     elif setup == "breakout_20d":
         lvl = float(b20["breakout_level"])
+    elif setup == "vwap_reclaim":
+        lvl = float(vwap_s[-1]) if (vwap_s and vwap_s[-1] is not None) else None
+    elif setup == "ema_alignment":
+        lvl = float(ema9_s[-1]) if (ema9_s and ema9_s[-1] is not None) else None
+    elif setup == "breakout_intraday":
+        lb_req = max(2, int(lookback_bars or 12))
+        if len(bars) >= 3:
+            win = bars[max(0, len(bars) - lb_req - 1):-1]
+            lvl = max(float(x["h"]) for x in win) if win else float(bars[-1]["h"])
+        else:
+            lvl = None
     else:
         lvl = float(chart.get("prev_close") or (bars[0]["c"] if bars else 100.0))
-    res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    res["level"] = (_round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)) if lvl is not None else None
 
     first_slot = n_or if setup in ("orb", "options_orb") else 0
     trig, thin = None, []
 
     if setup in ("orb", "level", "options_orb"):
-        for b in bars:
+        for i, b in enumerate(bars):
             if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
                 continue
             if b["c"] > lvl:
-                vx = (b["v"] / avg_vol) if avg_vol else None
+                ref_v = avg_vol if setup in ("orb", "options_orb") else (_rolling_avg_vol(bars, i) or avg_vol)
+                vx = (b["v"] / ref_v) if ref_v else None
                 if min_volume_x and (vx is None or vx < min_volume_x):
                     thin.append(b)
                     continue
@@ -1680,71 +2244,138 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
                 continue
             if _bar_confirms_breakout_20d(closes_prior, b["c"], lvl):
-                ref_avg_vol = avg_vol
-                if ref_avg_vol is None and i > 0:
-                    ref_avg_vol = sum(x["v"] for x in bars[:i]) / float(i)
+                ref_avg_vol = _rolling_avg_vol(bars, i) or avg_vol
                 vx = (b["v"] / ref_avg_vol) if ref_avg_vol else None
                 if min_volume_x and (vx is None or vx < min_volume_x):
                     thin.append(b)
                     continue
                 trig = b
                 break
-    elif setup == "ma_crossover":
-        fast_n, slow_n = 9, 21
-        for i in range(slow_n, len(bars)):
+    elif setup == "breakout_intraday":
+        lb_req = max(2, int(lookback_bars or 12))
+        for i in range(2, len(bars)):
             b = bars[i]
             if b["end"] < before or b["end"] > cutoff:
                 continue
-            f_curr = sum(x["c"] for x in bars[i - fast_n + 1:i + 1]) / float(fast_n)
-            f_prev = sum(x["c"] for x in bars[i - fast_n:i]) / float(fast_n)
-            s_curr = sum(x["c"] for x in bars[i - slow_n + 1:i + 1]) / float(slow_n)
-            s_prev = sum(x["c"] for x in bars[i - slow_n:i]) / float(slow_n)
+            prior_win = bars[max(0, i - lb_req):i]
+            win_hi = max(float(x["h"]) for x in prior_win)
+            prev_c = float(bars[i - 1]["c"])
+            if float(b["c"]) > win_hi and prev_c <= win_hi:
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = win_hi
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "vwap_reclaim" and vwap_s is not None:
+        for i in range(1, len(bars)):
+            b = bars[i]
+            vw = vwap_s[i]
+            vw_prev = vwap_s[i - 1]
+            if vw is None or vw_prev is None or b["end"] < before or b["end"] > cutoff:
+                continue
+            cross = (float(bars[i - 1]["c"]) <= vw_prev and float(b["c"]) > vw)
+            pullback_reclaim = (
+                float(b["l"]) <= vw * 1.0015 and float(b["c"]) > vw
+                and float(b["c"]) > (float(b["h"]) + float(b["l"])) / 2.0
+            )
+            if cross or pullback_reclaim:
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = vw
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "ema_alignment":
+        for i in range(1, len(bars)):
+            b = bars[i]
+            e9, e9p = ema9_s[i], ema9_s[i - 1]
+            e21, e21p = ema21_s[i], ema21_s[i - 1]
+            e50 = ema50_s[i] if i < len(ema50_s) else None
+            if e9 is None or e9p is None or e21 is None or e21p is None or b["end"] < before or b["end"] > cutoff:
+                continue
+            aligned_now = (float(b["c"]) > e9 > e21) and (e9 > e9p) and (e50 is None or e21 > e50 or float(b["c"]) > e50)
+            aligned_prev = (float(bars[i - 1]["c"]) > e9p > e21p)
+            pullback_tap = (aligned_now and float(b["l"]) <= e9 * 1.001 and float(b["c"]) > e9)
+            if aligned_now and (not aligned_prev or pullback_tap):
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = e9
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "ma_crossover":
+        fast_n, slow_n = 9, 21
+        for i in range(max(slow_n, off), len(all_bars)):
+            b = all_bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            f_curr = sum(x["c"] for x in all_bars[i - fast_n + 1:i + 1]) / float(fast_n)
+            f_prev = sum(x["c"] for x in all_bars[i - fast_n:i]) / float(fast_n)
+            s_curr = sum(x["c"] for x in all_bars[i - slow_n + 1:i + 1]) / float(slow_n)
+            s_prev = sum(x["c"] for x in all_bars[i - slow_n:i]) / float(slow_n)
             if f_prev <= s_prev and f_curr > s_curr:
                 trig = b
                 break
     elif setup == "trend":
         fast_n, slow_n = 9, 21
-        for i in range(slow_n, len(bars)):
-            b = bars[i]
+        for i in range(max(slow_n, off), len(all_bars)):
+            b = all_bars[i]
             if b["end"] < before or b["end"] > cutoff:
                 continue
-            f_curr = sum(x["c"] for x in bars[i - fast_n + 1:i + 1]) / float(fast_n)
-            s_curr = sum(x["c"] for x in bars[i - slow_n + 1:i + 1]) / float(slow_n)
+            f_curr = sum(x["c"] for x in all_bars[i - fast_n + 1:i + 1]) / float(fast_n)
+            s_curr = sum(x["c"] for x in all_bars[i - slow_n + 1:i + 1]) / float(slow_n)
             if b["c"] > f_curr > s_curr:
                 trig = b
                 break
     elif setup == "rsi_momentum":
-        closes = [b["c"] for b in bars]
-        for i in range(15, len(bars)):
-            b = bars[i]
+        for i in range(max(15, off), len(all_bars)):
+            b = all_bars[i]
             if b["end"] < before or b["end"] > cutoff:
                 continue
-            r = rsi_val(closes[:i + 1])
-            r_prev = rsi_val(closes[:i])
+            r = rsi_val(all_closes[:i + 1])
+            r_prev = rsi_val(all_closes[:i])
             if r is not None and r >= 60.0 and (r_prev is None or r_prev < 60.0):
                 trig = b
                 break
 
     last = bars[-1] if bars else None
     if last:
+        vs_lvl = r2(100.0 * (last["c"] / lvl - 1)) if (lvl and lvl > 0) else None
         res["last"] = {"bar_start": hm(last["et"]), "close": r2(last["c"]),
-                       "vs_level_pct": r2(100.0 * (last["c"] / lvl - 1))}
+                       "vs_level_pct": vs_lvl}
 
     if trig:
-        vx = (trig["v"] / avg_vol) if avg_vol else None
-        trig_reason = (
-            "the %s bar closed above 20-day breakout level %s%.2f at %s%.2f"
-            % (short(trig["et"]), curr, lvl, curr, trig["c"])
-            if setup == "breakout_20d"
-            else "the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level")
-        )
+        trig_i = bars.index(trig) if trig in bars else max(0, len(bars) - 1)
+        ref_v = avg_vol if setup in ("orb", "options_orb") else (_rolling_avg_vol(bars, trig_i) or avg_vol)
+        vx = (trig["v"] / ref_v) if ref_v else None
+        pct_over = r2(100.0 * (trig["c"] / lvl - 1)) if (lvl and lvl > 0) else 0.0
+        if setup == "breakout_20d":
+            trig_reason = "the %s bar closed above 20-day breakout level %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "breakout_intraday":
+            trig_reason = "the %s bar closed above intraday resistance %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "vwap_reclaim":
+            trig_reason = "the %s bar reclaimed session VWAP (%s%.2f) closing at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "ema_alignment":
+            trig_reason = "the %s bar confirmed bullish EMA alignment above %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        else:
+            trig_reason = "the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level")
         res.update(status="triggered", phase="open" if session_is_open else "after-close",
                    reason=trig_reason)
         conf_iso = _market_iso(local_to_utc(trig["end"], market=market), market=market)
         trig_px = _round_tick(trig["c"], eff_tick) if explicit_tick else r2(trig["c"])
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": trig_px, "close": trig["c"],
-                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
+                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": pct_over}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if setup == "breakout_20d":
             res["confirmation_price"] = trig_px
@@ -1830,6 +2461,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             and res.get("status") == "triggered"
             and not (setup == "breakout_20d" and res.get("signal_freshness") == "stale")
         )
+        _assess_intraday_decision(
+            res, chart, bars, all_bars, lvl, trig, pending, ind_snapshot,
+            local, eval_day, day, step, market, eff_tick, explicit_tick,
+            cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+            is_simulated, session_is_open, replay_full_session, cutoff,
+            max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+        )
         return res
     if not bars:
         if (setup == "breakout_20d" and not replay_full_session and session_is_open
@@ -1845,7 +2483,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 "waiting", data_tier, data_status, is_live_data, is_fixture, is_simulated,
                 is_historical, replay_full_session, eval_day, day, phase="forming",
             )
-            return res
+            return _assess_intraday_decision(
+                res, chart, bars, all_bars, lvl, None, pending, ind_snapshot,
+                local, eval_day, day, step, market, eff_tick, explicit_tick,
+                cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                is_simulated, session_is_open, replay_full_session, cutoff,
+                max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+            )
         no_bars_msg = (
             "Insufficient historical data before cutoff (%s): 0 closed bars for %s"
             % (res["now"], eval_day.isoformat())
@@ -1855,20 +2499,39 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
         if setup == "breakout_20d":
             res["signal_freshness"] = "stale" if data_status == "stale" else "unavailable"
-        return res
-    min_ind_bars = 22 if setup in ("ma_crossover", "trend") else (16 if setup == "rsi_momentum" else 0)
-    if market == "IN" and min_ind_bars and len(bars) < min_ind_bars:
+        return _assess_intraday_decision(
+            res, chart, bars, all_bars, lvl, None, pending, ind_snapshot,
+            local, eval_day, day, step, market, eff_tick, explicit_tick,
+            cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+            is_simulated, session_is_open, replay_full_session, cutoff,
+            max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+        )
+    min_ind_bars = 22 if setup in ("ma_crossover", "trend") else (21 if setup == "ema_alignment" else (16 if setup == "rsi_momentum" else 0))
+    if (market == "IN" or setup == "ema_alignment") and min_ind_bars and len(all_bars) < min_ind_bars:
         res.update(
             status="no-data",
             phase="open" if session_is_open else ("after-close" if not session_is_open else "after-cutoff"),
             reason="Insufficient historical data before cutoff (%s): need %d closed bars for %s, have %d"
-                   % (res["now"], min_ind_bars, setup, len(bars)),
+                   % (res["now"], min_ind_bars, setup, len(all_bars)),
         )
-        return _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+        _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
+        return _assess_intraday_decision(
+            res, chart, bars, all_bars, lvl, None, pending, ind_snapshot,
+            local, eval_day, day, step, market, eff_tick, explicit_tick,
+            cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+            is_simulated, session_is_open, replay_full_session, cutoff,
+            max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+        )
     if setup == "orb":
         what = "close above the range high %s%.2f" % (curr, lvl)
     elif setup == "breakout_20d":
         what = "confirm breakout_20d with a completed close above %s%.2f" % (curr, lvl)
+    elif setup == "breakout_intraday":
+        what = "close above intraday resistance %s%.2f" % (curr, lvl) if lvl is not None else "form intraday resistance breakout"
+    elif setup == "vwap_reclaim":
+        what = "reclaim session VWAP %s%.2f" % (curr, lvl) if lvl is not None else "reclaim session VWAP"
+    elif setup == "ema_alignment":
+        what = "align close > EMA9 > EMA21"
     else:
         what = "close above %s%.2f" % (curr, lvl)
     if (replay_full_session or local >= cutoff) and not (pending and pending["end"] <= cutoff):
@@ -1880,13 +2543,21 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 "expired", data_tier, data_status, is_live_data, is_fixture, is_simulated,
                 is_historical, replay_full_session, eval_day, day, phase=res["phase"],
             )
-        return res
+        return _assess_intraday_decision(
+            res, chart, bars, all_bars, lvl, None, pending, ind_snapshot,
+            local, eval_day, day, step, market, eff_tick, explicit_tick,
+            cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+            is_simulated, session_is_open, replay_full_session, cutoff,
+            max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+        )
     res["phase"] = "open"
-    if last["c"] > lvl and last in thin:
+    if setup == "vwap_reclaim" and ind_snapshot.get("vwap_unavailable"):
+        res["reason"] = "session VWAP unavailable (zero volume / spot index)"
+    elif lvl is not None and last["c"] > lvl and last in thin:
         res["reason"] = ("the %s bar closed above at %s%.2f but on %.2fx the %s volume, under your %.2fx" % (
             short(last["et"]), curr, last["c"], last["v"] / avg_vol if avg_vol else 0,
-            "baseline" if setup == "breakout_20d" else "range's", min_volume_x))
-    elif last["c"] > lvl and last["end"] < before:
+            "baseline" if setup != "orb" else "range's", min_volume_x))
+    elif lvl is not None and last["c"] > lvl and last["end"] < before:
         res["reason"] = ("the %s bar closed above at %s%.2f, but no entries before %s (config)" % (
             short(last["et"]), curr, last["c"], short(before)))
     elif setup == "breakout_20d":
@@ -1903,6 +2574,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res["reason"] = ("last close %s%.2f (%s bar), %s%.2f %s 20-day breakout level %s%.2f (%+.2f%%)" % (
                 curr, last["c"], short(last["et"]), curr, abs(gap), "under" if gap >= 0 else "over",
                 curr, lvl, 100.0 * (last["c"] / lvl - 1)))
+    elif lvl is None:
+        res["reason"] = "last close %s%.2f (%s bar), building intraday %s structure (%d closed bars)" % (
+            curr, last["c"], short(last["et"]), setup, len(bars))
     else:
         gap = lvl - last["c"]
         res["reason"] = ("last close %s%.2f (%s bar), %s%.2f %s %s (%+.2f%%)" % (
@@ -1914,7 +2588,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             "waiting", data_tier, data_status, is_live_data, is_fixture, is_simulated,
             is_historical, replay_full_session, eval_day, day, phase=res["phase"],
         )
-    return res
+    return _assess_intraday_decision(
+        res, chart, bars, all_bars, lvl, None, pending, ind_snapshot,
+        local, eval_day, day, step, market, eff_tick, explicit_tick,
+        cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+        is_simulated, session_is_open, replay_full_session, cutoff,
+        max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+    )
 
 
 def public(res):
@@ -1953,6 +2633,12 @@ def entry_doc(res, now_utc):
     if res.get("option_contract"):
         doc["option_contract"] = res["option_contract"]
         doc["asset_type"] = "OPTIONS"
+    elif res.get("asset_type"):
+        doc["asset_type"] = res["asset_type"]
+        if res.get("is_tradable_equity") is not None:
+            doc["is_tradable_equity"] = bool(res["is_tradable_equity"])
+        if res.get("analytical_only") is not None:
+            doc["analytical_only"] = bool(res["analytical_only"])
     if res.get("trading_style"):
         doc["trading_style"] = res["trading_style"]
     if res.get("is_market_open") is not None:
@@ -1990,6 +2676,13 @@ def entry_doc(res, now_utc):
             doc["daily_close_date"] = res["daily_close_date"]
         if res.get("scanner_breakout_matched") is not None:
             doc["scanner_breakout_matched"] = bool(res["scanner_breakout_matched"])
+    for ek in (
+        "decision_state", "decision", "entry_zone", "invalidation_level",
+        "stop_preview", "targets_preview", "reward_risk", "sizing_preview",
+        "anti_chasing", "candle_context", "indicators",
+    ):
+        if res.get(ek) is not None:
+            doc[ek] = res[ek]
     return doc
 
 
@@ -2017,13 +2710,30 @@ def setup_name(res):
         if res.get("breakout_level") is not None:
             return "20-day breakout (close above %s%.2f)" % (curr, res["breakout_level"])
         return "20-day breakout"
+    if res["setup"] == "breakout_intraday":
+        if res.get("level") is not None:
+            return "intraday breakout (close above %s%.2f)" % (curr, res["level"])
+        return "intraday breakout"
+    if res["setup"] == "vwap_reclaim":
+        return "VWAP reclaim (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "VWAP reclaim"
+    if res["setup"] == "ema_alignment":
+        return "EMA alignment (EMA9 > EMA21)"
+    if res["setup"] == "ma_crossover":
+        return "MA crossover (9/21)"
+    if res["setup"] == "trend":
+        return "intraday trend (close > MA9 > MA21)"
+    if res["setup"] == "rsi_momentum":
+        return "RSI momentum (>= 60)"
+    if res["setup"] == "options_orb":
+        return "options opening-range breakout (%d-minute range)" % res["or_minutes"]
     return ("close above %s%.2f" % (curr, res["level"])) if res["level"] is not None else "close above a level"
 
 
 def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
-    bars = "5-minute" if res["interval"] == "5m" else "1-minute"
+    iv_labels = {"1m": "1-minute", "5m": "5-minute", "15m": "15-minute", "30m": "30-minute", "1h": "1-hour"}
+    bars = iv_labels.get(res["interval"], res["interval"])
     market = res.get("market", "US")
     curr = "\u20b9" if market == "IN" else "$"
     tz_label = "IST" if market == "IN" else "ET"
@@ -2147,6 +2857,29 @@ def describe(res):
         inv_text = ("%s%.2f" % (curr, inv)) if inv is not None else "none"
         out.append("Breakout level: %s | Confirmation price: %s | Timestamp: %s" % (bl_text, cp_text, ts_text))
         out.append("Invalidation / stop level: %s | Signal freshness: %s" % (inv_text, fresh))
+    d = res.get("decision") or {}
+    d_state = res.get("decision_state")
+    if d_state:
+        sub_st = (" (%s)" % d["sub_state"]) if d.get("sub_state") else ""
+        chg = (" | Signal: %s" % res["signal_change"]) if res.get("signal_change") else ""
+        out.append("Decision: %s%s%s | Mode: on-invocation snapshot" % (d_state, sub_st, chg))
+        if d.get("no_trade_reason"):
+            out.append("Action note: %s." % d["no_trade_reason"])
+        ez = res.get("entry_zone")
+        if ez:
+            out.append("Entry zone: %s%.2f to %s%.2f | Invalidation: %s | Stop: %s | R:R: %s" % (
+                curr, ez["low"], curr, ez["high"],
+                ("%s%.2f" % (curr, res["invalidation_level"])) if res.get("invalidation_level") is not None else "none",
+                ("%s%.2f" % (curr, res["stop_preview"])) if res.get("stop_preview") is not None else "none",
+                ("%.2fR" % res["reward_risk"]) if res.get("reward_risk") is not None else "n/a",
+            ))
+        tp = res.get("targets_preview")
+        sp = res.get("sizing_preview")
+        if tp:
+            sz_txt = (" | Est. size: %d unit(s) (max loss %s%.2f)" % (
+                sp["qty"], curr, sp["estimated_max_loss"])) if sp else ""
+            out.append("Targets preview: T1 %s%.2f (1R), T2 %s%.2f (2R)%s" % (
+                curr, tp["t1_1r"], curr, tp["t2_2r"], sz_txt))
     if not res.get("calendar_known"):
         out.append("Holiday list covers %s only: check nyse.com for this date." % " and ".join(map(str, CALENDAR_YEARS)))
     return out
@@ -2308,7 +3041,10 @@ def _opts(a, cfg):
             "min_volume_x": a.min_volume_x, "cfg": cfg, "trading_style": trading_style,
             "option_strategy": option_strategy, "strike_selection": strike_selection,
             "exchange": getattr(a, "exchange", None),
-            "instruments_path": getattr(a, "instruments", None)}
+            "instruments_path": getattr(a, "instruments", None),
+            "lookback_bars": getattr(a, "lookback_bars", 12),
+            "max_chase_pct": getattr(a, "max_chase_pct", None),
+            "max_chase_atr": getattr(a, "max_chase_atr", None)}
 
 
 def _load(a, sym, now, market="US", cfg=None, setup=None):
@@ -2342,6 +3078,9 @@ def cmd_check(a):
     chart, now = _load(a, sym, parse_now(a.now, market=market) if a.now else None, market=market, cfg=cfg, setup=a.setup)
     opts["simulated"] = bool(a.now)
     res = evaluate(chart, now, **opts)
+    state_target = getattr(a, "state", None)
+    if state_target and not getattr(a, "no_state", False):
+        update_signal_state(state_target, sym, opts["setup"], opts["interval"], res, now)
     if a.write:
         write_json(a.write, entry_doc(res, now))
     if a.json:
@@ -2435,7 +3174,10 @@ def cmd_watchlist(a):
                 _sleep(PAUSE)
             chart, when = _load(a, sym, now, market=item_market, cfg=cfg, setup=a.setup)
             o["simulated"] = bool(a.now)
-            rows.append((sym, evaluate(chart, when, **o), None))
+            w_res = evaluate(chart, when, **o)
+            if getattr(a, "state", None) and not getattr(a, "no_state", False):
+                update_signal_state(a.state, sym, o["setup"], o["interval"], w_res, when)
+            rows.append((sym, w_res, None))
         except EntryError as e:
             rows.append((sym, None, str(e)))
     if a.json:
@@ -2472,11 +3214,16 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", default="orb",
-                       help="entry setup: orb, level, breakout_20d, ma_crossover, trend, rsi_momentum, or options_orb")
+                       help="entry setup: orb, level, breakout_20d, breakout_intraday, vwap_reclaim, ema_alignment, ma_crossover, trend, rsi_momentum, momentum, or options_orb")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
-        p.add_argument("--interval", choices=["5m", "1m"], default="5m")
+        p.add_argument("--interval", choices=["1m", "5m", "15m", "30m", "1h"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
-        p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
+        p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs baseline average")
+        p.add_argument("--lookback-bars", type=int, default=12, help="prior bars lookback for breakout_intraday (default 12)")
+        p.add_argument("--max-chase-pct", type=float, help="max percent above anchor for valid entry zone (default 1.5)")
+        p.add_argument("--max-chase-atr", type=float, help="max ATR multiple above anchor for valid entry zone (default 1.0)")
+        p.add_argument("--state", metavar="PATH", help="signal deduplication state JSON (default trader/state/signals.json when --write is used)")
+        p.add_argument("--no-state", action="store_true", help="disable signal deduplication state persistence")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='override the application clock to this market time for backtests/tests, e.g. "2026-10-19 10:15" (marks signals non-live)')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")

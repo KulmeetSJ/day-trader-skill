@@ -2195,24 +2195,23 @@ _UPSTOX_AUTH_ERROR_CODES = ("UDAPI100050", "UDAPI100051", "UDAPI100052", "UDAPI1
 _UPSTOX_NOT_FOUND_CODES = ("UDAPI100011", "UDAPI100044")
 _UPSTOX_RATE_LIMIT_CODES = ("UDAPI10005", "UDAPI100005")
 
-_UPSTOX_INDEX_KEYS = {
-    "NIFTY": "NSE_INDEX|Nifty 50",
-    "NIFTY50": "NSE_INDEX|Nifty 50",
-    "NIFTY 50": "NSE_INDEX|Nifty 50",
-    "^NSEI": "NSE_INDEX|Nifty 50",
-    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-    "NIFTY BANK": "NSE_INDEX|Nifty Bank",
-    "^NSEBANK": "NSE_INDEX|Nifty Bank",
-    "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
-    "NIFTY FIN SERVICE": "NSE_INDEX|Nifty Fin Service",
-    "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
-    "INDIAVIX": "NSE_INDEX|India VIX",
-    "INDIA VIX": "NSE_INDEX|India VIX",
-    "^INDIAVIX": "NSE_INDEX|India VIX",
-    "SENSEX": "BSE_INDEX|SENSEX",
-    "^BSESN": "BSE_INDEX|SENSEX",
-    "BANKEX": "BSE_INDEX|BANKEX",
-}
+def _build_upstox_index_keys():
+    mapping = {}
+    for canon, meta in getattr(symbols_in, "INDEX_MAP", {}).items():
+        ukey = meta.get("upstox_key")
+        if not ukey:
+            continue
+        mapping[canon.upper()] = ukey
+        if meta.get("name"):
+            mapping[str(meta["name"]).strip().upper()] = ukey
+        if meta.get("yahoo"):
+            mapping[str(meta["yahoo"]).strip().upper()] = ukey
+        for alias in meta.get("aliases") or ():
+            mapping[str(alias).strip().upper()] = ukey
+    return mapping
+
+
+_UPSTOX_INDEX_KEYS = _build_upstox_index_keys()
 
 
 def _redact_upstox_secret(text, secret=None):
@@ -2761,16 +2760,36 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             if not mapped_sym:
                 if seg_part.endswith("_INDEX"):
                     tail = raw.split("|", 1)[1].strip().upper()
-                    rev = {v.upper(): k for k, v in _UPSTOX_INDEX_KEYS.items() if not k.startswith("^") and " " not in k}
+                    rev = {
+                        str(m["upstox_key"]).upper(): c
+                        for c, m in getattr(symbols_in, "INDEX_MAP", {}).items()
+                        if m.get("upstox_key")
+                    }
                     mapped_sym = rev.get(raw.upper(), tail)
                 else:
                     mapped_sym = raw
             return raw, mapped_sym, exch
 
+        raw_spaces = " ".join(raw_upper.split())
+        if raw_spaces in _UPSTOX_INDEX_KEYS:
+            ikey = _UPSTOX_INDEX_KEYS[raw_spaces]
+            idx_exch = "BSE" if ikey.startswith("BSE_") else "NSE"
+            idx_canon = symbols_in.normalize_index_name(raw_spaces) or raw_spaces
+            return ikey, idx_canon, idx_exch
+        if (exch, raw_spaces) in self._key_by_symbol:
+            ikey = self._key_by_symbol[(exch, raw_spaces)]
+            idx_exch = "BSE" if ikey.startswith("BSE_") else exch
+            return ikey, self._symbol_by_key.get(ikey, raw_spaces), idx_exch
+
         try:
             canon = symbols_in.normalize_symbol(raw)
         except Exception as e:
-            raise InvalidSymbolError("Invalid Indian market symbol '%s': %s" % (raw, e))
+            if re.match(r"^(?:NIFTY|BSE|SENSEX|INDIA)[A-Z0-9 -]{1,30}$", raw_spaces):
+                canon = raw_spaces
+                if raw_spaces.startswith("BSE") or "SENSEX" in raw_spaces:
+                    exch = "BSE"
+            else:
+                raise InvalidSymbolError("Invalid Indian market symbol '%s': %s" % (raw, e))
         if canon in _UPSTOX_INDEX_KEYS:
             ikey = _UPSTOX_INDEX_KEYS[canon]
             idx_exch = "BSE" if ikey.startswith("BSE_") else "NSE"
@@ -3535,6 +3554,10 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                         # Prefer EQ / INDEX segments for canonical equity symbol resolution
                         if item["segment"] in ("NSE_EQ", "BSE_EQ", "NSE_INDEX", "BSE_INDEX") or (ex, sym_norm) not in self._key_by_symbol:
                             self._key_by_symbol[(ex, sym_norm)] = ikey
+                        if item["segment"] in ("NSE_INDEX", "BSE_INDEX"):
+                            for idx_alias in (tsym.upper(), str(item.get("name") or "").strip().upper(), ikey.split("|", 1)[-1].strip().upper()):
+                                if idx_alias and (ex, idx_alias) not in self._key_by_symbol:
+                                    self._key_by_symbol[(ex, idx_alias)] = ikey
                         exch_tok = str(rec.get("exchange_token") or "").strip()
                         if ex == "BSE" and exch_tok.isdigit() and item["segment"] in ("BSE_EQ", "BSE_INDEX"):
                             if (ex, exch_tok) not in self._key_by_symbol:

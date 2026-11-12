@@ -14,14 +14,131 @@ ISIN_REGEX = re.compile(r"^IN[A-Z0-9]{10}$")
 
 KNOWN_SUFFIXES = (".NS", ".BO", "-EQ", ":NSE", ":BSE")
 
-# Canonical index mappings and their Yahoo Finance tickers
+# Authoritative Indian benchmark indices (spot analytical instruments, not tradable cash equities)
+BENCHMARK_INDICES = (
+    "NIFTY",
+    "BANKNIFTY",
+    "FINNIFTY",
+    "MIDCPNIFTY",
+    "NIFTYNXT50",
+    "NIFTY100",
+    "NIFTY200",
+    "NIFTY500",
+    "SENSEX",
+    "BANKEX",
+)
+
+# Canonical index mappings, Upstox instrument keys (from BOD master), and Yahoo Finance tickers
 INDEX_MAP = {
-    "NIFTY": {"exchange": "NSE", "yahoo": "^NSEI", "name": "NIFTY 50", "aliases": ("NIFTY50", "NIFTY 50", "^NSEI")},
-    "BANKNIFTY": {"exchange": "NSE", "yahoo": "^NSEBANK", "name": "NIFTY BANK", "aliases": ("NIFTYBANK", "NIFTY BANK", "^NSEBANK")},
-    "FINNIFTY": {"exchange": "NSE", "yahoo": "NIFTY_FIN_SERVICE.NS", "name": "NIFTY FINANCIAL SERVICES", "aliases": ("NIFTYFIN", "NIFTY FIN SERVICE", "^CNXFIN")},
-    "MIDCPNIFTY": {"exchange": "NSE", "yahoo": "^NSEMDCP50", "name": "NIFTY MIDCAP SELECT", "aliases": ("MIDCPNIFTY", "NIFTY MIDCAP SELECT", "NIFTY_MID_SELECT.NS")},
-    "SENSEX": {"exchange": "BSE", "yahoo": "^BSESN", "name": "BSE SENSEX", "aliases": ("BSESN", "^BSESN", "BSE SENSEX")},
-    "BANKEX": {"exchange": "BSE", "yahoo": "^BSEBANK", "name": "BSE BANKEX", "aliases": ("BSEBANK", "^BSEBANK", "BSE BANKEX")},
+    "NIFTY": {
+        "exchange": "NSE",
+        "yahoo": "^NSEI",
+        "upstox_key": "NSE_INDEX|Nifty 50",
+        "name": "NIFTY 50",
+        "has_derivatives": True,
+        "aliases": ("NIFTY50", "NIFTY 50", "^NSEI", "NSE_INDEX|NIFTY 50"),
+    },
+    "BANKNIFTY": {
+        "exchange": "NSE",
+        "yahoo": "^NSEBANK",
+        "upstox_key": "NSE_INDEX|Nifty Bank",
+        "name": "NIFTY BANK",
+        "has_derivatives": True,
+        "aliases": ("NIFTYBANK", "NIFTY BANK", "^NSEBANK", "NSE_INDEX|NIFTY BANK"),
+    },
+    "FINNIFTY": {
+        "exchange": "NSE",
+        "yahoo": "NIFTY_FIN_SERVICE.NS",
+        "upstox_key": "NSE_INDEX|Nifty Fin Service",
+        "name": "NIFTY FINANCIAL SERVICES",
+        "has_derivatives": True,
+        "aliases": (
+            "NIFTYFIN",
+            "NIFTY FIN SERVICE",
+            "NIFTY FINANCIAL SERVICES",
+            "NIFTY_FIN_SERVICE.NS",
+            "^CNXFIN",
+            "NSE_INDEX|NIFTY FIN SERVICE",
+        ),
+    },
+    "MIDCPNIFTY": {
+        "exchange": "NSE",
+        "yahoo": "NIFTY_MID_SELECT.NS",
+        "upstox_key": "NSE_INDEX|NIFTY MID SELECT",
+        "name": "NIFTY MIDCAP SELECT",
+        "has_derivatives": True,
+        "aliases": (
+            "MIDCPNIFTY",
+            "NIFTY MIDCAP SELECT",
+            "NIFTY MID SELECT",
+            "NIFTY_MID_SELECT.NS",
+            "NSE_INDEX|NIFTY MID SELECT",
+        ),
+    },
+    "NIFTYNXT50": {
+        "exchange": "NSE",
+        "yahoo": "^NSMIDCP",
+        "upstox_key": "NSE_INDEX|Nifty Next 50",
+        "name": "NIFTY NEXT 50",
+        "has_derivatives": True,
+        "aliases": (
+            "NIFTYNXT50",
+            "NIFTYNEXT50",
+            "NIFTY NEXT 50",
+            "NIFTY JUNIOR",
+            "NIFTY JR",
+            "^NSMIDCP",
+            "NSE_INDEX|NIFTY NEXT 50",
+        ),
+    },
+    "NIFTY100": {
+        "exchange": "NSE",
+        "yahoo": "^CNX100",
+        "upstox_key": "NSE_INDEX|Nifty 100",
+        "name": "NIFTY 100",
+        "has_derivatives": False,
+        "aliases": ("NIFTY100", "NIFTY 100", "^CNX100", "NSE_INDEX|NIFTY 100"),
+    },
+    "NIFTY200": {
+        "exchange": "NSE",
+        "yahoo": "^CNX200",
+        "upstox_key": "NSE_INDEX|Nifty 200",
+        "name": "NIFTY 200",
+        "has_derivatives": False,
+        "aliases": ("NIFTY200", "NIFTY 200", "^CNX200", "NSE_INDEX|NIFTY 200"),
+    },
+    "NIFTY500": {
+        "exchange": "NSE",
+        "yahoo": "^CRSLDX",
+        "upstox_key": "NSE_INDEX|Nifty 500",
+        "name": "NIFTY 500",
+        "has_derivatives": False,
+        "aliases": ("NIFTY500", "NIFTY 500", "^CRSLDX", "NSE_INDEX|NIFTY 500"),
+    },
+    "SENSEX": {
+        "exchange": "BSE",
+        "yahoo": "^BSESN",
+        "upstox_key": "BSE_INDEX|SENSEX",
+        "name": "BSE SENSEX",
+        "has_derivatives": True,
+        "aliases": ("BSESN", "^BSESN", "BSE SENSEX", "SENSEX 30", "BSE_INDEX|SENSEX"),
+    },
+    "BANKEX": {
+        "exchange": "BSE",
+        "yahoo": "BSE-BANK.BO",
+        "upstox_key": "BSE_INDEX|BANKEX",
+        "name": "BSE BANKEX",
+        "has_derivatives": True,
+        "aliases": ("BSEBANK", "BSE BANKEX", "BSE-BANK.BO", "BSE_INDEX|BANKEX"),
+    },
+    "INDIAVIX": {
+        "exchange": "NSE",
+        "yahoo": "^INDIAVIX",
+        "upstox_key": "NSE_INDEX|India VIX",
+        "name": "INDIA VIX",
+        "has_derivatives": False,
+        "aliases": ("INDIAVIX", "INDIA VIX", "^INDIAVIX", "NSE_INDEX|INDIA VIX"),
+    },
 }
 
 # Derivatives Regex
@@ -46,11 +163,17 @@ def normalize_index_name(raw_index):
     """Normalize index name or alias to canonical index key (e.g. 'NIFTY 50' -> 'NIFTY')."""
     if not raw_index or not isinstance(raw_index, str):
         return None
-    clean = raw_index.strip().upper()
+    clean = " ".join(raw_index.strip().upper().split())
+    if ":" in clean:
+        parts = clean.split(":", 1)
+        if parts[0] in ("NSE", "BSE"):
+            clean = parts[1].strip()
     if clean in INDEX_MAP:
         return clean
     for canon, meta in INDEX_MAP.items():
-        if clean == meta["name"] or clean == meta["yahoo"]:
+        if clean == meta["name"].upper() or clean == meta["yahoo"].upper():
+            return canon
+        if clean == str(meta.get("upstox_key") or "").upper():
             return canon
         for alias in meta["aliases"]:
             if clean == alias.upper():
@@ -61,6 +184,24 @@ def normalize_index_name(raw_index):
 def is_index_symbol(symbol):
     """Return True if symbol corresponds to a known index."""
     return normalize_index_name(symbol) is not None
+
+
+def get_index_metadata(symbol):
+    """Return canonical index metadata copy for a known index, else None."""
+    canon = normalize_index_name(symbol)
+    if not canon:
+        return None
+    meta = dict(INDEX_MAP[canon])
+    meta["canonical_symbol"] = canon
+    return meta
+
+
+def list_benchmark_indices(exchange=None):
+    """Return list of canonical benchmark index symbols, optionally filtered by exchange."""
+    ex = str(exchange or "").strip().upper()
+    if not ex or ex == "ALL":
+        return list(BENCHMARK_INDICES)
+    return [sym for sym in BENCHMARK_INDICES if INDEX_MAP[sym]["exchange"] == ex]
 
 
 def normalize_symbol(raw_symbol):

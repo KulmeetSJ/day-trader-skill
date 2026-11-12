@@ -52,6 +52,10 @@ Reports tabular quarterly income/margin metrics plus YoY % growth, diluted EPS, 
 3. Call out balance-sheet leverage, cash runway, or upcoming earnings/filings risk if holding intraday or swinging across an expected report date.
 4. For JSON automation pipelines, inspect `provenance` (`provider`, `data_status`, `is_live`, `last_data_timestamp`) returned by `--json` or `--metrics` (see `metrics.example.json` for schema fields).
 
+## Opt-in visualisations
+
+Default output is text/tables only. Only when the user explicitly requests a chart, render revenue/profit/margin trends via `../trader-alerts/visuals.py fundamentals --facts ...` using already-fetched data (see `guides/trader-visuals.md`).
+
 ## What it never does
 
 It never forecasts future EPS or target prices, never rates a stock buy/sell, and never places a broker order.

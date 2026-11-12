@@ -1087,9 +1087,30 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None,
 
 # ---------------------------------------------------------------- fills -> portfolio
 
+def _assert_tradable_instrument(symbol, doc=None):
+    """Refuse direct equity/broker execution or paper fills on spot benchmark indices."""
+    raw = str(symbol or "").strip().upper()
+    norm = symbols_in.normalize_symbol(raw) if symbols_in else raw
+    is_deriv = bool(symbols_in and symbols_in.is_derivative_symbol(raw))
+    if isinstance(doc, dict):
+        if doc.get("option_contract") or doc.get("asset_type") in ("OPTIONS", "FUTURES"):
+            return
+        if str(doc.get("asset_type") or "").upper() == "INDEX" and not is_deriv:
+            raise TicketError(
+                "%s is a spot index (analytical only, not a directly tradable equity); "
+                "use index F&O derivative contracts instead" % norm
+            )
+    if symbols_in and symbols_in.is_index_symbol(norm) and not is_deriv:
+        raise TicketError(
+            "%s is a spot index (analytical only, not a directly tradable equity); "
+            "use index F&O derivative contracts instead" % norm
+        )
+
+
 def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None):
     """Record a filled order in trader/portfolio.json: cash and shares, with a
     cost-basis lot per buy (oldest lots are relieved first on a sell)."""
+    _assert_tradable_instrument(symbol)
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
         budget = cfg.get("budget")
@@ -1280,6 +1301,7 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    _assert_tradable_instrument(order.get("symbol", ""), doc=order)
     doc = read_json(a.orders, "orders file", required=False)
     sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
@@ -1440,6 +1462,7 @@ def cmd_flatten(a):
     sym = a.symbol.strip().upper()
     if symbols_in:
         sym = symbols_in.normalize_symbol(sym)
+    _assert_tradable_instrument(sym)
     plan = read_json(a.plan, "plan", required=False) or {}
     market = get_market_profile(a, cfg=cfg, risk=plan)
     if market == "US" and (sym.endswith((".NS", ".BO", "-EQ")) or plan.get("market") == "IN"):
