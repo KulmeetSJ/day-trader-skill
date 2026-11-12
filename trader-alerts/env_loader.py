@@ -1,7 +1,7 @@
 """Safe, optional .env loader using Python standard library only.
 
 Security and compatibility guarantees:
-- Locates .env relative to the project root, never the current working directory.
+- Locates .env relative to the project root (or enclosing repo root for in-repo dist/ packages), never the current working directory.
 - Supports KEY=value, optional `export KEY=value`, single-quoted literals, and double-quoted strings.
 - Never executes shell commands, subprocesses, eval/exec, or variable interpolation ($VAR, ${VAR}, $(...), `...`).
 - Never prints or logs loaded values or secrets.
@@ -135,9 +135,36 @@ def load_dotenv_file(path, environ=None, override=False):
     return tuple(loaded)
 
 
+def _find_packaged_repo_dotenv(pkg_root):
+    """Find <repo>/.env ONLY when pkg_root is an in-repo dist/ package copy.
+
+    Never resolves via os.getcwd() and stops within a bounded parent depth so
+    standalone extractions (such as Claude Chat containers) never search parent
+    directories arbitrarily.
+    """
+    abs_root = os.path.abspath(str(pkg_root))
+    cur = abs_root
+    for _ in range(4):
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        rel_parts = os.path.relpath(abs_root, parent).split(os.sep)
+        if rel_parts and rel_parts[0] == "dist":
+            if os.path.isfile(os.path.join(parent, "trader-alerts", "env_loader.py")):
+                cand_env = os.path.join(parent, ".env")
+                if os.path.isfile(cand_env):
+                    return cand_env
+        cur = parent
+    return None
+
+
 def load_project_dotenv(project_root=None, environ=None, override=False):
-    """Load <project_root>/.env if present, without overwriting existing env vars."""
+    """Load <project_root>/.env (or enclosing repo .env for in-repo dist/) without overwriting existing env vars."""
     root = resolve_project_root(project_root)
     env_path = os.path.join(root, ".env")
+    if project_root is None and not os.path.isfile(env_path):
+        packaged_env = _find_packaged_repo_dotenv(root)
+        if packaged_env:
+            env_path = packaged_env
     return load_dotenv_file(env_path, environ=environ, override=override)
 

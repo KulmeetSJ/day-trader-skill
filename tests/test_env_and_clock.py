@@ -198,6 +198,77 @@ class TestSafeDotenvLoader(unittest.TestCase):
         self.assertEqual(d2["tok"], "exported_env_override_tok")
         self.assertEqual(d2["cls"], "yahoo")
 
+    def test_packaged_dist_resolves_enclosing_repo_dotenv_while_standalone_stays_default(self):
+        mini_repo = os.path.join(self.tmp, "repo")
+        repo_alerts = os.path.join(mini_repo, "trader-alerts")
+        pkg_root = os.path.join(mini_repo, "dist", "claude-chat", "day-trader-skill-chat")
+        pkg_alerts = os.path.join(pkg_root, "trader-alerts")
+        standalone_parent = os.path.join(self.tmp, "standalone_parent")
+        standalone_alerts = os.path.join(standalone_parent, "day-trader-skill-chat", "trader-alerts")
+        outside_cwd = os.path.join(self.tmp, "outside_cwd")
+        for d in (repo_alerts, pkg_alerts, standalone_alerts, outside_cwd):
+            os.makedirs(d)
+
+        for fname in ("env_loader.py", "data_in.py", "symbols_in.py", "calendar_in.py", "instruments.py", "upstox_feed.py"):
+            shutil.copy2(os.path.join(ROOT, "trader-alerts", fname), os.path.join(repo_alerts, fname))
+            shutil.copy2(os.path.join(ROOT, "trader-alerts", fname), os.path.join(pkg_alerts, fname))
+            shutil.copy2(os.path.join(ROOT, "trader-alerts", fname), os.path.join(standalone_alerts, fname))
+
+        repo_tok = "dotenv_pkg_tok_222"
+        with open(os.path.join(mini_repo, ".env"), "w", encoding="utf-8") as fh:
+            fh.write("INDIA_MARKET_DATA_PROVIDER=upstox\n")
+            fh.write("UPSTOX_ANALYTICS_TOKEN=%s\n" % repo_tok)
+        with open(os.path.join(outside_cwd, ".env"), "w", encoding="utf-8") as fh:
+            fh.write("INDIA_MARKET_DATA_PROVIDER=offline\n")
+            fh.write("UPSTOX_ANALYTICS_TOKEN=outside_cwd_decoy\n")
+        with open(os.path.join(standalone_parent, ".env"), "w", encoding="utf-8") as fh:
+            fh.write("INDIA_MARKET_DATA_PROVIDER=upstox\n")
+            fh.write("UPSTOX_ANALYTICS_TOKEN=arbitrary_parent_decoy\n")
+
+        probe = (
+            "import json, os, sys; "
+            "sys.path.insert(0, sys.argv[1]); "
+            "import data_in; "
+            "print(json.dumps({"
+            "'provider': data_in.resolve_provider_name(), "
+            "'has_tok': bool(os.environ.get('UPSTOX_ANALYTICS_TOKEN')), "
+            "'tok': os.environ.get('UPSTOX_ANALYTICS_TOKEN', ''), "
+            "'cls': data_in.get_provider().provider_name"
+            "}))"
+        )
+        base_env = {k: v for k, v in os.environ.items() if k not in (
+            "INDIA_MARKET_DATA_PROVIDER", "BHARAT_DATA_PROVIDER", "UPSTOX_ANALYTICS_TOKEN"
+        )}
+
+        # In-repo dist/ package loads enclosing mini_repo/.env and ignores outside_cwd/.env
+        r_pkg = subprocess.run(
+            [sys.executable, "-c", probe, pkg_alerts],
+            cwd=outside_cwd, env=base_env, capture_output=True, text=True, check=True,
+        )
+        d_pkg = json.loads(r_pkg.stdout)
+        self.assertEqual(d_pkg["provider"], "upstox")
+        self.assertEqual(d_pkg["tok"], repo_tok)
+        self.assertEqual(d_pkg["cls"], "upstox")
+
+        # Exported shell env still overrides enclosing repo .env
+        override_env = dict(base_env)
+        override_env["INDIA_MARKET_DATA_PROVIDER"] = "yahoo"
+        r_ov = subprocess.run(
+            [sys.executable, "-c", probe, pkg_alerts],
+            cwd=outside_cwd, env=override_env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(json.loads(r_ov.stdout)["cls"], "yahoo")
+
+        # Standalone extraction never searches arbitrary parents and stays default yahoo
+        r_solo = subprocess.run(
+            [sys.executable, "-c", probe, standalone_alerts],
+            cwd=outside_cwd, env=base_env, capture_output=True, text=True, check=True,
+        )
+        d_solo = json.loads(r_solo.stdout)
+        self.assertEqual(d_solo["provider"], "yahoo")
+        self.assertFalse(d_solo["has_tok"])
+        self.assertEqual(d_solo["cls"], "yahoo")
+
 
 class TestNowClockOverrideSemantics(unittest.TestCase):
     def setUp(self):

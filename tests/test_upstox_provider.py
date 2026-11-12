@@ -1477,6 +1477,125 @@ class TestUpstoxProvider(unittest.TestCase):
         self.assertIsNone(ce["prev_oi"])
         self.assertIsNone(ce["change_in_oi"])
 
+    def test_entry_freshness_interval_aware_1m_and_5m_boundaries(self):
+        import entry as entry_mod  # type: ignore  # noqa: E402
+
+        def _make_5m_chart(last_bar_end_ist, provider="upstox", tier="REAL_TIME", status="CURRENT", is_live=True):
+            bars = [
+                ["2026-10-19T09:15:00+05:30", 1342.0, 1348.0, 1340.0, 1346.0, 9000, 0],
+                ["2026-10-19T09:20:00+05:30", 1346.0, 1349.5, 1343.0, 1347.0, 8000, 0],
+                ["2026-10-19T09:25:00+05:30", 1347.0, 1350.0, 1345.0, 1349.0, 8500, 0],
+                ["2026-10-19T09:30:00+05:30", 1349.0, 1358.0, 1348.5, 1356.0, 22000, 0],
+            ]
+            last_start = last_bar_end_ist - datetime.timedelta(minutes=5)
+            if last_start > datetime.datetime(2026, 10, 19, 9, 30, 0, tzinfo=calendar_in.IST):
+                bars.append([last_start.isoformat(), 1356.0, 1359.0, 1354.0, 1357.0, 10000, 0])
+            bar_dicts = []
+            for row in bars:
+                ts = int(datetime.datetime.fromisoformat(row[0]).timestamp())
+                bar_dicts.append({"t": ts, "ts": ts, "o": row[1], "h": row[2], "l": row[3], "c": row[4], "v": row[5]})
+            dt_ts = int(last_bar_end_ist.timestamp())
+            ch = data_in.to_entry_chart({
+                "symbol": "RELIANCE",
+                "exchange": "NSE",
+                "interval": "5m",
+                "provider": provider,
+                "source": provider,
+                "tier": tier,
+                "data_status": status,
+                "is_live": is_live,
+                "timestamp": dt_ts,
+                "prev_close": 1340.0,
+                "bars": bar_dicts,
+                "meta": {"symbol": "RELIANCE.NS", "dataGranularity": "5m", "regularMarketTime": dt_ts},
+            })
+            ch["is_live_capable"] = (provider == "upstox")
+            return ch
+
+        def _make_1m_chart(last_bar_end_ist):
+            bars = []
+            t0 = datetime.datetime(2026, 10, 19, 9, 15, 0, tzinfo=calendar_in.IST)
+            cur = t0
+            while cur < last_bar_end_ist:
+                ts = int(cur.timestamp())
+                close_px = 1345.0 if (cur - t0).total_seconds() < 900 else 1356.0
+                bars.append({"t": ts, "ts": ts, "o": close_px - 1.0, "h": close_px + 0.5, "l": close_px - 1.5, "c": close_px, "v": 2000})
+                cur += datetime.timedelta(minutes=1)
+            dt_ts = int(last_bar_end_ist.timestamp())
+            ch = data_in.to_entry_chart({
+                "symbol": "RELIANCE",
+                "exchange": "NSE",
+                "interval": "1m",
+                "provider": "upstox",
+                "source": "upstox",
+                "tier": "REAL_TIME",
+                "data_status": "CURRENT",
+                "is_live": True,
+                "timestamp": dt_ts,
+                "prev_close": 1340.0,
+                "bars": bars,
+                "meta": {"symbol": "RELIANCE.NS", "dataGranularity": "1m", "regularMarketTime": dt_ts},
+            })
+            ch["is_live_capable"] = True
+            return ch
+
+        # 5m: step=300, max_fresh_lag=420s
+        bar_end_5m = datetime.datetime(2026, 10, 19, 10, 30, 0, tzinfo=calendar_in.IST)
+        ch_5m = _make_5m_chart(bar_end_5m)
+        for sec_lag, exp_tier, exp_status, exp_live in (
+            (255, "CURRENT", "current", True),    # mid-candle (4m15s after bar end)
+            (420, "CURRENT", "current", True),    # exact step + 120 boundary
+            (421, "DELAYED", "delayed", False),   # 1s past boundary
+            (1801, "DELAYED", "stale", False),    # genuinely stale (> 30m)
+        ):
+            now_ist = bar_end_5m + datetime.timedelta(seconds=sec_lag)
+            now_utc = now_ist.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            ev = entry_mod.evaluate(ch_5m, now_utc, setup="orb", or_minutes=15, interval="5m", market="IN")
+            self.assertEqual(ev["data_tier"], exp_tier, "5m lag=%s" % sec_lag)
+            self.assertEqual(ev["data_status"], exp_status, "5m lag=%s" % sec_lag)
+            self.assertIs(ev["is_live_data"], exp_live, "5m lag=%s" % sec_lag)
+            self.assertIs(ev["is_live_signal"], exp_live, "5m lag=%s" % sec_lag)
+            self.assertEqual(ev["trigger"]["bar_start"], "09:30")
+            self.assertEqual(ev["trigger"]["price"], 1356.0)
+            if exp_live:
+                txt = "\n".join(entry_mod.describe(ev))
+                self.assertIn("CURRENT data", txt)
+                self.assertNotIn("websocket", txt.lower())
+                self.assertNotIn("streaming", txt.lower())
+                doc = entry_mod.entry_doc(ev, now_utc)
+                self.assertEqual(doc["data_tier"], "CURRENT")
+                self.assertEqual(doc["data_status"], "current")
+
+        # Yahoo on the same 5m mid-candle timestamp remains DELAYED
+        ch_5m_y = _make_5m_chart(bar_end_5m, provider="yahoo", tier="DELAYED", status="DELAYED", is_live=False)
+        now_255 = (bar_end_5m + datetime.timedelta(seconds=255)).astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        ev_y = entry_mod.evaluate(ch_5m_y, now_255, setup="orb", or_minutes=15, interval="5m", market="IN")
+        self.assertEqual(ev_y["data_tier"], "DELAYED")
+        self.assertFalse(ev_y["is_live_data"])
+
+        # --now override still downgrades CURRENT window to HISTORICAL
+        ev_sim = entry_mod.evaluate(ch_5m, now_255, setup="orb", or_minutes=15, interval="5m", market="IN", simulated=True)
+        self.assertEqual(ev_sim["data_tier"], "HISTORICAL")
+        self.assertFalse(ev_sim["is_live_data"])
+        self.assertFalse(ev_sim["is_live_signal"])
+
+        # 1m: step=60, max_fresh_lag=180s
+        bar_end_1m = datetime.datetime(2026, 10, 19, 10, 30, 0, tzinfo=calendar_in.IST)
+        ch_1m = _make_1m_chart(bar_end_1m)
+        for sec_lag, exp_tier, exp_status, exp_live in (
+            (45, "CURRENT", "current", True),
+            (180, "CURRENT", "current", True),
+            (181, "DELAYED", "delayed", False),
+            (1801, "DELAYED", "stale", False),
+        ):
+            now_ist = bar_end_1m + datetime.timedelta(seconds=sec_lag)
+            now_utc = now_ist.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            ev = entry_mod.evaluate(ch_1m, now_utc, setup="orb", or_minutes=15, interval="1m", market="IN")
+            self.assertEqual(ev["data_tier"], exp_tier, "1m lag=%s" % sec_lag)
+            self.assertEqual(ev["data_status"], exp_status, "1m lag=%s" % sec_lag)
+            self.assertIs(ev["is_live_data"], exp_live, "1m lag=%s" % sec_lag)
+            self.assertIs(ev["is_live_signal"], exp_live, "1m lag=%s" % sec_lag)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1280,17 +1280,21 @@ def _classify_market_data(chart, market, day, eval_day, local, open_dt, close_dt
         and prov_tier in ("", "CURRENT", "REAL_TIME")
     )
 
+    # Completed-candle feeds set dt to the last closed bar end; allow one bar
+    # interval plus a 120s settlement grace window for CURRENT freshness
+    # (distinct from live streaming WebSocket quotes).
+    max_fresh_lag = step + 120
     dt_day = to_local(utc_of(dt), market=market).date() if dt is not None else None
     lag_sec = (now_ts - int(dt)) if dt is not None else None
     min_lag = 0 if market == "IN" else -5
-    dt_is_fresh = (dt is not None and dt_day == day and lag_sec is not None and min_lag <= lag_sec <= 120)
+    dt_is_fresh = (dt is not None and dt_day == day and lag_sec is not None and min_lag <= lag_sec <= max_fresh_lag)
 
     received_bars = [b for b in by_slot.values() if b["t"] <= now_ts]
     if eval_day == day and local >= open_dt + datetime.timedelta(seconds=step):
         if received_bars:
             latest_bar_end = max(b["t"] + step for b in received_bars)
             bars_lag = now_ts - latest_bar_end
-            bars_are_fresh = bars_lag <= (step + 120)
+            bars_are_fresh = bars_lag <= max_fresh_lag
         else:
             bars_lag = None
             bars_are_fresh = False
