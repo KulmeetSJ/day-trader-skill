@@ -854,11 +854,25 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             asset_type = "INDEX"
         else:
             asset_type = "EQUITY"
+    asset_type = str(asset_type).upper()
+    if asset_type == "OPTIONS":
+        if not c.get("allow_options"):
+            raise SizeError("options are not enabled: set allow_options: true in trader/config.json")
+        if market == "IN" and symbols_in and symbols_in.is_index_symbol(sym) and not symbols_in.is_derivative_symbol(sym):
+            raise SizeError("%s is a benchmark spot index (analytical only); caller asset_type cannot make it tradable" % sym)
+        if not symbols_in or not symbols_in.is_derivative_symbol(raw_sym):
+            raise SizeError("OPTIONS sizing requires an actual listed derivative contract symbol")
+        if not instruments:
+            raise SizeError("authoritative instrument master is required for option sizing")
+        try:
+            instruments.validate_listed_derivative_contract(raw_sym, exchange=req_exchange, expected=plan.get("option_contract"))
+        except Exception as exc:
+            raise SizeError("derivative contract validation failed: %s" % exc)
+        raise SizeError("OPTION RISK UNAVAILABLE: option sizing is disabled until fresh two-sided quotes, authoritative tick/liquidity metadata, costs, and premium-based stops/targets validate at least 1:2 R:R")
 
     if str(asset_type).upper() == "INDEX" or (
         market == "IN" and symbols_in and symbols_in.is_index_symbol(sym)
-        and not symbols_in.is_derivative_symbol(sym) and not plan.get("option_contract")
-        and asset_type not in ("OPTIONS", "FUTURES")
+        and not symbols_in.is_derivative_symbol(sym)
     ):
         raise SizeError(
             "%s is a benchmark spot index (analytical only, not a directly tradable equity); "
@@ -871,6 +885,12 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     elif asset_type == "FUTURES":
         if c.get("allow_futures") is False:
             raise SizeError("futures are not enabled: set allow_futures: true in trader/config.json")
+
+    if str(asset_type).upper() in ("OPTIONS", "FUTURES"):
+        if not symbols_in or not symbols_in.is_derivative_symbol(raw_sym):
+            raise SizeError("OPTIONS/FUTURES sizing requires an actual listed derivative contract symbol")
+        if not instruments:
+            raise SizeError("authoritative instrument master is required for derivative sizing")
 
     if today and plan.get("date") and str(plan["date"]) != today:
         is_allowed_off_hours = False
@@ -918,17 +938,35 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             except Exception as exc:
                 raise SizeError("Failed to load authoritative instrument cache (%s): %s" % (inst_path, exc))
         if inst_cache is not None:
+            if symbols_in and symbols_in.is_derivative_symbol(raw_sym):
+                try:
+                    inst = instruments.validate_listed_derivative_contract(raw_sym, cache_payload=inst_cache, exchange=req_exchange)
+                except Exception as exc:
+                    raise SizeError("derivative contract validation failed: %s" % exc)
             instr_err_cls = getattr(instruments, "InstrumentMetadataError", Exception)
             try:
-                inst = instruments.resolve_instrument(
-                    raw_sym, cache_payload=inst_cache, require_intraday=False, exchange=req_exchange
-                )
+                if inst is None:
+                    inst = instruments.resolve_instrument(
+                        raw_sym, cache_payload=inst_cache, require_intraday=False, exchange=req_exchange
+                    )
             except instr_err_cls as exc:
                 raise SizeError(str(exc))
             if inst:
                 inst_tick = _parse_tick(inst.get("tick_size"), allow_none=False, context="instrument master (%s)" % sym)
                 if inst.get("exchange"):
                     resolved_exchange = str(inst["exchange"]).strip().upper()
+
+        if asset_type in ("OPTIONS", "FUTURES"):
+            try:
+                inst = instruments.validate_listed_derivative_contract(
+                    raw_sym, cache_payload=inst_cache, exchange=req_exchange,
+                    expected=plan.get("option_contract"),
+                )
+                inst_tick = _parse_tick(inst.get("tick_size"), allow_none=False, context="listed contract (%s)" % sym)
+                if inst.get("exchange"):
+                    resolved_exchange = str(inst["exchange"]).strip().upper()
+            except Exception as exc:
+                raise SizeError("derivative contract validation failed: %s" % exc)
 
     plan_tick = None
     if "tick_size" in plan:

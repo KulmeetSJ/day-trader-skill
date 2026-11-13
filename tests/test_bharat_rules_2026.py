@@ -7,7 +7,7 @@ Verifies:
 4. NSE MIDCPNIFTY expiry (Tuesday)
 5. NSE stock derivative expiry (Tuesday)
 6. Holiday-adjusted expiry (roll backward to previous trading day)
-7. BSE independent expiry rules (SENSEX Friday, BANKEX Monday)
+7. BSE independent expiry rules (SENSEX/BANKEX Thursday)
 8. STT calculations for equity intraday, equity delivery, futures, options, and exercised options
 9. NSE transaction charges across cash, futures, and options segments (March 2026 revision)
 10. Brokerage separation and charges impact on trade profitability
@@ -103,25 +103,25 @@ class TestBharatRules2026(unittest.TestCase):
         self.assertFalse(is_trading)
         self.assertIn("Dussehra", reason)
 
-    # 7. BSE Independent Expiry Rules (SENSEX Friday, BANKEX Monday)
+    # 7. BSE Independent Expiry Rules (SENSEX/BANKEX Thursday)
     def test_bse_expiry_rules_independent(self):
-        # SENSEX: Friday (weekday = 4)
+        # SENSEX: Thursday (weekday = 3)
         sensex_weekday = calendar_mod.get_fallback_expiry_weekday(exchange="BSE", underlying="SENSEX")
-        self.assertEqual(sensex_weekday, 4)
+        self.assertEqual(sensex_weekday, 3)
         sensex_exp = calendar_mod.get_next_expiry(as_of_date="2026-10-19", underlying="SENSEX", exchange="BSE")
-        self.assertEqual(sensex_exp.weekday(), 4)  # Friday
-        self.assertEqual(sensex_exp.isoformat(), "2026-10-23")
+        self.assertEqual(sensex_exp.weekday(), 3)  # Thursday
+        self.assertEqual(sensex_exp.isoformat(), "2026-10-22")
 
-        # BANKEX: Monday (weekday = 0)
+        # BANKEX: Thursday (weekday = 3)
         bankex_weekday = calendar_mod.get_fallback_expiry_weekday(exchange="BSE", underlying="BANKEX")
-        self.assertEqual(bankex_weekday, 0)
+        self.assertEqual(bankex_weekday, 3)
         bankex_exp = calendar_mod.get_next_expiry(as_of_date="2026-10-21", underlying="BANKEX", exchange="BSE")
-        self.assertEqual(bankex_exp.weekday(), 0)  # Monday
-        self.assertEqual(bankex_exp.isoformat(), "2026-10-26")
+        self.assertEqual(bankex_exp.weekday(), 3)  # Thursday
+        self.assertEqual(bankex_exp.isoformat(), "2026-10-29")
 
-        # General BSE fallback is Friday
+        # General BSE fallback is Thursday
         gen_bse = calendar_mod.get_fallback_expiry_weekday(exchange="BSE", underlying="UNKNOWN_BSE")
-        self.assertEqual(gen_bse, 4)
+        self.assertEqual(gen_bse, 3)
 
     # 8. STT Calculations Across All Segments (Effective 1 April 2026)
     def test_stt_calculations_all_segments(self):

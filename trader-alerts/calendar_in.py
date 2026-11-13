@@ -727,18 +727,15 @@ def get_fallback_expiry_weekday(exchange="NSE", underlying=None):
 
     Authoritative Exchange Specifications (November 2026):
     - NSE: Tuesday (weekday = 1) for NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY,
-      and individual stock derivatives.
-    - BSE: SENSEX / general BSE contracts expire on Friday (weekday = 4);
-      BSE BANKEX expires on Monday (weekday = 0).
+      NIFTYNXT50, and individual stock derivatives.
+    - BSE: Thursday (weekday = 3) for SENSEX, BANKEX, and general BSE derivatives.
     When the target expiry day is an exchange holiday, the expiry is adjusted
     to the preceding trading day.
     """
     u = str(underlying or "").strip().upper()
     exch = str(exchange or "NSE").strip().upper()
-    if u == "BANKEX":
-        return 0  # BSE BANKEX: Monday
-    if u == "SENSEX" or exch == "BSE":
-        return 4  # BSE SENSEX / general BSE: Friday
+    if u in ("SENSEX", "BANKEX") or exch == "BSE":
+        return 3  # BSE SENSEX / BANKEX / general BSE: Thursday
     # NSE authoritative specification: Tuesday for all index and stock derivatives
     return 1
 

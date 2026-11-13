@@ -26,7 +26,7 @@ risk_mod = load("trader-risk", "check")
 
 
 class TestBharatOptionsRisk(unittest.TestCase):
-    def test_options_sizing_in_whole_lots(self):
+    def test_options_sizing_fails_closed_without_validated_contract_pricing(self):
         plan = {
             "symbol": "NIFTY26OCT24000CE",
             "side": "buy",
@@ -51,23 +51,11 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "market": "IN",
         }
 
-        s = budget_mod.size_trade(plan, cfg, today="2026-10-19")
-        self.assertIsNone(s["refusal"])
-        # 1 lot = 25 * 24 = Rs 600 risk; 2 lots = 50 * 24 = Rs 1200 risk; 3 lots = 75 * 24 = Rs 1800 (> 1500)
-        self.assertEqual(s["qty"], 50)
-        self.assertEqual(s["contracts"], 2)
-        self.assertEqual(s["lot_size"], 25)
-        self.assertEqual(s["asset_type"], "OPTIONS")
-        self.assertIn("transaction_costs", s)
+        with self.assertRaises(budget_mod.SizeError) as ctx:
+            budget_mod.size_trade(plan, cfg, today="2026-10-19")
+        self.assertIn("derivative contract validation failed", str(ctx.exception))
 
-        order = budget_mod.bracket_order(s)
-        self.assertIsNotNone(order)
-        self.assertEqual(order["qty"], "50")
-        self.assertEqual(order["contracts"], 2)
-        self.assertEqual(order["lot_size"], 25)
-        self.assertEqual(order["asset_type"], "OPTIONS")
-
-    def test_options_sizing_refusal_when_one_lot_risk_exceeds_max_loss(self):
+    def test_options_sizing_refuses_unverified_contract_before_calculating_loss(self):
         plan = {
             "symbol": "NIFTY26OCT24000CE",
             "side": "buy",
@@ -88,11 +76,9 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "market": "IN",
         }
 
-        s = budget_mod.size_trade(plan, cfg, today="2026-10-19")
-        self.assertEqual(s["qty"], 0)
-        self.assertIsNotNone(s["refusal"])
-        self.assertIn("more than your \u20b91,000 max loss per trade", s["refusal"])
-        self.assertIsNone(budget_mod.bracket_order(s))
+        with self.assertRaises(budget_mod.SizeError) as ctx:
+            budget_mod.size_trade(plan, cfg, today="2026-10-19")
+        self.assertIn("derivative contract validation failed", str(ctx.exception))
 
     def test_options_gate_blocks_when_not_allowed(self):
         plan = {

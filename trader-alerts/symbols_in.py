@@ -334,7 +334,7 @@ def parse_derivative_symbol(symbol):
         month_num = MONTH_NAMES.index(month_str) + 1
         import calendar
         last_day = calendar.monthrange(yy, month_num)[1]
-        target_weekday = 0 if underlying == "BANKEX" else (4 if underlying == "SENSEX" else 1)
+        target_weekday = 3 if underlying in ("SENSEX", "BANKEX") else 1
         offset = (datetime.date(yy, month_num, last_day).weekday() - target_weekday) % 7
         exp_date = "%04d-%02d-%02d" % (yy, month_num, last_day - offset)
         return {
@@ -364,7 +364,7 @@ def parse_derivative_symbol(symbol):
         option_type = m.group("option_type")
         import calendar
         last_day = calendar.monthrange(yy, month_num)[1]
-        target_weekday = 0 if underlying == "BANKEX" else (4 if underlying == "SENSEX" else 1)
+        target_weekday = 3 if underlying in ("SENSEX", "BANKEX") else 1
         offset = (datetime.date(yy, month_num, last_day).weekday() - target_weekday) % 7
         exp_date = "%04d-%02d-%02d" % (yy, month_num, last_day - offset)
         return {

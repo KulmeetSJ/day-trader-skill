@@ -829,6 +829,28 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                          % (oc or "advanced_instructions"))
 
         # asset
+        is_in_derivative = bool(market == "IN" and symbols_in and symbols_in.is_derivative_symbol(sym))
+        is_spot_idx = bool(
+            market == "IN" and symbols_in and symbols_in.is_index_symbol(sym) and not is_in_derivative
+        )
+        declared_derivative = str(o.get("asset_type") or "").upper() in ("OPTIONS", "FUTURES") or bool(o.get("option_contract"))
+        if is_spot_idx:
+            reasons.append(
+                "asset: %s is a spot index (analytical only); caller asset_type/options metadata cannot make it tradable" % sym
+            )
+        elif declared_derivative and not is_in_derivative:
+            reasons.append("asset: %s is not a canonical listed derivative contract symbol" % sym)
+        elif is_in_derivative:
+            if not instruments:
+                reasons.append("asset: authoritative instrument master unavailable for derivative %s" % sym)
+            else:
+                try:
+                    instruments.validate_listed_derivative_contract(
+                        sym, cache_payload=inst_cache, exchange=o.get("exchange"),
+                        expected=o.get("option_contract")
+                    )
+                except Exception as exc:
+                    reasons.append("asset: derivative contract validation failed for %s: %s" % (sym, exc))
         is_opt = False
         is_fut = False
         deriv_meta = None
@@ -846,12 +868,19 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         elif o.get("asset_type") == "FUTURES":
             is_fut = True
 
-        if is_opt:
+        if is_spot_idx or (declared_derivative and not is_in_derivative):
+            pass
+        elif is_opt:
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
+            elif side == "buy":
+                reasons.append(
+                    "OPTION RISK UNAVAILABLE: this pipeline does not validate fresh two-sided option quotes, "
+                    "authoritative contract ticks, liquidity, execution costs, and premium-based stop/target at 1:2 R:R"
+                )
             else:
-                warns.append("option order: options can lose 100% of what you pay")
+                warns.append("option exit: closing an existing long contract; use a fresh market quote")
         elif is_fut:
             if c.get("allow_futures") is False:
                 reasons.append("asset: %s is a futures contract; futures are off "
@@ -859,14 +888,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             else:
                 warns.append("futures order: leveraged derivative instrument")
         elif sym:
-            is_spot_idx = (
-                str(o.get("asset_type") or "").upper() == "INDEX"
-                or (
-                    symbols_in
-                    and symbols_in.is_index_symbol(sym)
-                    and not symbols_in.is_derivative_symbol(sym)
-                )
-            )
+            is_spot_idx = str(o.get("asset_type") or "").upper() == "INDEX"
             if is_spot_idx:
                 reasons.append(
                     "asset: %s is a spot index (analytical only, not a tradable equity); "

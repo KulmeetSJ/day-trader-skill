@@ -1831,7 +1831,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     res["reward_risk"] = rr_preview
     lot_sz = ((res.get("option_contract") or {}).get("lot_size") or 1)
     res["sizing_preview"] = (
-        None if (invalidated_bar is not None or is_extended or plan is None)
+        None if (setup == "options_orb" or invalidated_bar is not None or is_extended or plan is None)
         else _sizing_estimate(entry_ref_out, stop_preview, cfg, market=market, lot_size=lot_sz)
     )
 
@@ -1844,6 +1844,10 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         d_state = "NO TRADE"
         sub_state = "ANALYTICAL_ONLY_INDEX"
         no_trade_reason = "Spot index is analytical only (use NSE/BSE index F&O or --setup options_orb for tradable contracts)"
+    elif res.get("options_unavailable"):
+        d_state = "NO TRADE"
+        sub_state = res.get("option_contract_sub_state") or "NO_LISTED_FO_CONTRACT"
+        no_trade_reason = res.get("option_contract_unavailable_reason") or "UNAVAILABLE -- NO LISTED F&O CONTRACT"
     elif res.get("status") == "no-data" or (setup == "vwap_reclaim" and (indicators or {}).get("vwap_unavailable")):
         d_state = "NO TRADE"
         sub_state = "STALE_DATA" if data_status == "stale" else "NO_DATA"
@@ -1890,8 +1894,14 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
                     % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px) if curr_px is not None else float(trig["c"]))
                 )
         else:
-            d_state = "ENTRY CONFIRMED"
-            sub_state = "ACTIONABLE_IN_ZONE"
+            if setup == "options_orb":
+                res["underlying_signal_state"] = "ENTRY CONFIRMED"
+                d_state = "NO TRADE"
+                sub_state = "OPTION_RISK_UNAVAILABLE"
+                no_trade_reason = "OPTION RISK UNAVAILABLE: fresh two-sided premium quotes, authoritative tick size, spread/liquidity limits, costs and actual premium stop/target are not validated"
+            else:
+                d_state = "ENTRY CONFIRMED"
+                sub_state = "ACTIONABLE_IN_ZONE"
     else:
         # waiting / forming / pre-open
         forming_px = pending["c"] if pending else None
@@ -1933,6 +1943,19 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         "targets_preview": targets_preview,
         "reward_risk": rr_preview,
     }
+    if setup == "options_orb":
+        res["underlying_technical_preview"] = {
+            "instrument": res.get("symbol"),
+            "entry_reference": entry_ref_out,
+            "stop": stop_preview,
+            "targets": targets_preview,
+            "reward_risk": rr_preview,
+            "interpretation": "underlying analytical levels; not option premium levels or option R:R",
+        }
+        for key in ("entry_reference", "entry_reference_source", "stop_preview", "stop_preview_source",
+                    "risk_per_unit", "targets_preview", "reward_risk"):
+            res[key] = None
+            res["decision"][key] = None
     return res
 
 
@@ -2001,6 +2024,148 @@ def update_signal_state(state_path, sym, setup, interval, res, now_utc):
     res["signal_change"] = change
     res["deduplicated"] = deduped
     return res
+
+
+def _mark_options_unavailable(res, reason, sub_state="NO_LISTED_FO_CONTRACT"):
+    msg = str(reason or "UNAVAILABLE -- NO LISTED F&O CONTRACT")
+    res["options_unavailable"] = True
+    res["option_contract_status"] = "UNAVAILABLE"
+    res["option_contract_unavailable_reason"] = msg
+    res["option_contract_sub_state"] = sub_state
+    res["option_contract"] = None
+
+
+def _resolve_options_cache_payload(instruments_path):
+    if not instruments_path or instruments is None or not os.path.isfile(instruments_path):
+        return None
+    try:
+        return instruments.load_instrument_cache(instruments_path, max_age_days=30)
+    except Exception:
+        return None
+
+
+def _attach_options_orb_contract(res, chart, trig, now_utc, eval_day, exchange,
+                                 instruments_path=None, cfg=None, strike_selection="ATM", fetch_chain=True,
+                                 option_strategy=None):
+    """Resolve and attach an authoritative BOD-backed options contract, failing closed when unavailable."""
+    if res.get("market") != "IN":
+        return
+    strategy = str(option_strategy or "BUY CE").strip().upper().replace("_", " ")
+    if strategy not in ("BUY CE", "BUY CALL", "LONG CE"):
+        _mark_options_unavailable(res, "UNSUPPORTED_STRATEGY: only bullish BUY CE setup signals are implemented; BUY PE, SELL CE and SELL PE are unsupported", sub_state="UNSUPPORTED_STRATEGY")
+        return
+    sym_raw = chart.get("symbol", "")
+    sym_clean = sym_raw
+    if symbols_in:
+        try:
+            sym_clean = symbols_in.normalize_symbol(sym_raw)
+        except Exception:
+            sym_clean = sym_raw
+
+    sig_dt = _to_ist_aware(local_to_utc(trig["end"], market="IN")) if trig else _to_ist_aware(now_utc)
+    sig_day = trig["end"].date() if trig else eval_day
+    cache_payload = _resolve_options_cache_payload(instruments_path)
+
+    if instruments is None or not hasattr(instruments, "resolve_underlying_derivatives_meta"):
+        _mark_options_unavailable(res, "UNAVAILABLE -- INSTRUMENT MASTER MODULE UNAVAILABLE")
+        return
+
+    meta_d = instruments.resolve_underlying_derivatives_meta(
+        sym_clean, cache_payload=cache_payload, exchange=exchange, as_of_date=sig_day
+    )
+    if not meta_d.get("available", True) or meta_d.get("is_fo_eligible") is False:
+        sub_st = (
+            "HISTORICAL_CONTRACT_UNAVAILABLE"
+            if meta_d.get("source") == "unavailable_historical_bod"
+            else "NO_LISTED_FO_CONTRACT"
+        )
+        _mark_options_unavailable(res, meta_d.get("unavailable_reason"), sub_state=sub_st)
+        return
+
+    exp_arg = meta_d.get("expiry")
+    lot_sz = meta_d.get("lot_size")
+    strike_step = meta_d.get("strike_interval")
+    exch_resolved = meta_d.get("exchange") or exchange
+    if not exp_arg or not lot_sz or int(lot_sz) <= 0 or not strike_step or float(strike_step) <= 0:
+        _mark_options_unavailable(res, "UNAVAILABLE -- NO LISTED F&O CONTRACT")
+        return
+
+    if not fetch_chain or not trig or data_in is None:
+        return
+
+    try:
+        chain_kw = {
+            "expiry": exp_arg,
+            "exchange": exch_resolved,
+            "spot_price": trig["c"],
+        }
+        if chart.get("is_offline"):
+            chain_kw["provider"] = data_in.get_provider("simulated")
+            chain_kw["now"] = sig_dt
+        else:
+            chain_kw["config"] = cfg
+            chain_kw["now"] = sig_dt
+        chain = data_in.fetch_option_chain(sym_clean, **chain_kw)
+        if not chain or str(getattr(chain, "expiry", "") or "")[:10] != exp_arg:
+            _mark_options_unavailable(
+                res,
+                "UNAVAILABLE -- OPTION CHAIN EXPIRY %r DOES NOT MATCH AUTHORITATIVE BOD EXPIRY %s"
+                % (getattr(chain, "expiry", None), exp_arg),
+                sub_state="EXPIRY_MISMATCH",
+            )
+            return
+        sel_strike = chain.select_strike(strategy=strike_selection or "ATM", option_type="CE")
+        contract = chain.get_contract(sel_strike, "CE")
+        if not contract:
+            _mark_options_unavailable(res, "UNAVAILABLE -- NO OPTION CONTRACT RETURNED FOR STRIKE %r" % (sel_strike,))
+            return
+
+        try:
+            listed_contract = instruments.validate_listed_derivative_contract(
+                contract.get("symbol"), cache_payload=cache_payload, exchange=exch_resolved,
+                expected={
+                    "underlying": sym_clean, "exchange": exch_resolved, "expiry": exp_arg,
+                    "strike": sel_strike, "option_type": "CE",
+                },
+            )
+        except Exception as exc:
+            _mark_options_unavailable(res, "UNAVAILABLE -- OPTION CONTRACT IS NOT VERIFIED IN THE EXCHANGE MASTER: %s" % exc,
+                                      sub_state="UNLISTED_OPTION_CONTRACT")
+            return
+
+        fo_lot = listed_contract.get("lot_size") or instruments.get_fo_lot_size(
+            sym_clean, cache_payload=cache_payload, expiry=exp_arg, exchange=exch_resolved
+        ) or lot_sz
+        if not fo_lot or int(fo_lot) <= 0:
+            _mark_options_unavailable(res, "UNAVAILABLE -- LOT SIZE UNAVAILABLE FOR %s" % sym_clean)
+            return
+
+        tier_val = str(contract.get("tier", "SIMULATED")).replace("DataTier.", "")
+        is_sim_opt = tier_val == "SIMULATED"
+        res["option_contract_status"] = "SIMULATED" if is_sim_opt else "LIVE"
+        res["option_contract"] = {
+            "symbol": contract["symbol"],
+            "underlying": sym_clean,
+            "exchange": exch_resolved,
+            "strike": sel_strike,
+            "option_type": "CE",
+            "expiry": exp_arg,
+            "premium": contract["last_price"],
+            "lot_size": int(fo_lot),
+            "strike_interval": float(strike_step),
+            "greeks": contract.get("greeks", {}),
+            "tier": tier_val,
+            "is_simulated": is_sim_opt,
+            "metadata_source": meta_d.get("source"),
+        }
+        res["option_quote_status"] = "UNAVAILABLE"
+        res["option_quote_unavailable_reason"] = "OPTION RISK UNAVAILABLE: option chain did not provide a validated fresh two-sided quote, authoritative contract tick, liquidity and execution-cost inputs"
+        if is_sim_opt:
+            res["is_simulated"] = True
+        res["trigger"]["option_symbol"] = contract["symbol"]
+        res["trigger"]["option_premium"] = contract["last_price"]
+    except Exception as exc:
+        _mark_options_unavailable(res, "UNAVAILABLE -- %s" % str(exc), sub_state="OPTION_CHAIN_UNAVAILABLE")
 
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
@@ -2381,6 +2546,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                                 "low": _round_tick(or_l, eff_tick) if explicit_tick else r2(or_l),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
                                 "complete": (replay_full_session or local >= or_end), "avg_volume": int(round(avg_vol))}
+    if setup == "options_orb":
+        _attach_options_orb_contract(
+            res, chart, None, now_utc, eval_day, exchange,
+            instruments_path=instruments_path, cfg=cfg, strike_selection=strike_selection, fetch_chain=False,
+            option_strategy=option_strategy,
+        )
     if setup in ("orb", "options_orb"):
         if not replay_full_session and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
@@ -2601,75 +2772,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 minutes_since=res["minutes_since"], phase=res["phase"],
             )
 
-        # Options-specific enrichment
-        if setup == "options_orb" and data_in:
-            try:
-                sym_clean = chart["symbol"]
-                if symbols_in:
-                    try:
-                        sym_clean = symbols_in.normalize_symbol(sym_clean)
-                    except Exception:
-                        pass
-                exp_arg = None
-                meta_d = {}
-                if instruments is not None and hasattr(instruments, "resolve_underlying_derivatives_meta"):
-                    try:
-                        meta_d = instruments.resolve_underlying_derivatives_meta(
-                            sym_clean, as_of_date=_to_ist_aware(now_utc)
-                        )
-                        exp_arg = meta_d.get("expiry")
-                    except Exception:
-                        meta_d = {}
-                        exp_arg = None
-                if not exp_arg and calendar_in is not None:
-                    try:
-                        exp_arg = calendar_in.get_next_expiry(
-                            as_of_date=_to_ist_aware(now_utc),
-                            underlying=sym_clean,
-                        ).strftime("%Y-%m-%d")
-                    except Exception:
-                        exp_arg = None
-                chain_kw = {"expiry": exp_arg, "spot_price": trig["c"]}
-                if chart.get("is_offline"):
-                    chain_kw["provider"] = data_in.get_provider("simulated")
-                else:
-                    chain_kw["config"] = cfg
-                    chain_kw["now"] = _to_ist_aware(now_utc)
-                chain = data_in.fetch_option_chain(sym_clean, **chain_kw)
-                sel_strike = chain.select_strike(strategy=strike_selection or "ATM", option_type="CE")
-                contract = chain.get_contract(sel_strike, "CE")
-                if contract:
-                    fo_lot = None
-                    if instruments:
-                        try:
-                            fo_lot = instruments.get_fo_lot_size(
-                                sym_clean,
-                                expiry=chain.expiry or exp_arg,
-                                exchange=meta_d.get("exchange"),
-                            )
-                        except Exception:
-                            fo_lot = None
-                    lot_sz = fo_lot or meta_d.get("lot_size") or 1
-                    tier_val = str(contract.get("tier", "SIMULATED")).replace("DataTier.", "")
-                    res["option_contract"] = {
-                        "symbol": contract["symbol"],
-                        "underlying": sym_clean,
-                        "strike": sel_strike,
-                        "option_type": "CE",
-                        "expiry": chain.expiry,
-                        "premium": contract["last_price"],
-                        "lot_size": lot_sz,
-                        "strike_interval": meta_d.get("strike_interval"),
-                        "greeks": contract.get("greeks", {}),
-                        "tier": tier_val,
-                        "is_simulated": tier_val == "SIMULATED",
-                    }
-                    if tier_val == "SIMULATED":
-                        res["is_simulated"] = True
-                    res["trigger"]["option_symbol"] = contract["symbol"]
-                    res["trigger"]["option_premium"] = contract["last_price"]
-            except Exception:
-                pass
+        # Options-specific enrichment (authoritative BOD master first; fail closed if unavailable)
+        if setup == "options_orb":
+            _attach_options_orb_contract(
+                res, chart, trig, now_utc, eval_day, exchange,
+                instruments_path=instruments_path, cfg=cfg, strike_selection=strike_selection,
+                option_strategy=option_strategy,
+            )
 
         if dt and utc_of(dt) < local_to_utc(trig["end"], market=market):
             move_unit = "a few paise" if market == "IN" else "a cent or two"
@@ -2871,6 +2980,9 @@ def entry_doc(res, now_utc):
             doc["is_tradable_equity"] = bool(res["is_tradable_equity"])
         if res.get("analytical_only") is not None:
             doc["analytical_only"] = bool(res["analytical_only"])
+    for opt_k in ("options_unavailable", "option_contract_status", "option_contract_unavailable_reason"):
+        if res.get(opt_k) is not None:
+            doc[opt_k] = res[opt_k]
     if res.get("trading_style"):
         doc["trading_style"] = res["trading_style"]
     if res.get("is_market_open") is not None:
@@ -2912,7 +3024,7 @@ def entry_doc(res, now_utc):
         "decision_state", "decision", "entry_zone", "entry_reference", "entry_reference_source",
         "invalidation_level", "invalidation_rule", "stop_preview", "stop_preview_source",
         "risk_per_unit", "targets_preview", "reward_risk", "sizing_preview",
-        "anti_chasing", "candle_context", "indicators",
+        "anti_chasing", "candle_context", "indicators", "underlying_technical_preview",
     ):
         if res.get(ek) is not None:
             doc[ek] = res[ek]
@@ -3096,6 +3208,30 @@ def describe(res):
         sub_st = (" (%s)" % d["sub_state"]) if d.get("sub_state") else ""
         chg = (" | Signal: %s" % res["signal_change"]) if res.get("signal_change") else ""
         out.append("Decision: %s%s%s | Mode: on-invocation snapshot" % (d_state, sub_st, chg))
+        if res.get("option_contract"):
+            oc = res["option_contract"]
+            sim_tag = " [SIMULATED]" if oc.get("is_simulated") else ""
+            try:
+                observed_ltp = float(oc.get("premium"))
+                ltp_text = ("%s%.2f (unvalidated)" % (curr, observed_ltp)) if observed_ltp > 0 else "unavailable"
+            except (TypeError, ValueError):
+                ltp_text = "unavailable"
+            out.append(
+                "Option contract: %s | Expiry: %s | Lot: %s | Strike step: %s | Observed LTP: %s%s"
+                % (
+                    oc.get("symbol"), oc.get("expiry"), oc.get("lot_size"), oc.get("strike_interval"),
+                    ltp_text, sim_tag,
+                )
+            )
+            if res.get("option_quote_status") == "UNAVAILABLE":
+                out.append("Option execution quote: unavailable (timestamp/source, bid/ask, spread, and liquidity not validated)")
+            preview = res.get("underlying_technical_preview") or {}
+            if preview:
+                out.append("Underlying setup levels are analytical only; no option-premium levels or R:R are available.")
+            if d_state == "NO TRADE" and res.get("sub_state") == "OPTION_RISK_UNAVAILABLE":
+                out.append("NO TRADE: OPTION RISK UNAVAILABLE")
+        elif res.get("option_contract_status") == "UNAVAILABLE":
+            out.append("Option contract: %s" % (res.get("option_contract_unavailable_reason") or "UNAVAILABLE -- NO LISTED F&O CONTRACT"))
         if d.get("no_trade_reason"):
             out.append("Action note: %s." % d["no_trade_reason"])
         ez = res.get("entry_zone")

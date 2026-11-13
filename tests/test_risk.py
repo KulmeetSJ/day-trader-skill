@@ -387,8 +387,8 @@ class V1Checks(unittest.TestCase):
         self.assertEqual(r["verdict"], "BLOCK")
         self.assertIn("option", " ".join(r["reasons"]))
         r = self.one(opt, allow_options=True)
-        self.assertEqual(r["verdict"], "PASS")
-        self.assertTrue(r["warnings"])
+        self.assertEqual(r["verdict"], "BLOCK")
+        self.assertIn("OPTION RISK UNAVAILABLE", " ".join(r["reasons"]))
 
     def test_crypto_and_junk_symbols(self):
         crypto = {"symbol": "BTC/USD", "side": "buy", "notional": "50", "type": "market", "time_in_force": "day"}

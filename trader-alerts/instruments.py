@@ -690,9 +690,12 @@ def _aggregate_derivatives_metadata_from_records(records, as_of_date=None):
             "opt_strikes_by_exp": {},
             "opt_exps": set(),
             "fut_exps": set(),
+            "weekly_exps": set(),
         })
         if itype in ("CE", "PE", "OPTIDX", "OPTSTK"):
             bucket["opt_exps"].add(exp_str)
+            if rec.get("weekly") is True:
+                bucket["weekly_exps"].add(exp_str)
         elif itype in ("FUT", "FUTIDX", "FUTSTK"):
             bucket["fut_exps"].add(exp_str)
         if lot_v is not None:
@@ -712,6 +715,13 @@ def _aggregate_derivatives_metadata_from_records(records, as_of_date=None):
         first_month = opt_or_all[0][:7]
         in_first_month = [e for e in opt_or_all if e[:7] == first_month]
         schedule = "weekly" if len(in_first_month) > 1 else "monthly"
+
+        weekly_list = sorted(e for e in active_exps if e in b["weekly_exps"])
+        if not weekly_list and schedule == "weekly":
+            by_month = {}
+            for e in active_exps:
+                by_month.setdefault(e[:7], []).append(e)
+            weekly_list = [e for e in active_exps if len(by_month.get(e[:7], [])) > 1 and e != max(by_month[e[:7]])]
 
         lot_by_exp = {}
         for e in active_exps:
@@ -739,6 +749,7 @@ def _aggregate_derivatives_metadata_from_records(records, as_of_date=None):
             "is_fo_eligible": True,
             "next_expiry": next_exp,
             "expiries": active_exps,
+            "weekly_expiries": weekly_list,
             "expiry_schedule": schedule,
             "fo_lot_size": front_lot,
             "lot_size_by_expiry": lot_by_exp,
@@ -769,6 +780,8 @@ def _apply_derivatives_summary_to_master(instruments, instruments_by_exchange, b
                 out["next_expiry"] = summ["next_expiry"]
             if summ.get("expiries"):
                 out["expiries"] = list(summ["expiries"])
+            if "weekly_expiries" in summ:
+                out["weekly_expiries"] = list(summ["weekly_expiries"] or [])
             if summ.get("expiry_schedule"):
                 out["expiry_schedule"] = summ["expiry_schedule"]
             if summ.get("lot_size_by_expiry"):
@@ -807,20 +820,25 @@ def _apply_derivatives_summary_to_master(instruments, instruments_by_exchange, b
 def get_strike_interval(underlying, spot_price=None, cache_payload=None, exchange=None):
     """Authoritatively determine the strike price step interval for an instrument.
 
-    Prefers cached/BOD contract metadata when available; falls back to regulatory
-    index defaults or spot price brackets for equities.
+    Prefers cached/BOD contract metadata when available; returns None for
+    explicitly non-F&O instruments rather than fabricating a strike step.
     """
     sym = normalize_symbol(underlying)
-    cached, _ = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exchange)
-    if isinstance(cached, dict) and cached.get("strike_interval"):
-        try:
-            val = float(cached["strike_interval"])
-            if math.isfinite(val) and val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
+    cached, loaded = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exchange)
+    if isinstance(cached, dict):
+        if cached.get("strike_interval"):
+            try:
+                val = float(cached["strike_interval"])
+                if math.isfinite(val) and val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+        if cached.get("is_fo_eligible") is False:
+            return None
+        if isinstance(loaded, dict) and loaded.get("derivatives_meta") and not cached.get("fo_lot_size"):
+            return None
     if sym in INDEX_INSTRUMENTS:
-        return INDEX_INSTRUMENTS[sym].get("strike_interval", 50.0)
+        return INDEX_INSTRUMENTS[sym].get("strike_interval")
 
     # Dynamic equity strike interval based on spot price
     if spot_price is not None and spot_price > 0:
@@ -872,6 +890,8 @@ def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None):
 
     inst, _ = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exchange)
     if isinstance(inst, dict):
+        if inst.get("is_fo_eligible") is False:
+            return None
         by_exp = inst.get("lot_size_by_expiry")
         if exp_norm and isinstance(by_exp, dict) and by_exp.get(exp_norm):
             return int(by_exp[exp_norm])
@@ -882,6 +902,63 @@ def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None):
         return INDEX_INSTRUMENTS[sym]["fo_lot_size"]
 
     return None
+
+
+def _unavailable_derivatives_meta(sym, exch, reason, source="unavailable_no_listed_fo", is_fo_eligible=False, effective_date=None):
+    return {
+        "underlying": sym,
+        "exchange": exch,
+        "available": False,
+        "is_fo_eligible": is_fo_eligible,
+        "expiry": None,
+        "expiry_date": None,
+        "expiries": [],
+        "weekly_expiries": [],
+        "expiry_schedule": None,
+        "lot_size": None,
+        "lot_size_by_expiry": {},
+        "strike_interval": None,
+        "effective_date": effective_date,
+        "source": source,
+        "unavailable_reason": reason,
+    }
+
+
+def _find_historical_bod_snapshot(ref_d, sym, exch, cache_path=None):
+    """Locate an archived BOD derivatives snapshot covering ref_d (effective_date <= ref_d)."""
+    ref_iso = ref_d.isoformat()
+    base_dir = os.path.dirname(os.path.abspath(cache_path or DEFAULT_CACHE_PATH))
+    search_dirs = [os.path.join(base_dir, "history"), HISTORY_DIR]
+    candidates = []
+    seen_files = set()
+    for dpath in search_dirs:
+        if not dpath or not os.path.isdir(dpath):
+            continue
+        for fname in sorted(os.listdir(dpath)):
+            if not (fname.startswith("instruments_") and fname.endswith(".json")):
+                continue
+            fp = os.path.join(dpath, fname)
+            if fp in seen_files:
+                continue
+            seen_files.add(fp)
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    snap = json.load(fh)
+                eff_s = str(snap.get("effective_date") or "")[:10]
+                if not eff_s or eff_s > ref_iso:
+                    continue
+                eff_d = datetime.date.fromisoformat(eff_s)
+                if (ref_d - eff_d).days > 7:
+                    continue
+                if not isinstance(snap.get("derivatives_meta"), dict) or not snap["derivatives_meta"]:
+                    continue
+                candidates.append((eff_s, snap))
+            except Exception:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange=None, as_of_date=None):
@@ -895,16 +972,73 @@ def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange
     ref_d = calendar_in._resolve_date(as_of_date)
     ref_iso = ref_d.isoformat()
 
-    cached, loaded = _lookup_cached_record(sym, cache_payload=cache_payload, exchange=exch)
-    if cache_payload is None and loaded is not None:
-        cache_payload = loaded
+    cache_from_disk = False
+    payload = cache_payload
+    if payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
+        try:
+            payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
+            cache_from_disk = True
+        except Exception:
+            payload = None
 
-    expiries = []
+    eff_iso = str(payload.get("effective_date") or "")[:10] if isinstance(payload, dict) else ""
+    if isinstance(payload, dict) and eff_iso and ref_iso < eff_iso:
+        hist_snap = _find_historical_bod_snapshot(ref_d, sym, exch, cache_path=DEFAULT_CACHE_PATH) if cache_from_disk else None
+        if hist_snap is not None:
+            payload = hist_snap
+            eff_iso = str(payload.get("effective_date") or "")[:10]
+        else:
+            return _unavailable_derivatives_meta(
+                sym, exch,
+                "UNAVAILABLE -- NO HISTORICAL BOD CONTRACT METADATA FOR %s (MASTER EFFECTIVE %s)" % (ref_iso, eff_iso),
+                source="unavailable_historical_bod",
+                is_fo_eligible=None,
+                effective_date=eff_iso,
+            )
+
+    cached, _ = _lookup_cached_record(sym, cache_payload=payload, exchange=exch) if isinstance(payload, dict) else (None, None)
+
+    if isinstance(payload, dict):
+        dmeta = payload.get("derivatives_meta") or {}
+        has_bod_dmeta = bool(dmeta)
+        dmeta_rec = dmeta.get("%s:%s" % (exch, sym))
+        if not isinstance(dmeta_rec, dict):
+            cand_dm = dmeta.get(sym)
+            if isinstance(cand_dm, dict) and (not cand_dm.get("exchange") or str(cand_dm.get("exchange")).upper() == exch):
+                dmeta_rec = cand_dm
+
+        if isinstance(cached, dict) and cached.get("is_fo_eligible") is False:
+            return _unavailable_derivatives_meta(
+                sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT", effective_date=eff_iso or None
+            )
+        if has_bod_dmeta and dmeta_rec is None:
+            has_cached_fo = bool(
+                isinstance(cached, dict)
+                and cached.get("is_fo_eligible")
+                and cached.get("fo_lot_size")
+                and cached.get("expiries")
+            )
+            if not has_cached_fo:
+                return _unavailable_derivatives_meta(
+                    sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT", effective_date=eff_iso or None
+                )
+        if isinstance(cached, dict) and not cached.get("is_fo_eligible") and not cached.get("fo_lot_size") and not cached.get("expiries"):
+            return _unavailable_derivatives_meta(
+                sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT", effective_date=eff_iso or None
+            )
+    else:
+        if sym in INDEX_INSTRUMENTS and not INDEX_INSTRUMENTS[sym].get("is_fo_eligible", False):
+            return _unavailable_derivatives_meta(sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT")
+        if sym not in INDEX_INSTRUMENTS:
+            return _unavailable_derivatives_meta(sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT")
+
+    raw_expiries = []
     if isinstance(cached, dict) and isinstance(cached.get("expiries"), list):
-        expiries = sorted(
+        raw_expiries = sorted(
             e for e in (_normalize_expiry_date(x) for x in cached["expiries"])
-            if e and e >= ref_iso
+            if e
         )
+    expiries = [e for e in raw_expiries if e >= ref_iso]
     if not expiries and isinstance(cached, dict) and cached.get("next_expiry"):
         ne = _normalize_expiry_date(cached.get("next_expiry"))
         if ne and ne >= ref_iso:
@@ -917,6 +1051,14 @@ def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange
             "weekly" if sum(1 for e in expiries if e[:7] == next_exp_str[:7]) > 1 else "monthly"
         )
         source = cached.get("derivatives_source") or cached.get("metadata_source") or "instrument_cache"
+    elif raw_expiries:
+        return _unavailable_derivatives_meta(
+            sym, exch,
+            "UNAVAILABLE -- NO ACTIVE BOD EXPIRY ON OR AFTER %s" % ref_iso,
+            source="unavailable_no_active_expiry",
+            is_fo_eligible=True,
+            effective_date=eff_iso or None,
+        )
     else:
         exp_dt = calendar_in.get_next_expiry(as_of_date=ref_d, expiry_type=None, underlying=sym, exchange=exch)
         next_exp_str = exp_dt.isoformat()
@@ -928,8 +1070,22 @@ def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange
         )
         source = "calendar_fallback"
 
-    lot_size = get_fo_lot_size(sym, cache_payload=cache_payload, expiry=next_exp_str, exchange=exch)
-    strike_step = get_strike_interval(sym, cache_payload=cache_payload, exchange=exch)
+    lot_size = get_fo_lot_size(sym, cache_payload=payload, expiry=next_exp_str, exchange=exch)
+    strike_step = get_strike_interval(sym, cache_payload=payload, exchange=exch)
+    if not lot_size or lot_size <= 0 or not strike_step or strike_step <= 0:
+        return _unavailable_derivatives_meta(
+            sym, exch, "UNAVAILABLE -- NO LISTED F&O CONTRACT", effective_date=eff_iso or None
+        )
+
+    weekly_expiries = []
+    if isinstance(cached, dict) and isinstance(cached.get("weekly_expiries"), list):
+        weekly_expiries = [e for e in cached["weekly_expiries"] if e in expiries]
+    elif schedule == "weekly":
+        by_m = {}
+        for e in expiries:
+            by_m.setdefault(e[:7], []).append(e)
+        weekly_expiries = [e for e in expiries if len(by_m.get(e[:7], [])) > 1 and e != max(by_m[e[:7]])]
+
     lot_by_exp = (
         dict(cached.get("lot_size_by_expiry"))
         if (isinstance(cached, dict) and isinstance(cached.get("lot_size_by_expiry"), dict))
@@ -938,13 +1094,17 @@ def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange
     return {
         "underlying": sym,
         "exchange": exch,
+        "available": True,
+        "is_fo_eligible": True,
         "expiry": next_exp_str,
         "expiry_date": exp_dt,
         "expiries": expiries,
+        "weekly_expiries": weekly_expiries,
         "expiry_schedule": schedule,
         "lot_size": lot_size,
         "lot_size_by_expiry": lot_by_exp,
         "strike_interval": strike_step,
+        "effective_date": eff_iso or None,
         "source": source,
     }
 
@@ -1387,6 +1547,133 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None, exc
         "is_cas_eligible": False,
         "is_index": underlying in INDEX_INSTRUMENTS,
     }
+
+
+def validate_listed_derivative_contract(symbol, cache_payload=None, exchange=None, expected=None):
+    """Validate a derivative against an exact exchange-master contract record.
+
+    Parsing a symbol or resolving an underlying's lot size is not evidence that
+    the specific contract is listed. This function requires an exact record.
+    """
+    if not is_derivative_symbol(symbol):
+        raise InstrumentMetadataError("%s is not a canonical listed derivative symbol" % symbol)
+    if cache_payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
+        cache_payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
+    if not isinstance(cache_payload, dict):
+        raise InstrumentMetadataError("authoritative derivative instrument master is unavailable")
+    parsed = parse_derivative_symbol(symbol)
+    canonical = parsed["canonical_symbol"]
+    req_exch = _infer_exchange_from_symbol(symbol, explicit_exchange=exchange) or (
+        "BSE" if parsed["underlying"] in ("SENSEX", "BANKEX") else "NSE"
+    )
+    by_exch = cache_payload.get("instruments_by_exchange") or {}
+    record = (by_exch.get(req_exch) or {}).get(canonical) if isinstance(by_exch.get(req_exch), dict) else None
+    if record is None:
+        all_records = cache_payload.get("instruments") or {}
+        candidate = all_records.get(canonical)
+        if isinstance(candidate, dict) and str(candidate.get("exchange") or "").upper() == req_exch:
+            record = candidate
+    if record is None:
+        # BOD masters commonly key exact contracts by their exchange trading label
+        # (for example, "SENSEX 82200 CE 12 NOV 26") rather than our canonical
+        # command-line symbol. Match every contract field within that exchange.
+        bucket = by_exch.get(req_exch) or {}
+        for candidate in bucket.values() if isinstance(bucket, dict) else []:
+            if not isinstance(candidate, dict):
+                continue
+            cand_under = candidate.get("underlying") or candidate.get("underlying_symbol")
+            if not cand_under:
+                label = str(candidate.get("trading_symbol") or candidate.get("canonical_symbol") or candidate.get("symbol") or "")
+                cand_under = label.split()[0] if label else None
+            cand_exp = _normalize_expiry_date(candidate.get("expiry"))
+            cand_type = str(candidate.get("option_type") or candidate.get("instrument_type") or "").upper()
+            if cand_type in ("OPTIDX", "OPTSTK"):
+                cand_type = str(candidate.get("option_type") or "").upper()
+            elif cand_type in ("FUTIDX", "FUTSTK"):
+                cand_type = "FUT"
+            cand_strike = candidate.get("strike", candidate.get("strike_price"))
+            try:
+                strike_matches = (parsed.get("strike") is None and cand_strike is None) or (
+                    parsed.get("strike") is not None and cand_strike is not None
+                    and float(parsed["strike"]) == float(cand_strike)
+                )
+            except (TypeError, ValueError):
+                strike_matches = False
+            if (
+                cand_under and normalize_symbol(cand_under) == parsed["underlying"]
+                and (
+                    cand_exp == parsed["expiry_date"] if parsed.get("expiry_day") is not None
+                    else bool(cand_exp and cand_exp[:7] == "%04d-%02d" % (parsed["expiry_yy"], parsed["expiry_month"]))
+                )
+                and cand_type == str(parsed.get("option_type") or "FUT").upper()
+                and strike_matches
+            ):
+                record = candidate
+                break
+    if not isinstance(record, dict):
+        raise InstrumentMetadataError("%s is not present in the authoritative %s contract master" % (canonical, req_exch))
+    meta = _normalize_cache_record_tick(record, cache_payload=cache_payload, allow_none=True, sym_hint=canonical)
+    raw_inst_type = str(meta.get("instrument_type") or "").upper()
+    raw_opt_type = str(meta.get("option_type") or raw_inst_type or "").upper()
+    if parsed.get("asset_type") == "FUTURES" and raw_inst_type not in ("FUT", "FUTIDX", "FUTSTK"):
+        raise InstrumentMetadataError("%s is not an exchange-master futures contract" % canonical)
+    if parsed.get("asset_type") == "OPTIONS" and raw_opt_type not in ("CE", "PE"):
+        raise InstrumentMetadataError("%s is not an exchange-master option contract" % canonical)
+    exp = _normalize_expiry_date(meta.get("expiry"))
+    expected_fields = {
+        "underlying": parsed.get("underlying"),
+        "exchange": req_exch,
+        "expiry": parsed.get("expiry_date") if parsed.get("expiry_day") is not None else None,
+        "strike": parsed.get("strike"),
+        "option_type": parsed.get("option_type"),
+    }
+    underlying_val = meta.get("underlying") or meta.get("underlying_symbol")
+    if not underlying_val:
+        label = str(meta.get("trading_symbol") or meta.get("canonical_symbol") or meta.get("symbol") or "")
+        underlying_val = (parsed["underlying"] if canonical in (str(meta.get("canonical_symbol") or "").upper(), str(meta.get("symbol") or "").upper())
+                          else (label.split()[0] if label else None))
+    opt_type_val = meta.get("option_type")
+    if parsed.get("asset_type") == "FUTURES":
+        opt_type_val = None
+    if not opt_type_val and str(meta.get("instrument_type") or "").upper() in ("CE", "PE"):
+        opt_type_val = meta.get("instrument_type")
+    actual_fields = {
+        "underlying": normalize_symbol(underlying_val) if underlying_val else None,
+        "exchange": str(meta.get("exchange") or "").upper(),
+        "expiry": exp,
+        "strike": meta.get("strike", meta.get("strike_price")),
+        "option_type": str(opt_type_val or "").upper() or None,
+    }
+    for key, want in expected_fields.items():
+        got = actual_fields[key]
+        if want is None:
+            matches = True
+        elif got is not None and key == "strike":
+            try:
+                matches = float(got) == float(want)
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = got is not None and str(got).upper() == str(want).upper()
+        if not matches:
+            raise InstrumentMetadataError("%s metadata mismatch for %s: expected %r, found %r" % (key, canonical, want, got))
+    if expected:
+        exp_symbol = expected.get("symbol") or expected.get("canonical_symbol")
+        if exp_symbol and str(exp_symbol).strip().upper() != canonical:
+            raise InstrumentMetadataError("caller contract symbol disagrees with listed contract %s" % canonical)
+        for key in ("underlying", "exchange", "expiry", "strike", "option_type"):
+            want = expected.get(key)
+            if want is not None and str(want).upper() != str(actual_fields[key]).upper():
+                raise InstrumentMetadataError("caller %s disagrees with listed contract %s" % (key, canonical))
+        if expected.get("lot_size") is not None and int(expected["lot_size"]) != int(meta.get("lot_size") or 0):
+            raise InstrumentMetadataError("caller lot_size disagrees with listed contract %s" % canonical)
+    tick = meta.get("tick_size")
+    if tick is None or meta.get("tick_size_source") == "synthetic_default":
+        raise TickResolutionError("%s has no authoritative contract tick size" % canonical)
+    meta["canonical_symbol"] = canonical
+    meta["exchange"] = req_exch
+    meta["expiry"] = exp
+    return meta
 
 
 def resolve_instrument(symbol, cache_payload=None, require_intraday=True, exchange=None):

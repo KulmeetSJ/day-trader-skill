@@ -443,10 +443,8 @@ class TestQARegressions(unittest.TestCase):
             "max_loss_per_trade_inr": 1200,
             "allow_options": True,
         }
-        sized = size_mod.size_trade(plan, cfg, today="2026-10-19", market="IN", instruments_path=inst_path)
-        self.assertEqual(sized["lot_size"], 250)
-        self.assertEqual(sized["qty"], 250)
-        self.assertEqual(sized["contracts"], 1)
+        with self.assertRaisesRegex(size_mod.SizeError, "derivative contract validation failed"):
+            size_mod.size_trade(plan, cfg, today="2026-10-19", market="IN", instruments_path=inst_path)
 
 
 if __name__ == "__main__":

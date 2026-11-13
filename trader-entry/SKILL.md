@@ -5,7 +5,8 @@ description: >-
   (09:45, 11:30, 14:00) on 1m/5m/15m/30m/1h bars across US and Indian
   (NSE/BSE, IST, tick-size normalized) markets. Supports breakout_intraday,
   vwap_reclaim, ema_alignment, orb, level, breakout_20d, ma_crossover, trend,
-  rsi_momentum, and simulated options_orb without requiring opening-range
+  rsi_momentum, and signal-only options_orb (BUY CE only; no option execution)
+  without requiring opening-range
   bars for non-ORB setups. Distinguishes ENTRY CONFIRMED, ENTRY CANDIDATE,
   SETUP, and NO TRADE (EXTENDED anti-chasing, INVALIDATED, STALE_DATA),
   reports entry_zone, invalidation_level, stop/target previews, and writes
@@ -14,6 +15,10 @@ argument-hint: "[TICKER] [--setup breakout_intraday|vwap_reclaim|ema_alignment|o
 ---
 
 # trader-entry
+
+## Options strategy support
+
+`options_orb` evaluates a bullish underlying opening-range breakout and can identify a listed **BUY CE** contract for analysis. BUY PE, SELL CE, and SELL PE are unsupported and must return `UNSUPPORTED_STRATEGY`. It does not currently validate fresh two-sided option quotes, execution costs, or premium-based stop/target levels, so an option signal is never an actionable option recommendation: report the underlying setup separately and return `NO TRADE / OPTION RISK UNAVAILABLE`. Never size or route an option order from the underlying's R:R.
 
 The Entry Timer turns a setup into one moment: the bar that confirms it. It
 reads bars, 1-minute or 5-minute, and waits for each one to finish. A price

@@ -14,6 +14,10 @@ argument-hint: "[plan|manage] [--stop ...] [--target 2R|1R|price:X] [--interval 
 
 # trader-exit
 
+Intraday portfolio lots use their oldest remaining lot date to detect overnight carryover. A carryover on a holiday, weekend, or outside an open session is `EXIT_PENDING_NEXT_SESSION` with no exit price or executable ticket; at the first open session, only fresh available market data can produce an `EXIT`. Positional holdings are exempt from this rule.
+
+For options, underlying technical levels are analytical only. The tool does not have a validated premium valuation path with fresh bid/ask data, authoritative contract ticks, liquidity and charges; it therefore reports `OPTION RISK UNAVAILABLE` and `NO TRADE`, never a delta-based premium stop/target or option R:R.
+
 The Exit Planner decides how a trade ends before it starts. The stop is where
 the setup has failed. The target is where you take what you came for. Both
 are set BEFORE the entry, written down and handed on, so nobody has to decide

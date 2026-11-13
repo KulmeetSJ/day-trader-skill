@@ -278,14 +278,15 @@ class BankNiftyAuditTests(unittest.TestCase):
                 ]
                 now_bn = _utc_from_ts(_ist_ts(2026, 11, 12, 9, 36))
                 res_bn = entry.evaluate(_make_5m_chart("BANKNIFTY", bn_bars, 60792.4), now_bn, setup="options_orb", market="IN")
-                self.assertEqual(res_bn["option_contract"]["expiry"], "2026-11-23")
-                self.assertEqual(res_bn["option_contract"]["lot_size"], 30)
-                self.assertEqual(res_bn["option_contract"]["strike_interval"], 100.0)
+                self.assertTrue(res_bn["options_unavailable"])
+                self.assertIsNone(res_bn["option_contract"])
+                self.assertEqual(res_bn["decision_state"], "NO TRADE")
+                self.assertIn("not present", res_bn["option_contract_unavailable_reason"].lower())
 
                 res_nf = entry.evaluate(_make_5m_chart("NIFTY", nf_bars, 25255.05), now_bn, setup="options_orb", market="IN")
-                self.assertEqual(res_nf["option_contract"]["expiry"], "2026-11-17")
-                self.assertEqual(res_nf["option_contract"]["lot_size"], 65)
-                self.assertEqual(res_nf["option_contract"]["strike_interval"], 50.0)
+                self.assertTrue(res_nf["options_unavailable"])
+                self.assertIsNone(res_nf["option_contract"])
+                self.assertEqual(res_nf["decision_state"], "NO TRADE")
 
     def test_rsi_momentum_never_reuses_old_prev_close_as_entry_zone_or_invalidation(self):
         # Simulate BANKNIFTY intraday session with stale 5d chartPreviousClose=57773.65,

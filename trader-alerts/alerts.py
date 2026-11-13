@@ -958,13 +958,19 @@ def cmd_readiness(a):
                     meta_u = instruments.resolve_underlying_derivatives_meta(
                         u, cache_payload=inst_payload, exchange=exch_u, as_of_date=ref_d
                     )
+                    if not meta_u.get("available", True) or meta_u.get("expiry_date") is None:
+                        deriv_items.append("%s [%s] (%s)" % (u, exch_u, meta_u.get("unavailable_reason") or "UNAVAILABLE"))
+                        continue
                     exp = meta_u["expiry_date"]
-                    lot = meta_u["lot_size"] or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
+                    lot = meta_u["lot_size"]
                     step = meta_u["strike_interval"]
                 else:
                     exp = calendar_in.get_next_expiry(as_of_date=ref_d, underlying=u, exchange=exch_u)
-                    lot = instruments.get_fo_lot_size(u, cache_payload=inst_payload, exchange=exch_u) or instruments.INDEX_INSTRUMENTS.get(u, {}).get("fo_lot_size", 25)
+                    lot = instruments.get_fo_lot_size(u, cache_payload=inst_payload, exchange=exch_u)
                     step = instruments.get_strike_interval(u, cache_payload=inst_payload, exchange=exch_u)
+                if not lot or not step:
+                    deriv_items.append("%s [%s] (UNAVAILABLE -- NO LISTED F&O CONTRACT)" % (u, exch_u))
+                    continue
                 dte = calendar_in.days_to_expiry(exp, as_of_date=ref_d)
                 deriv_items.append("%s [%s] (exp %s, %dd, lot %d, step %.0f)" % (u, exch_u, exp.strftime("%Y-%m-%d"), dte, lot, step))
             except Exception as e:

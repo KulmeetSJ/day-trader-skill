@@ -57,9 +57,11 @@ except ImportError:
 try:
     import symbols_in  # type: ignore
     import calendar_in  # type: ignore
+    import instruments  # type: ignore
 except ImportError:
     symbols_in = None
     calendar_in = None
+    instruments = None
 
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
@@ -734,6 +736,10 @@ def risk_verdict(risk, fp, today):
 
 def status_of(order, risk, state, today, cfg=None, market=None):
     """(ready, label, risk_result)"""
+    try:
+        _assert_tradable_instrument(order.get("symbol"), order)
+    except TicketError as exc:
+        return False, "BLOCKED instrument check: " + str(exc), None
     issue = positional_order_issue(order, cfg=cfg, market=market)
     if issue:
         return False, "BLOCKED positional check: " + issue, None
@@ -743,6 +749,14 @@ def status_of(order, risk, state, today, cfg=None, market=None):
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
         return False, "BLOCKED by trader-risk: " + "; ".join(rv.get("reasons", [])), rv
+    opt_entry = (
+        str(order.get("asset_type") or "").upper() == "OPTIONS"
+        or bool(order.get("option_contract"))
+        or bool(symbols_in and symbols_in.is_derivative_symbol(str(order.get("symbol") or ""))
+                and symbols_in.parse_derivative_symbol(str(order.get("symbol"))) .get("asset_type") == "OPTIONS")
+    )
+    if opt_entry and kind_of(order, rv) == "entry":
+        return False, "BLOCKED: OPTION RISK UNAVAILABLE; option entry premium risk is not validated", rv
     rec = latest(state, fp, today)
     if rec:
         st = rec.get("status")
@@ -1091,20 +1105,27 @@ def _assert_tradable_instrument(symbol, doc=None):
     """Refuse direct equity/broker execution or paper fills on spot benchmark indices."""
     raw = str(symbol or "").strip().upper()
     norm = symbols_in.normalize_symbol(raw) if symbols_in else raw
-    is_deriv = bool(symbols_in and symbols_in.is_derivative_symbol(raw))
+    is_deriv = bool(symbols_in and symbols_in.is_derivative_symbol(norm))
+    spot_index = bool(symbols_in and symbols_in.is_index_symbol(norm) and not is_deriv)
     if isinstance(doc, dict):
-        if doc.get("option_contract") or doc.get("asset_type") in ("OPTIONS", "FUTURES"):
-            return
-        if str(doc.get("asset_type") or "").upper() == "INDEX" and not is_deriv:
+        declared_derivative = str(doc.get("asset_type") or "").upper() in ("OPTIONS", "FUTURES") or bool(doc.get("option_contract"))
+        if spot_index or (declared_derivative and not is_deriv):
             raise TicketError(
-                "%s is a spot index (analytical only, not a directly tradable equity); "
-                "use index F&O derivative contracts instead" % norm
+                "%s is not a listed derivative contract; spot indices are analytical only and caller metadata cannot make them tradable" % norm
             )
-    if symbols_in and symbols_in.is_index_symbol(norm) and not is_deriv:
+    if spot_index:
         raise TicketError(
             "%s is a spot index (analytical only, not a directly tradable equity); "
             "use index F&O derivative contracts instead" % norm
         )
+    if is_deriv:
+        if not instruments:
+            raise TicketError("authoritative instrument master is required for derivative tickets")
+        expected = (doc or {}).get("option_contract") if isinstance(doc, dict) else None
+        try:
+            instruments.validate_listed_derivative_contract(raw, exchange=(doc or {}).get("exchange"), expected=expected)
+        except Exception as exc:
+            raise TicketError("derivative ticket validation failed: %s" % exc)
 
 
 def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None):

@@ -306,7 +306,10 @@ class TestIndexScannerAndSafety(unittest.TestCase):
             # 3. ticket.py apply_fill refuses spot index equity fill, allows derivative F&O fill
             with self.assertRaises(ticket.TicketError):
                 ticket.apply_fill(pf_path, {"budget": 100000, "market": "IN"}, "NIFTY", "buy", 1, 25000.0, "2026-10-19", market="IN")
-            pf = ticket.apply_fill(pf_path, {"budget": 100000, "market": "IN"}, "NIFTY26NOVFUT", "buy", 25, 25050.0, "2026-10-19", market="IN")
+            with mock.patch.object(ticket.instruments, "validate_listed_derivative_contract", return_value={
+                "canonical_symbol": "NIFTY26NOVFUT", "exchange": "NSE", "tick_size": 0.05,
+            }):
+                pf = ticket.apply_fill(pf_path, {"budget": 100000, "market": "IN"}, "NIFTY26NOVFUT", "buy", 25, 25050.0, "2026-10-19", market="IN")
             self.assertEqual(pf["positions"][0]["ticker"], "NIFTY26NOVFUT")
 
             # 4. entry.py & exit.py tag spot index as INDEX / analytical_only without crashing

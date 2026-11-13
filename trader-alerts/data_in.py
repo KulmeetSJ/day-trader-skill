@@ -2060,11 +2060,19 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     now=now,
                 )
             else:
+                meta_u = instruments.resolve_underlying_derivatives_meta(
+                    underlying, exchange=exchange, as_of_date=now_dt.date()
+                )
+                if not meta_u.get("available", True):
+                    raise MissingDataError(
+                        meta_u.get("unavailable_reason") or ("UNAVAILABLE -- NO LISTED F&O CONTRACT for %s" % underlying)
+                    )
                 strike = parsed["strike"]
                 opt_type = parsed["option_type"]
-                exp_dt = calendar_in.get_next_expiry(
-                    as_of_date=now_dt, underlying=underlying, exchange=exchange
-                )
+                if parsed.get("expiry_date"):
+                    exp_dt = datetime.date.fromisoformat(parsed["expiry_date"])
+                else:
+                    exp_dt = meta_u["expiry_date"]
                 days = max(1, calendar_in.days_to_expiry(exp_dt, as_of_date=now_dt, exchange=exchange))
                 t_years = days / 365.0
                 bs = black_scholes(spot, strike, t_years, rate=self.rate, vol=self.default_iv, option_type=opt_type)
@@ -2111,27 +2119,89 @@ class SimulatedMarketDataProvider(MarketDataProvider):
     def get_instruments(self, exchange="NSE", symbol=None):
         return self.base_provider.get_instruments(exchange=exchange, symbol=symbol)
 
-    def get_option_chain(self, symbol, expiry=None, exchange="NSE", spot_price=None):
+    def get_option_chain(self, symbol, expiry=None, exchange=None, spot_price=None, now=None):
         canonical = symbols_in.normalize_symbol(symbol)
+        exch_default = (
+            instruments.INDEX_INSTRUMENTS.get(canonical, {}).get("exchange")
+            or ("BSE" if canonical in ("SENSEX", "BANKEX") else "NSE")
+        )
+        exch = _normalize_exchange(exchange or exch_default)
+        cutoff_dt, _ = _parse_cutoff_ts(now)
+        ref_d = cutoff_dt.date() if cutoff_dt is not None else None
+
+        meta_d = instruments.resolve_underlying_derivatives_meta(canonical, exchange=exch, as_of_date=ref_d)
+        if not meta_d.get("available", True):
+            allow_explicit_hist = bool(
+                expiry
+                and meta_d.get("source") == "unavailable_historical_bod"
+            )
+            if not allow_explicit_hist:
+                raise MissingDataError(
+                    meta_d.get("unavailable_reason") or ("UNAVAILABLE -- NO LISTED F&O CONTRACT for %s" % canonical)
+                )
+
         if spot_price is not None:
             spot = float(spot_price)
         else:
             try:
-                q = self.base_provider.get_quote(canonical, exchange=exchange)
+                q = _call_with_optional_now(self.base_provider.get_quote, canonical, exchange=exch, now=now)
                 spot = float(q["price"])
             except Exception:
                 spot = 24000.0 if canonical in ("NIFTY", "^NSEI") else 2800.0
 
+        step = meta_d.get("strike_interval") or instruments.get_strike_interval(canonical, spot_price=spot, exchange=exch)
+        if not step or float(step) <= 0:
+            raise MissingDataError("UNAVAILABLE -- NO VALID STRIKE INTERVAL FOR %s (%s)" % (canonical, exch))
+        step = float(step)
+
         if expiry:
-            exp_dt = calendar_in.get_next_expiry(expiry, underlying=canonical, exchange=exchange)
-            step = instruments.get_strike_interval(canonical, spot_price=spot, exchange=exchange)
+            exp_iso = instruments._normalize_expiry_date(expiry)
+            if not exp_iso:
+                raise MissingDataError("Invalid option expiry date %r for %s (%s)" % (expiry, canonical, exch))
+            bod_exps = meta_d.get("expiries") or []
+            eff_iso = meta_d.get("effective_date") or ""
+            if exp_iso in bod_exps:
+                exp_dt = datetime.date.fromisoformat(exp_iso)
+            elif meta_d.get("source") in ("bod_master", "instrument_cache") and bod_exps:
+                if eff_iso and exp_iso < eff_iso:
+                    cal_exp = calendar_in.get_next_expiry(exp_iso, underlying=canonical, exchange=exch)
+                    if cal_exp.isoformat() != exp_iso:
+                        raise MissingDataError(
+                            "Invalid historical expiry %s for %s (%s)" % (exp_iso, canonical, exch)
+                        )
+                    exp_dt = cal_exp
+                else:
+                    raise MissingDataError(
+                        "Expiry %s is not a listed %s BOD contract expiry for %s (valid: %s)"
+                        % (exp_iso, exch, canonical, ", ".join(bod_exps[:5]))
+                    )
+            else:
+                cal_exp = calendar_in.get_next_expiry(exp_iso, underlying=canonical, exchange=exch)
+                if cal_exp.isoformat() != exp_iso:
+                    raise MissingDataError(
+                        "Expiry %s is not a valid %s expiry for %s (next valid: %s)"
+                        % (exp_iso, exch, canonical, cal_exp.isoformat())
+                    )
+                exp_dt = cal_exp
         else:
-            meta_d = instruments.resolve_underlying_derivatives_meta(canonical, exchange=exchange)
             exp_dt = meta_d["expiry_date"]
-            step = meta_d["strike_interval"] or instruments.get_strike_interval(canonical, spot_price=spot, exchange=exchange)
-        days = max(1, calendar_in.days_to_expiry(exp_dt))
+
+        days = max(1, calendar_in.days_to_expiry(exp_dt, as_of_date=ref_d, exchange=exch))
         t_years = days / 365.0
         base_atm = round(spot / step) * step
+
+        exp_iso_out = exp_dt.strftime("%Y-%m-%d")
+        weekly_set = set(meta_d.get("weekly_expiries") or [])
+        if weekly_set:
+            is_weekly = exp_iso_out in weekly_set
+        elif meta_d.get("expiry_schedule") == "weekly":
+            by_m = [e for e in (meta_d.get("expiries") or []) if e[:7] == exp_iso_out[:7]]
+            if len(by_m) > 1:
+                is_weekly = exp_iso_out != max(by_m)
+            else:
+                is_weekly = exp_dt != calendar_in.get_monthly_expiry(exp_dt.year, exp_dt.month, exchange=exch, underlying=canonical)
+        else:
+            is_weekly = False
 
         strikes_data = {}
         for i in range(-10, 11):
@@ -2144,7 +2214,7 @@ class SimulatedMarketDataProvider(MarketDataProvider):
 
             strikes_data[k] = {
                 "ce": {
-                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "CE"),
+                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "CE", is_weekly=is_weekly),
                     "last_price": ce_bs["price"],
                     "bid": max(0.05, round(ce_bs["price"] - 0.10, 2)),
                     "ask": round(ce_bs["price"] + 0.10, 2),
@@ -2159,7 +2229,7 @@ class SimulatedMarketDataProvider(MarketDataProvider):
                     "is_live": False,
                 },
                 "pe": {
-                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "PE"),
+                    "symbol": symbols_in.format_derivative_symbol(canonical, exp_dt, k, "PE", is_weekly=is_weekly),
                     "last_price": pe_bs["price"],
                     "bid": max(0.05, round(pe_bs["price"] - 0.10, 2)),
                     "ask": round(pe_bs["price"] + 0.10, 2),
@@ -2178,10 +2248,10 @@ class SimulatedMarketDataProvider(MarketDataProvider):
         return OptionChain(
             underlying=canonical,
             underlying_price=spot,
-            expiry=exp_dt.strftime("%Y-%m-%d"),
+            expiry=exp_iso_out,
             strikes_data=strikes_data,
             data_tier=DataTier.SIMULATED,
-            exchange=exchange,
+            exchange=exch,
         )
 
     def get_derivatives_master(self, exchange="NSE"):
@@ -3700,10 +3770,24 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                 % (cutoff_dt.date().isoformat(), canon)
             )
         ref_dt = cutoff_dt if cutoff_dt is not None else now_dt
+        meta_d = instruments.resolve_underlying_derivatives_meta(canon, exchange=exch, as_of_date=ref_dt)
         exp_str = str(expiry)[:10] if expiry else None
+        if meta_d.get("source") == "unavailable_no_listed_fo":
+            raise MissingDataError(
+                meta_d.get("unavailable_reason") or ("UNAVAILABLE -- NO LISTED F&O CONTRACT for %s" % canon)
+            )
         if not exp_str:
-            meta_d = instruments.resolve_underlying_derivatives_meta(canon, exchange=exch, as_of_date=ref_dt)
+            if not meta_d.get("available", True):
+                raise MissingDataError(
+                    meta_d.get("unavailable_reason") or ("UNAVAILABLE -- NO LISTED F&O CONTRACT for %s" % canon)
+                )
             exp_str = meta_d["expiry"]
+        elif meta_d.get("source") in ("bod_master", "instrument_cache") and meta_d.get("expiries"):
+            eff_iso = meta_d.get("effective_date") or ""
+            if exp_str not in meta_d["expiries"] and (not eff_iso or exp_str >= eff_iso):
+                raise MissingDataError(
+                    "Expiry %s is not a listed %s BOD contract expiry for %s" % (exp_str, exch, canon)
+                )
 
         resp = self._request_json(
             "/v2/option/chain",
@@ -4302,7 +4386,9 @@ def fetch_instruments(exchange="NSE", symbol=None, provider=None):
     return prov.get_instruments(exchange=exchange, symbol=symbol)
 
 
-def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_price=None, config=None, now=None):
+def fetch_option_chain(symbol, expiry=None, exchange=None, provider=None, spot_price=None, config=None, now=None):
+    canon = symbols_in.normalize_symbol(symbol) if hasattr(symbols_in, "normalize_symbol") else symbol
+    exch = exchange or instruments.INDEX_INSTRUMENTS.get(canon, {}).get("exchange") or ("BSE" if canon in ("SENSEX", "BANKEX") else "NSE")
     if provider is not None:
         prov = provider
     else:
@@ -4311,11 +4397,11 @@ def fetch_option_chain(symbol, expiry=None, exchange="NSE", provider=None, spot_
         if prov_cls is not None and resolved != "simulated" and prov_cls.CAPABILITIES.get(CAPABILITY_OPTION_CHAINS):
             prov = get_provider(resolved, config=config)
             if not prov.supports(CAPABILITY_OPTION_CHAINS):
-                return prov.get_option_chain(symbol, expiry=expiry, exchange=exchange, spot_price=spot_price)
+                return prov.get_option_chain(symbol, expiry=expiry, exchange=exch, spot_price=spot_price)
         else:
             prov = get_provider("simulated")
     return _call_with_optional_now(
-        prov.get_option_chain, symbol, expiry=expiry, exchange=exchange, spot_price=spot_price, now=now
+        prov.get_option_chain, symbol, expiry=expiry, exchange=exch, spot_price=spot_price, now=now
     )
 
 

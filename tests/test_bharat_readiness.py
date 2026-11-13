@@ -124,15 +124,15 @@ class TestBharatReadiness(unittest.TestCase):
         self.assertEqual(mid_exp.isoformat(), "2026-10-27")
 
         # BSE Independent Expiry Rules:
-        # BSE SENSEX: Friday (4)
+        # BSE SENSEX: Thursday (3)
         sensex_exp = calendar_mod.get_next_expiry(as_of_date=ref_holiday_week, underlying="SENSEX", exchange="BSE")
-        self.assertEqual(sensex_exp.weekday(), 4)  # Friday
-        self.assertEqual(sensex_exp.isoformat(), "2026-10-23")
+        self.assertEqual(sensex_exp.weekday(), 3)  # Thursday
+        self.assertEqual(sensex_exp.isoformat(), "2026-10-22")
 
-        # BSE BANKEX: Monday (0)
+        # BSE BANKEX: Thursday (3)
         bankex_exp = calendar_mod.get_next_expiry(as_of_date=ref_normal, underlying="BANKEX", exchange="BSE")
-        self.assertEqual(bankex_exp.weekday(), 0)  # Monday
-        self.assertEqual(bankex_exp.isoformat(), "2026-10-26")
+        self.assertEqual(bankex_exp.weekday(), 3)  # Thursday
+        self.assertEqual(bankex_exp.isoformat(), "2026-10-29")
 
     def test_fail_closed_derivative_refusal_on_missing_lot_size(self):
         # Derivative order where lot size cannot be authoritatively resolved

@@ -287,10 +287,8 @@ class PositionalOrderSemanticsTests(unittest.TestCase):
         # 3. Derivative positional uses NRML instead of CNC
         fut_cfg = _in_cfg(allow_futures=True, max_order_inr=500000, max_loss_per_trade_inr=10000, budget=500000)
         fut_plan = _in_plan(asset_type="FUTURES", lot_size=25)
-        s_fut = budget_mod.size_trade(fut_plan, fut_cfg, today="2026-10-19")
-        o_fut = budget_mod.build_order(s_fut, cfg=fut_cfg)
-        self.assertEqual(o_fut["product"], "NRML")
-        self.assertEqual(o_fut["multi_session_protection"]["product"], "NRML")
+        with self.assertRaisesRegex(budget_mod.SizeError, "actual listed derivative contract symbol"):
+            budget_mod.size_trade(fut_plan, fut_cfg, today="2026-10-19")
 
     def test_flat_by_positional_without_trading_style_does_not_inherit_day_bracket(self):
         # Config has trading_style='intraday', plan only sets flat_by='positional'

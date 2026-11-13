@@ -1331,8 +1331,9 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         self.assertEqual(res["symbol"], "RELIANCE.NS")
 
     def test_subpaisa_ticket_single_limit_stop_stop_limit_and_fill_preserve_4dec(self):
+        cache_path, _, _ = _write_inr_cache(self.tmp)
         base = {
-            "symbol": "USDINR26OCTFUT", "side": "buy", "qty": "1",
+            "symbol": "USDINR26NOVFUT", "side": "buy", "qty": "1",
             "time_in_force": "day", "market": "IN", "currency": "INR",
             "tick_size": 0.0025,
         }
@@ -1340,7 +1341,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         lim = dict(base, type="limit", limit_price="84.1025")
         self.assertIn("limit order at ₹84.1025", ticket_mod.plain(lim, market="IN"))
         lim_no_tick = {
-            "symbol": "USDINR26OCTFUT", "side": "buy", "qty": "1",
+            "symbol": "USDINR26NOVFUT", "side": "buy", "qty": "1",
             "type": "limit", "limit_price": "84.1025", "time_in_force": "day", "market": "IN",
         }
         self.assertIn("limit order at ₹84.1025", ticket_mod.plain(lim_no_tick, market="IN"))
@@ -1370,10 +1371,15 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
             json.dump({"cash": 100000.0, "currency": "INR", "positions": []}, fh)
         with open(cfg_p, "w", encoding="utf-8") as fh:
             json.dump({"market": "IN"}, fh)
-        code_f, out_f, err_f = _run_cli(ticket_mod, [
-            "fill", "--symbol", "USDINR26OCTFUT", "--side", "buy", "--qty", "1", "--price", "84.1025",
-            "--portfolio", pf_p, "--state", st_p, "--config", cfg_p, "--market", "IN", "--now", "2026-10-19 10:15",
-        ])
+        ticket_orig_master = ticket_mod.instruments.DEFAULT_CACHE_PATH
+        ticket_mod.instruments.DEFAULT_CACHE_PATH = cache_path
+        try:
+            code_f, out_f, err_f = _run_cli(ticket_mod, [
+                "fill", "--symbol", "USDINR26NOVFUT", "--side", "buy", "--qty", "1", "--price", "84.1025",
+                "--portfolio", pf_p, "--state", st_p, "--config", cfg_p, "--market", "IN", "--now", "2026-10-19 10:15",
+            ])
+        finally:
+            ticket_mod.instruments.DEFAULT_CACHE_PATH = ticket_orig_master
         self.assertEqual(code_f, 0, err_f)
         self.assertIn("at ₹84.1025", out_f)
         with open(st_p, encoding="utf-8") as fh:

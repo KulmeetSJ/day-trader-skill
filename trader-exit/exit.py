@@ -861,6 +861,11 @@ def gather(a):
     return info
 
 
+def option_premium_analysis(option_contract, underlying_entry, underlying_stop, underlying_target, market="US"):
+    """Fail closed until fresh, two-sided, master-ticked option valuation is available."""
+    return {"available": False, "reason": "OPTION RISK UNAVAILABLE: validated bid/ask, tick metadata, freshness, costs and premium stop/target are required"}
+
+
 def build_plan(a, now_utc=None):
     info = gather(a)
     cfg = read_config(a.config)
@@ -924,13 +929,23 @@ def build_plan(a, now_utc=None):
         market == "IN"
         and symbols_in
         and symbols_in.is_index_symbol(info["symbol"])
-        and asset_type not in ("OPTIONS", "FUTURES")
-        and not option_contract
+        and not symbols_in.is_derivative_symbol(info["symbol"])
     ):
         asset_type = "INDEX"
+        option_contract = None
         idx_meta = symbols_in.get_index_metadata(info["symbol"])
         if idx_meta and not cli_exch and not doc_exch:
             req_exchange = idx_meta["exchange"]
+
+    if asset_type in ("OPTIONS", "FUTURES"):
+        if not symbols_in or not symbols_in.is_derivative_symbol(info["symbol"]):
+            raise PlanError("OPTIONS/FUTURES plans require a canonical listed derivative contract symbol")
+        if not instruments:
+            raise PlanError("authoritative instrument master is required for derivative plans")
+        try:
+            instruments.validate_listed_derivative_contract(info["symbol"], exchange=req_exchange)
+        except Exception as exc:
+            raise PlanError("derivative contract validation failed: %s" % exc)
 
     # Instrument metadata resolution (tick size, lot size, T2T)
     tick_size = None
@@ -1099,6 +1114,9 @@ def build_plan(a, now_utc=None):
         plan["analytical_only"] = True
     if option_contract:
         plan["option_contract"] = option_contract
+        plan["option_premium_analysis"] = option_premium_analysis(
+            option_contract, c["entry"], c["stop"], c["target"], market=market
+        )
         if not lot_size or lot_size == 1:
             lot_size = option_contract.get("lot_size", 1)
     if trading_style:
@@ -1203,11 +1221,42 @@ def describe(plan):
             opt.get("expiry", ""),
             plan.get("lot_size", 1)
         ))
+        premium_view = plan.get("option_premium_analysis")
+        if premium_view:
+            if premium_view.get("available"):
+                out.append("  Option R:R    estimated %s stop / %s target; %s (delta-scaled, tick-rounded)" % (
+                    money(premium_view["stop"], market=market, tick=premium_view["tick_size"]),
+                    money(premium_view["target"], market=market, tick=premium_view["tick_size"]),
+                    ratio(premium_view["reward_risk"]),
+                ))
+            else:
+                out.append("  Option R:R    unavailable: %s" % premium_view.get("reason", "delta unavailable"))
     if plan.get("flat_by") == "positional":
         out.append("  Hold          positional: multi-day hold permitted")
     else:
         out.append("  Flat by       %s %s, win or lose: no overnight hold" % (plan["flat_by"], tz_label))
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
+    out.append("")
+    if plan.get("option_contract"):
+        out.append("UNDERLYING SETUP (ANALYTICAL ONLY)")
+        out.append("  Underlying: %s | Setup: %s" % (plan["symbol"], setup))
+        out.append("  Underlying entry/stop/target: %s / %s / %s" % (
+            money(plan["entry"], market=market, tick=p_tick),
+            money(plan["stop"], market=market, tick=p_tick),
+            money(plan["target"], market=market, tick=p_tick),
+        ))
+        out.append("  OPTION RISK UNAVAILABLE: no option premium entry, stop, target, quantity or R:R is validated; NO TRADE.")
+    else:
+        out.append("TRADE RECOMMENDATION")
+        out.append("  Instrument: %s" % plan["symbol"])
+        out.append("  Setup: %s | Entry: %s | Stop: %s | Target: %s | Reward:risk: %s" % (
+            setup, money(plan["entry"], market=market, tick=p_tick),
+            money(plan["stop"], market=market, tick=p_tick),
+            money(plan["target"], market=market, tick=p_tick), ratio(plan["reward_risk"]),
+        ))
+        out.append("  Status: Plan only; execution requires separate risk and broker checks.")
+    out.append("")
+    out.append("PROBABILITY: NOT AVAILABLE \u2014 INSUFFICIENT VALIDATED DATA")
     out.append(NOTE)
     return out
 
@@ -1363,6 +1412,9 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         if dmeta:
             raw_asset = "OPTIONS" if dmeta.get("instrument_type") == "OPT" else "FUTURES"
     asset_type = str(raw_asset or "EQUITY").upper()
+    if (market == "IN" and symbols_in and symbols_in.is_index_symbol(sym)
+            and not symbols_in.is_derivative_symbol(sym)):
+        asset_type = "INDEX"
     lot_size = max(1, int(position.get("lot_size") or 1))
     expiry_str = position.get("expiry")
     flat_by_raw = position.get("flat_by")
@@ -1477,10 +1529,33 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
     if style == "intraday" and s and flat_by_time:
         fb_dt = datetime.datetime.combine(day, flat_by_time)
         mins_to_flat = (fb_dt - local).total_seconds() / 60.0
-        if mins_to_flat <= 5.0 and local.time() <= s[1]:
+        # Fire when at or past flat_by, regardless of whether session is still open.
+        # local.time() <= s[1] was removed: square-off must trigger even post-close.
+        if mins_to_flat <= 5.0:
             action = "EXIT"
             reason_code = "INTRADAY_SQUARE_OFF"
             reasons.append("Intraday flat-by cutoff %s approached/reached (now %s)" % (hm(flat_by_time), hm(local)))
+    entry_date = position.get("entry_date") or position.get("date")
+    carryover_pending = False
+    if action == "HOLD" and style == "intraday" and entry_date:
+        try:
+            entered_on = datetime.date.fromisoformat(str(entry_date)[:10])
+        except (TypeError, ValueError):
+            entered_on = None
+        if entered_on is not None and entered_on < day:
+            if not s or not session_open:
+                action = "EXIT_PENDING_NEXT_SESSION"
+                reason_code = "INTRADAY_CARRYOVER"
+                carryover_pending = True
+                reasons.append("Intraday position entered %s is overdue; market is closed, exit at the first valid session opportunity" % entered_on.isoformat())
+            elif curr_px is not None and not is_stale:
+                action = "EXIT"
+                reason_code = "INTRADAY_CARRYOVER"
+                reasons.append("Intraday position entered %s is overdue; exit at the first valid session opportunity" % entered_on.isoformat())
+            else:
+                action = "NO_ACTION"
+                reason_code = "STALE_DATA" if is_stale else "NO_DATA"
+                reasons.append("Intraday carryover is overdue, but no fresh in-session price is available to evaluate an exit")
     if action == "HOLD" and asset_type in ("OPTIONS", "FUTURES") and expiry_str == day.isoformat() and s:
         exp_cutoff = parse_hhmm("15:15" if market == "IN" else "15:45", "expiry cutoff", market=market)
         if local.time() >= exp_cutoff:
@@ -1515,7 +1590,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         reasons.append("Unrealized loss %.2f exceeds max_loss_per_trade %.2f" % (unrealized_pnl, float(max_loss_cap)))
 
     # 5. Trend deterioration / VWAP breakdown on COMPLETED bars (any time of day)
-    if action == "HOLD" and last_closed is not None and last_closed["date"] == day:
+    if action == "HOLD" and last_closed is not None and last_closed["date"] == day.isoformat():
         bear_ema = (ema9_v is not None and ema21_v is not None and last_closed["c"] < ema21_v and ema9_v < ema21_v)
         below_vwap = (vwap_v is not None and last_closed["c"] < vwap_v)
         weak_rsi = (rsi14 is not None and rsi14 < 45.0)
@@ -1597,13 +1672,13 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         "qty": qty,
         "exit_qty": exit_qty if action == "PARTIAL EXIT" else (qty if action == "EXIT" else 0),
         "entry": entry_px,
-        "current_price": curr_px,
-        "price_source": "current_quote" if quote_px is not None else ("completed_candle" if last_closed else "unavailable"),
+        "current_price": None if carryover_pending else curr_px,
+        "price_source": "unavailable" if carryover_pending else ("current_quote" if quote_px is not None else ("completed_candle" if last_closed else "unavailable")),
         "active_stop": active_stop,
         "recommended_stop": recommended_stop,
         "target": target_px,
         "flat_by": "positional" if style == "positional" else (hm(flat_by_time) if flat_by_time else None),
-        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pnl": None if carryover_pending else unrealized_pnl,
         "r_multiple": r_mult,
         "indicators": {
             "ema9": round(ema9_v, 4) if ema9_v else None,
@@ -1626,6 +1701,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         "provider": prov_name,
         "evaluated_at": _market_iso(now_utc, market=market),
         "evaluation_mode": "on_invocation",
+        "next_session_pending": carryover_pending,
     }
 
 
@@ -1702,6 +1778,7 @@ def _collect_open_positions(a, cfg, plan_doc=None):
             "tick_size": (plan_doc or {}).get("tick_size"),
             "lot_size": (plan_doc or {}).get("lot_size") or 1,
             "flat_by": (plan_doc or {}).get("flat_by"),
+            "entry_date": getattr(a, "entry_date", None) or (plan_doc or {}).get("date"),
         }
         positions.append(p)
         return positions
@@ -1714,12 +1791,29 @@ def _collect_open_positions(a, cfg, plan_doc=None):
                 continue
             merged = dict(pos)
             merged["symbol"] = sym
+            lots = merged.get("lots") or []
+            open_lot_dates = []
+            if isinstance(lots, list):
+                for lot in lots:
+                    if not isinstance(lot, dict):
+                        continue
+                    try:
+                        if float(lot.get("shares", lot.get("qty", lot.get("quantity", 0))) or 0) > 0 and lot.get("date"):
+                            open_lot_dates.append(str(lot["date"])[:10])
+                    except (TypeError, ValueError):
+                        continue
+            if open_lot_dates:
+                merged["entry_date"] = min(open_lot_dates)
+            elif not merged.get("entry_date"):
+                merged["entry_date"] = merged.get("date") or merged.get("entry_time_date")
             if plan_doc and str(plan_doc.get("symbol") or "").upper() == sym:
                 for k in ("stop", "target", "trading_style", "flat_by", "tick_size", "lot_size", "asset_type", "exchange"):
                     if merged.get(k) is None and plan_doc.get(k) is not None:
                         merged[k] = plan_doc[k]
                 if not merged.get("expiry") and (plan_doc.get("option_contract") or {}).get("expiry"):
                     merged["expiry"] = plan_doc["option_contract"]["expiry"]
+                if not merged.get("entry_date"):
+                    merged["entry_date"] = plan_doc.get("date")
             positions.append(merged)
     return positions
 
@@ -1741,8 +1835,18 @@ def describe_management(ev):
         lines.append("  Reason: %s" % r)
     if ev.get("recommended_stop") is not None:
         lines.append("  New trailing stop: %s%.2f (never move stops further away)" % (curr, ev["recommended_stop"]))
-    if ev["action"] == "EXIT":
+    analytical_index = ev.get("market") == "IN" and (
+        str(ev.get("asset_type") or "").upper() == "INDEX"
+        or (symbols_in and symbols_in.is_index_symbol(ev.get("symbol", "")) and not symbols_in.is_derivative_symbol(ev.get("symbol", "")))
+    )
+    if ev["action"] == "EXIT" and analytical_index:
+        lines.append("  Spot index is analytical only; use a listed index F&O contract for execution.")
+    elif ev["action"] == "EXIT_PENDING_NEXT_SESSION":
+        lines.append("  Market is closed; no exit price or executable ticket is available. Recheck at the next valid session.")
+    elif ev["action"] == "EXIT":
         lines.append("  Next (paper gate): ticket.py flatten --symbol %s -> check.py -> yes -> ticket.approve" % ev["symbol"])
+    elif ev["action"] == "PARTIAL EXIT" and analytical_index:
+        lines.append("  Spot index is analytical only; use a listed index F&O contract for execution.")
     elif ev["action"] == "PARTIAL EXIT":
         lines.append("  Next (paper gate): ticket.py flatten --symbol %s --qty %s -> check.py -> yes -> ticket.approve" % (
             ev["symbol"], int(ev.get("exit_qty") or 1)))
