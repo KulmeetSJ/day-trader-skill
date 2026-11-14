@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 import _load
@@ -114,16 +115,19 @@ class IntradayEngineTests(unittest.TestCase):
         today[-1]["l"] = 2804.5
         today[-1]["c"] = 2808.2
         today[-1]["v"] = 36000
-        # Forming 10:30 bar (incomplete at 10:31 IST)
-        forming = {"t": today[-1]["t"] + 300, "o": 2808.2, "h": 2809.2, "l": 2807.8, "c": 2808.5, "v": 9000}
-        now = _ist_utc(2026, 10, 19, 10, 31)
+        # A second qualifying close follows the first trigger; the first must remain selected.
+        later = {"t": today[-1]["t"] + 300, "o": 2808.2, "h": 2812.0, "l": 2808.0, "c": 2811.0, "v": 40000}
+        # Forming 10:35 bar must not replace the first completed trigger.
+        forming = {"t": today[-1]["t"] + 600, "o": 2811.0, "h": 2813.0, "l": 2810.5, "c": 2812.0, "v": 9000}
+        now = _ist_utc(2026, 10, 19, 10, 36)
         ch, _ = _make_v8_chart(
-            "RELIANCE", prev_day + today + [forming], interval="5m", market="IN",
+            "RELIANCE", prev_day + today + [later, forming], interval="5m", market="IN",
             prev_close=2795.0,
             quote={"price": 2808.5, "timestamp": int(now.timestamp()), "provider": "upstox", "data_status": "CURRENT", "is_live": True},
         )
         cfg = dict(entry.DEFAULTS_IN)
-        cfg.update({"budget": 100000.0, "max_loss": 2000.0, "max_order": 50000.0, "position_cap": 1.0})
+        cfg.update({"budget": 100000.0, "max_loss": 2000.0, "max_order": 50000.0, "position_cap": 1.0,
+                    "min_reward_risk": 1.0})
         res = entry.evaluate(
             ch, now, setup="breakout_intraday", interval="5m", market="IN",
             min_volume_x=1.5, cfg=cfg, lookback_bars=12,
@@ -137,9 +141,18 @@ class IntradayEngineTests(unittest.TestCase):
         self.assertIsNotNone(res["decision"]["targets_preview"])
         self.assertGreater(res["decision"]["reward_risk"], 1.0)
         self.assertGreater(res["sizing_preview"]["qty"], 0)
-        self.assertEqual(res["candle_context"]["completed_candle"]["close"], 2808.2)
-        self.assertEqual(res["candle_context"]["forming_candle"]["close_so_far"], 2808.5)
-        self.assertEqual(res["candle_context"]["current_quote"]["price"], 2808.5)
+        self.assertEqual(res["candle_context"]["completed_candle"]["close"], 2811.0)
+        self.assertEqual(res["trigger"]["bar_start"], "10:25")
+        self.assertEqual(res["trigger"]["price"], 2808.2)
+        self.assertEqual(res["trigger"]["time"], "10:30 AM")
+        self.assertIn("10:25", res["reason"])
+        self.assertEqual(res["decision"]["entry_reference"], res["trigger"]["price"])
+        self.assertEqual(res["decision"]["entry_reference_source"], "trigger_close")
+        self.assertAlmostEqual(
+            res["decision"]["targets_preview"]["t2_2r"],
+            3 * res["decision"]["entry_reference"] - 2 * res["decision"]["stop_preview"],
+        )
+        self.assertEqual(res["candle_context"]["forming_candle"]["close_so_far"], 2812.0)
         self.assertEqual(res["decision"]["evaluation_mode"], "on_invocation")
 
     def test_late_session_1400_and_15m_without_opening_range_or_daily(self):
@@ -484,7 +497,8 @@ class IntradayEngineTests(unittest.TestCase):
         # Same pullback bars on tradable equity surface ENTRY CONFIRMED / ACTIONABLE_IN_ZONE
         ch_pb_eq, _ = _make_v8_chart("RELIANCE", or_bars + [trig_bar, pb_bar], interval="5m", market="IN", prev_close=25190.0)
         res_pb_eq = entry.evaluate(ch_pb_eq, datetime.fromtimestamp(pb_bar["t"] + 310, tz=timezone.utc),
-                                   setup="orb", or_minutes=15, interval="5m", market="IN")
+                                   setup="orb", or_minutes=15, interval="5m", market="IN",
+                                   cfg=dict(entry.DEFAULTS_IN, budget=100000.0, max_loss=2000.0))
         self.assertEqual(res_pb_eq["decision_state"], "ENTRY CONFIRMED")
         self.assertEqual(res_pb_eq["sub_state"], "ACTIONABLE_IN_ZONE")
 
@@ -504,6 +518,64 @@ class IntradayEngineTests(unittest.TestCase):
         res_inv_eq = entry.evaluate(ch_inv_eq, datetime.fromtimestamp(inv_bar["t"] + 310, tz=timezone.utc),
                                     setup="orb", or_minutes=15, interval="5m", market="IN")
         self.assertEqual(res_inv_eq["sub_state"], "INVALIDATED")
+
+    def test_orb_requires_exact_completed_opening_range_slots(self):
+        t0 = _ist_utc(2026, 11, 12, 9, 15)
+        range_bars = [
+            {"t": int(t0.timestamp()) + i * 300, "o": 99.0, "h": hi, "l": lo,
+             "c": 99.5, "v": 10000}
+            for i, (hi, lo) in enumerate(((100.0, 98.0), (99.5, 98.5), (99.7, 98.7)))
+        ]
+        trigger = {"t": int(t0.timestamp()) + 900, "o": 100.0, "h": 100.4,
+                   "l": 99.8, "c": 100.2, "v": 20000}
+        now = datetime.fromtimestamp(trigger["t"] + 310, tz=timezone.utc)
+        cfg = dict(entry.DEFAULTS_IN, budget=100000.0, max_loss=2000.0)
+
+        missing, _ = _make_v8_chart("RELIANCE", [range_bars[0], range_bars[2], trigger],
+                                    interval="5m", market="IN")
+        res_missing = entry.evaluate(missing, now, setup="orb", or_minutes=15,
+                                     interval="5m", market="IN", cfg=cfg)
+        self.assertFalse(res_missing["opening_range"]["complete"])
+        self.assertEqual(res_missing["decision_state"], "NO TRADE")
+        self.assertIn("missing slots 1", res_missing["reason"])
+
+        duplicate, _ = _make_v8_chart("RELIANCE", range_bars + [dict(range_bars[1]), trigger],
+                                      interval="5m", market="IN")
+        res_duplicate = entry.evaluate(duplicate, now, setup="orb", or_minutes=15,
+                                       interval="5m", market="IN", cfg=cfg)
+        self.assertFalse(res_duplicate["opening_range"]["complete"])
+        self.assertEqual(res_duplicate["decision_state"], "NO TRADE")
+        self.assertIn("duplicate slots 1", res_duplicate["reason"])
+
+        complete, _ = _make_v8_chart("RELIANCE", range_bars + [trigger],
+                                     interval="5m", market="IN")
+        res_complete = entry.evaluate(complete, now, setup="orb", or_minutes=15,
+                                      interval="5m", market="IN", cfg=cfg)
+        self.assertTrue(res_complete["opening_range"]["complete"])
+        self.assertEqual(res_complete["opening_range"]["bars"], 3)
+
+    def test_qualifying_entry_without_valid_risk_plan_cannot_confirm(self):
+        bars = _build_session_bars(_ist_utc(2026, 10, 19, 9, 15), 15, 300,
+                                   base_price=2798.0, step_delta=0.4)
+        for b in bars[:-1]:
+            b.update(h=2808.0, c=2805.0, o=2804.0, l=2800.0, v=12000)
+        bars[-1].update(o=2804.8, h=2809.0, l=2804.5, c=2808.2, v=36000)
+        now = _ist_utc(2026, 10, 19, 10, 31)
+        ch, _ = _make_v8_chart(
+            "RELIANCE", bars, interval="5m", market="IN", prev_close=2795.0,
+            quote={"price": 2808.5, "timestamp": int(now.timestamp()), "provider": "offline"},
+        )
+        cfg = dict(entry.DEFAULTS_IN, budget=100000.0, max_loss=2000.0)
+        with patch.object(entry, "compute_risk_reward_plan", return_value=None):
+            res = entry.evaluate(ch, now, setup="breakout_intraday", interval="5m",
+                                 market="IN", min_volume_x=1.5, cfg=cfg, lookback_bars=12)
+        self.assertEqual(res["decision_state"], "NO TRADE")
+        self.assertEqual(res["sub_state"], "INVALID_RISK_PLAN")
+        self.assertFalse(res["decision"]["actionable"])
+        self.assertIn("no valid risk plan", res["decision"]["no_trade_reason"])
+        self.assertIsNone(res["stop_preview"])
+        self.assertIsNone(res["targets_preview"])
+        self.assertIsNone(res["sizing_preview"])
 
     def test_risk_reward_plan_long_short_positions_and_invalid_atr(self):
         # Long: non-tick entry/stop normalized cleanly, exact R-multiple reconciliation

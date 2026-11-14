@@ -116,7 +116,7 @@ def _in_cfg():
     }
 
 
-def _sample_order(sym="RELIANCE", qty="30", entry=1340.0, stop=1324.40, target=1371.20, **meta):
+def _sample_order(sym="RELIANCE", qty="30", entry=1340.0, stop=1324.40, target=1410.00, **meta):
     o = {
         "symbol": sym,
         "side": "buy",
@@ -153,6 +153,18 @@ def _sample_order(sym="RELIANCE", qty="30", entry=1340.0, stop=1324.40, target=1
         "market": "IN",
         "currency": "INR",
     }
+    c_target = budget_mod.calculate_indian_transaction_charges(
+        asset_type="EQUITY", side="buy", entry_price=entry, exit_price=target,
+        qty=float(qty), trading_style="positional", as_of_date="2026-10-19",
+    )
+    c_stop = budget_mod.calculate_indian_transaction_charges(
+        asset_type="EQUITY", side="buy", entry_price=entry, exit_price=stop,
+        qty=float(qty), trading_style="positional", as_of_date="2026-10-19",
+    )
+    o["transaction_costs"] = c_target
+    o["transaction_costs_at_stop"] = c_stop
+    o["plan"]["transaction_costs"] = c_target
+    o["plan"]["transaction_costs_at_stop"] = c_stop
     for k, v in meta.items():
         o[k] = v
         o["plan"][k] = v
@@ -467,7 +479,7 @@ class TestTicketSignalProvenance(unittest.TestCase):
 
         # Exit -> Plan preserves provenance
         code_x, out_x, err_x = _run_cli(exit_mod, [
-            "plan", "--from", self.entry_path, "--config", self.cfg_path,
+            "plan", "--from", self.entry_path, "--target", "4R", "--config", self.cfg_path,
             "--market", "IN", "--now", sim_now, "--write", self.plan_path, "--json",
         ])
         self.assertEqual(code_x, 0, out_x + err_x)
@@ -554,7 +566,9 @@ class TestTicketSignalProvenance(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as fh:
             st = json.load(fh)
         rec = st["orders"][0]
-        self.assertEqual(rec["fingerprint"], ticket_mod.fingerprint(order))
+        with open(self.risk_path, encoding="utf-8") as fh:
+            checked_risk = json.load(fh)
+        self.assertEqual(rec["fingerprint"], checked_risk["results"][0]["fingerprint"])
         self.assertEqual(rec["data_tier"], "HISTORICAL")
         self.assertIs(rec["is_historical_analysis"], True)
         self.assertIs(rec["is_live_signal"], False)

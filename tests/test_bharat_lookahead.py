@@ -183,7 +183,7 @@ class TestLookaheadInvariance(unittest.TestCase):
 
         c_exit, out_exit, err_exit = run_cli(exit_mod, [
             "plan", "--from", entry_path, "--offline", chart_path,
-            "--stop", "atr:1.5", "--target", "2R",
+            "--stop", "atr:1.5", "--target", "4R",
             "--config", self.cfg_path, "--market", "IN",
             "--now", now_arg, "--write", plan_path,
         ])
@@ -601,10 +601,10 @@ class TestLookaheadRejectionAndDataCutoff(unittest.TestCase):
             "interval": "5m",
             "opening_range": {"high": 2848.0, "low": 2836.0, "minutes": 15},
             "stop": 2842.0,
-            "target": 2896.0,
+            "target": 2932.0,
             "tick_size": 0.05,
             "risk_per_share": 18.0,
-            "reward_risk": 2.0,
+            "reward_risk": 4.0,
             "flat_by": "15:20",
             "last_data_timestamp": "2026-10-19T14:00:00+05:30",
         }
@@ -678,10 +678,10 @@ class TestLookaheadRejectionAndDataCutoff(unittest.TestCase):
                 "entry_bar": 14,
                 "interval": "5m",
                 "stop": 2842.0,
-                "target": 2863.0,
+                "target": 2877.0,
                 "tick_size": 0.05,
                 "risk_per_share": 7.0,
-                "reward_risk": 2.0,
+                "reward_risk": 4.0,
                 "flat_by": "15:20",
                 "last_data_timestamp": "2026-10-19T10:35:00+05:30",
             }, fh)

@@ -67,7 +67,7 @@ each value in plain words:
 - **max_loss_per_trade_inr** / **max_loss_per_trade_usd** (or neutral **max_loss_per_trade**): the most one trade may lose if the stop fills at the stop (default 50 USD / 2000 INR).
 - **max_position_pct**, **max_order_inr** / **max_order_usd**, **min_order_inr** / **min_order_usd**: the biggest position (75% of the budget), biggest order and smallest order.
 - The day limits trader-risk enforces: **max_daily_loss_inr** / **max_daily_loss_usd**, **max_trades_per_day** (3),
-  **min_reward_risk** (1.0), **require_stop** (true), **no_entries_before** / **no_entries_after**
+  **min_reward_risk** (2.0 minimum; configuration can raise it), **require_stop** (true), **no_entries_before** / **no_entries_after**
   ("09:45" / "15:30" ET for US; "09:30" / "15:00" IST for India) and **flat_by** ("15:55" ET for US; "15:20" IST for India).
 - **blocked**: tickers they never want to trade.
 - Keep **paper** true until they have watched it work on a paper account.
@@ -135,7 +135,7 @@ below the stop. Then hand over to `/trader-risk`.
 ## Example: the reel
 
 TSLA on Monday 2026-10-19. Opening-range breakout: entry 364.18 at 10:15 AM,
-stop 358.32 (the opening-range midpoint), target 370.04 (1R). Risk 5.86 a
+stop 358.32 (the opening-range midpoint), target 375.90 (2R). Risk 5.86 a
 share. The example config: $5,000 budget, 10% cash buffer, $50 max loss.
 
 | limit | the math | shares |

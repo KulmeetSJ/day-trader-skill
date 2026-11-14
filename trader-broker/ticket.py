@@ -5,7 +5,7 @@ This tool never talks to a broker and never places anything. It does its
 work around the one moment that matters, your yes:
 
   show      renders each proposed order as a plain-English ticket plus the
-            exact JSON Claude will send to Alpaca's place_stock_order tool.
+            exact US connector JSON or Indian paper-only simulation payload.
             A bracket order shows its stop-loss, take-profit and the max loss
             at the stop. An order is READY only if trader-risk passed THIS
             exact order today (matched by fingerprint) and nobody has decided
@@ -14,7 +14,7 @@ work around the one moment that matters, your yes:
             word. It refuses "yes to all", "sure", "ok", a yes that names a
             different stock or amount, and any order that is not READY.
   decline   records a no.
-  result    records what happened after the Allow once / Deny card:
+  result    records a US connector result or an Indian simulated paper result:
             placed (with the broker's order id), denied, or failed.
   fill      records a fill in trader/portfolio.json (cash and shares).
   flatten   builds a sell ticket that closes a symbol's open position by
@@ -36,13 +36,15 @@ New York dates; --now "2026-10-19 10:15" pins the clock.
 import argparse
 import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-import hashlib
 import json
 import os
 import re
 import sys
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
+_RISK_DIR = os.path.join(os.path.dirname(_DIR), "trader-risk")
+if _RISK_DIR not in sys.path:
+    sys.path.insert(0, _RISK_DIR)
 _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
@@ -63,13 +65,15 @@ except ImportError:
     calendar_in = None
     instruments = None
 
+import order_fingerprint  # type: ignore
+
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions")
-FINGERPRINT_FIELDS = ALPACA_FIELDS + (
+PAPER_ORDER_FIELDS = ALPACA_FIELDS + (
     "market", "currency", "trading_style", "product", "multi_session_protection",
 )
 PAPER_MULTI_SESSION_BROKERS = ("paper", "paper_in", "simulated", "mock")
@@ -334,11 +338,97 @@ def rec_day(rec):
 
 # ---------------------------------------------------------------- the order
 
-def fingerprint(order):
-    """Same function as trader-risk/check.py: identifies the exact order."""
-    core = {k: order[k] for k in FINGERPRINT_FIELDS if k in order and order[k] is not None}
-    blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+def fingerprint(order, cfg=None, market=None, identity=None, risk_result=None):
+    """Canonical fingerprint shared with trader-risk, including its validated identity."""
+    if identity is None and isinstance(risk_result, dict):
+        identity = risk_result.get("resolved_identity")
+    fingerprint_cfg = dict(cfg or {})
+    saved_policy = (risk_result or {}).get("risk_parameters") or {}
+    saved_overrides = (risk_result or {}).get("fingerprint_overrides") or {}
+    for key in ("allow_off_hours", "exchange"):
+        if key in saved_overrides:
+            fingerprint_cfg[key] = saved_overrides[key]
+    if "allow_off_hours" not in fingerprint_cfg and "allow_off_hours" in saved_policy:
+        fingerprint_cfg["allow_off_hours"] = saved_policy["allow_off_hours"]
+    explicit_exchange = bool(
+        isinstance(order, dict) and (
+            order.get("exchange") or (isinstance(order.get("plan"), dict) and order["plan"].get("exchange"))
+        )
+    )
+    if "exchange" not in fingerprint_cfg and explicit_exchange and "exchange" in saved_policy:
+        fingerprint_cfg["exchange"] = saved_policy["exchange"]
+    return order_fingerprint.fingerprint(order, config=fingerprint_cfg, market=market, identity=identity)
+
+
+def _indian_paper_issue(market, cfg):
+    """India is simulated-only; reject unsafe broker or account configuration."""
+    if str(market or "").upper() != "IN":
+        return None
+    if not bool((cfg or {}).get("paper", True)):
+        return "Indian orders require paper=true; live execution is not supported"
+    broker = str((cfg or {}).get("broker") or "paper").strip().lower()
+    if broker != "paper":
+        return "Indian orders require broker='paper'; configured broker %r is not allowed" % broker
+    return None
+
+
+def _ensure_indian_paper(market, cfg):
+    issue = _indian_paper_issue(market, cfg)
+    if issue:
+        raise TicketError(issue)
+
+
+def _market_for_order(order, market=None, cfg=None):
+    """Do not let a caller's US override reclassify an explicitly Indian order."""
+    order = order if isinstance(order, dict) else {}
+    plan = order.get("plan") if isinstance(order.get("plan"), dict) else {}
+    markers = (
+        order.get("market"), order.get("currency"), order.get("exchange"), order.get("product"),
+        plan.get("market"), plan.get("currency"), plan.get("exchange"), plan.get("product"),
+        (cfg or {}).get("market"), (cfg or {}).get("currency"),
+    )
+    if any(str(value or "").strip().upper() in ("IN", "INDIA", "INR", "NSE", "BSE", "MIS", "CNC", "NRML")
+           for value in markers):
+        return "IN"
+    symbol = str(order.get("symbol") or "").strip().upper()
+    if symbol.endswith((".NS", ".BO", "-EQ")) or symbol.startswith(("NSE:", "BSE:")):
+        return "IN"
+    if symbols_in and (symbols_in.is_index_symbol(symbol) or symbols_in.is_derivative_symbol(symbol)):
+        return "IN"
+    return str(market or get_market_profile(None, orders=[order], cfg=cfg)).upper()
+
+
+def _external_identity_issue(order, risk_result, market):
+    """Require explicit, risk-validated US identity before an external ticket can be emitted."""
+    if str(market or "").upper() != "US":
+        return None
+    order = order if isinstance(order, dict) else {}
+    identity = risk_result.get("resolved_identity") if isinstance(risk_result, dict) else None
+    symbol = str(order.get("symbol") or "").strip().upper()
+    asset_type = str(order.get("asset_type") or "").strip().upper()
+    if str(order.get("market") or "").strip().upper() != "US":
+        return "US external orders require explicit order market='US'"
+    if str(order.get("currency") or "").strip().upper() != "USD":
+        return "US external orders require explicit order currency='USD'"
+    if asset_type not in ("EQUITY", "STOCK", "ETF"):
+        return "US external orders require a validated equity or ETF asset_type"
+    if not isinstance(identity, dict):
+        return "US external orders require a resolved instrument identity from trader-risk"
+    if identity.get("validation_status") != "RISK_VALIDATED_US_EQUITY":
+        return "US external orders require a risk-validated US equity/ETF identity"
+    expected = {
+        "symbol": symbol,
+        "market": "US",
+        "currency": "USD",
+        "asset_type": asset_type,
+    }
+    for key, value in expected.items():
+        actual = identity.get(key)
+        if key in ("symbol", "market", "currency", "asset_type"):
+            actual = str(actual or "").strip().upper()
+        if actual != value:
+            return "US external order identity is missing or conflicts on %s" % key
+    return None
 
 
 def is_positional_gtt(order):
@@ -407,7 +497,7 @@ def _f(x):
 def tool_input(order):
     """The exact arguments for place_stock_order (or paper GTT OCO payload for positional Indian orders)."""
     out = {}
-    fields = FINGERPRINT_FIELDS if is_positional_gtt(order) else ALPACA_FIELDS
+    fields = PAPER_ORDER_FIELDS if is_positional_gtt(order) else ALPACA_FIELDS
     for k in fields:
         if k in order and order[k] is not None:
             out[k] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
@@ -463,26 +553,26 @@ def is_bracket(order):
     return oc == "bracket" or (not oc and legs)
 
 
-def max_loss(order):
+def max_loss(order, risk_result=None):
     """(amount lost, stop) if the stop fills exactly at the stop, or (None, stop)."""
-    stop = _f(order.get("stop_loss_stop_price")) or _f((order.get("plan") or {}).get("stop"))
+    stop = _f(order.get("stop_loss_stop_price"))
     q = _f(order.get("qty"))
     if not stop or not q:
         return None, stop
     plan = order.get("plan") or {}
     if str(order.get("type", "market")) == "limit" and _f(order.get("limit_price")):
         entry = _f(order["limit_price"])
-    elif _f(plan.get("max_loss")) is not None:
-        return round(_f(plan["max_loss"]), 2), stop
+    elif isinstance(risk_result, dict) and _f(risk_result.get("max_loss")) is not None:
+        return round(_f(risk_result["max_loss"]), 2), stop
     else:
-        entry = _f(plan.get("entry"))
+        entry = _f((risk_result or {}).get("entry_ref")) or _f(plan.get("entry"))
     if not entry:
         return None, stop
     risk = abs(Decimal(str(entry)) - Decimal(str(stop)))
     return round(float(Decimal(str(q)) * risk), 2), stop
 
 
-def plain_parts(order, market=None):
+def plain_parts(order, market=None, risk_result=None):
     """The ticket in plain words, one part per line."""
     if market is None:
         market = order.get("market") or ("IN" if order.get("currency") == "INR" else "US")
@@ -511,7 +601,7 @@ def plain_parts(order, market=None):
             parts.append(leg)
         if order.get("take_profit_limit_price") is not None:
             parts.append("take-profit %s" % _p(order["take_profit_limit_price"], tick=tick))
-        loss, stop = max_loss(order)
+        loss, stop = max_loss(order, risk_result)
         if loss is not None:
             parts.append("max loss about %s if the stop fills at %s (it can fill worse in a fast market)"
                          % (_money(loss, market=market), _p(stop, tick=tick)))
@@ -538,10 +628,10 @@ def plain_parts(order, market=None):
     return ["%s %s, %s, %s" % (side, what, how, tif)]
 
 
-def plain(order, market=None):
+def plain(order, market=None, risk_result=None):
     """BUY $1,250 of AAPL, market order, good for today
     BUY 8 TSLA, market, good for today / stop-loss 358.32 / take-profit 370.04 / max loss about $46.88 ..."""
-    return " / ".join(plain_parts(order, market=market))
+    return " / ".join(plain_parts(order, market=market, risk_result=risk_result))
 
 
 def amount_numbers(order):
@@ -724,6 +814,7 @@ def latest(state, fp, today):
 
 
 def risk_verdict(risk, fp, today):
+    """Legacy exact-fingerprint lookup API; kept stable for existing callers."""
     if not risk:
         return None, "trader-risk has not checked these orders (run check.py)"
     if risk.get("date") != today:
@@ -734,8 +825,30 @@ def risk_verdict(risk, fp, today):
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
+def _risk_order_verdict(risk, order, today, cfg=None, market=None):
+    if not risk:
+        return None, "trader-risk has not checked these orders (run check.py)", None
+    if risk.get("date") != today:
+        return None, "the risk check is from %s, not today; run check.py again" % risk.get("date"), None
+    for r in risk.get("results", []):
+        if str(r.get("symbol") or "").upper() != str(order.get("symbol") or "").upper():
+            continue
+        if str(r.get("side") or "").lower() != str(order.get("side") or "").lower():
+            continue
+        fp = fingerprint(order, cfg=cfg, market=market, risk_result=r)
+        if r.get("fingerprint") == fp:
+            return r, None, fp
+    return None, "this exact order was not in the last risk check (it changed or is new, including risk context); run check.py again", None
+
+
 def status_of(order, risk, state, today, cfg=None, market=None):
     """(ready, label, risk_result)"""
+    if not isinstance(order, dict):
+        return False, "BLOCKED: order must be a valid object", None
+    market = _market_for_order(order, market, cfg)
+    india_issue = _indian_paper_issue(market, cfg)
+    if india_issue:
+        return False, "BLOCKED: " + india_issue, None
     try:
         _assert_tradable_instrument(order.get("symbol"), order)
     except TicketError as exc:
@@ -743,12 +856,14 @@ def status_of(order, risk, state, today, cfg=None, market=None):
     issue = positional_order_issue(order, cfg=cfg, market=market)
     if issue:
         return False, "BLOCKED positional check: " + issue, None
-    fp = fingerprint(order)
-    rv, why = risk_verdict(risk, fp, today)
+    rv, why, fp = _risk_order_verdict(risk, order, today, cfg=cfg, market=market)
     if rv is None:
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
         return False, "BLOCKED by trader-risk: " + "; ".join(rv.get("reasons", [])), rv
+    identity_issue = _external_identity_issue(order, rv, market)
+    if identity_issue:
+        return False, "BLOCKED instrument identity: " + identity_issue, rv
     opt_entry = (
         str(order.get("asset_type") or "").upper() == "OPTIONS"
         or bool(order.get("option_contract"))
@@ -757,11 +872,19 @@ def status_of(order, risk, state, today, cfg=None, market=None):
     )
     if opt_entry and kind_of(order, rv) == "entry":
         return False, "BLOCKED: OPTION RISK UNAVAILABLE; option entry premium risk is not validated", rv
+    if kind_of(order, rv) == "entry" and bool((cfg or {}).get("require_stop", True)):
+        actual_stop = _f(order.get("stop_loss_stop_price"))
+        risk_stop = _f(rv.get("stop"))
+        if actual_stop is None:
+            return False, "BLOCKED: risk PASS has no protective stop in the actual order", rv
+        if risk_stop is None or Decimal(str(actual_stop)) != Decimal(str(risk_stop)):
+            return False, "BLOCKED: risk stop does not match the protective stop in the actual order", rv
     rec = latest(state, fp, today)
     if rec:
         st = rec.get("status")
         if st == "approved":
-            return False, "APPROVED by you at %s, waiting for the place_stock_order call" % rec.get("at"), rv
+            next_step = "paper result" if market == "IN" else "the place_stock_order call"
+            return False, "APPROVED by you at %s, waiting for %s" % (rec.get("at"), next_step), rv
         return False, "DONE: %s at %s" % (st, rec.get("at")), rv
     return True, "READY: trader-risk PASS, waiting for your yes", rv
 
@@ -994,6 +1117,9 @@ def _signal_summary_line(prov):
 
 def render(order, idx, total, cfg, risk, state, today, market="US", doc=None,
            simulated_at=None, last_data_timestamp=None, clock_override=None, now=None):
+    if not isinstance(order, dict):
+        return "#%d: BLOCKED: order must be a valid object" % idx, False
+    market = _market_for_order(order, market, cfg)
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
                              simulated_at=simulated_at, last_data_timestamp=last_data_timestamp,
@@ -1001,29 +1127,39 @@ def render(order, idx, total, cfg, risk, state, today, market="US", doc=None,
     default_broker = "paper" if market == "IN" else "alpaca"
     broker = str(cfg.get("broker", default_broker)).lower()
     paper = cfg.get("paper", True)
-    acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    broker_name = "Interactive Brokers" if broker == "ibkr" else ("Paper Broker (NSE/BSE)" if market == "IN" else "Alpaca")
+    acct = "BLOCKED CONFIG" if market == "IN" and _indian_paper_issue(market, cfg) else ("PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY")
+    broker_name = "Paper Broker (NSE/BSE)" if market == "IN" else ("Interactive Brokers" if broker == "ibkr" else "Alpaca")
     lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, broker_name)]
     if prov.get("signal_warning"):
         lines.append("  WARNING: " + prov["signal_warning"])
     lines.append(_signal_summary_line(prov))
-    for part in plain_parts(order, market=market):
+    for part in plain_parts(order, market=market, risk_result=rv):
         lines.append("  " + part)
     if order.get("why"):
         lines.append("  why: " + order["why"])
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
-        lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
-        lines.append("  IBKR account, and it only goes to the market after you approve it there.")
-    elif is_positional_gtt(order):
+    identity_issue = _external_identity_issue(order, rv, market)
+    if market == "IN" and _indian_paper_issue(market, cfg):
+        lines.append("  No order payload prepared: Indian orders require the paper broker configuration.")
+    elif market == "IN" and is_positional_gtt(order):
         lines.append("  Paper broker positional GTT OCO payload (simulated CNC/NRML delivery; persists across sessions):")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
         lines.append("  Paper broker arms GTT OCO stop-loss (%s) and take-profit (%s) across sessions under product %s."
                      % (order.get("stop_loss_stop_price"), order.get("take_profit_limit_price"),
                         order.get("product", "CNC")))
+    elif market == "IN":
+        lines.append("  Paper MIS simulation payload (not an external broker order):")
+        for l in json.dumps(tool_input(order), indent=2).splitlines():
+            lines.append("    " + l)
+        lines.append("  Approval records the simulated paper order; use ticket.py result/fill to update the paper portfolio.")
+    elif identity_issue:
+        lines.append("  No external order payload prepared: " + identity_issue + ".")
+    elif broker == "ibkr":
+        lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
+        lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -1035,7 +1171,9 @@ def render(order, idx, total, cfg, risk, state, today, market="US", doc=None,
                 lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
                 lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
-        if is_positional_gtt(order):
+        if market == "IN":
+            lines.append("  Reply \"yes\" to record this simulated Indian paper order, or \"no\" to skip it.")
+        elif is_positional_gtt(order):
             lines.append("  Reply \"yes\" to record paper approval for this positional GTT OCO order, or \"no\" to skip it.")
             lines.append("  Simulated paper mode only: no live broker execution occurs.")
         else:
@@ -1047,17 +1185,30 @@ def render(order, idx, total, cfg, risk, state, today, market="US", doc=None,
 
 def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None,
                 simulated_at=None, last_data_timestamp=None, clock_override=None, now=None):
+    if not isinstance(order, dict):
+        return {
+            "index": idx,
+            "ready": False,
+            "status": "BLOCKED: order must be a valid object",
+            "plain": "INVALID ORDER",
+            "fingerprint": "",
+            "paper": True,
+            "broker": "paper",
+        }
+    market = _market_for_order(order, market, cfg)
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
                              simulated_at=simulated_at, last_data_timestamp=last_data_timestamp,
                              clock_override=clock_override, now=now, market=market)
-    loss, stop = max_loss(order)
+    loss, stop = max_loss(order, rv)
+    identity_issue = _external_identity_issue(order, rv, market)
     default_broker = "paper" if market == "IN" else "alpaca"
-    res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market),
-           "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
+    res = {"index": idx, "ready": ready, "status": label, "plain": plain(order, market=market, risk_result=rv),
+           "fingerprint": fingerprint(order, cfg=cfg, market=market, risk_result=rv), "paper": bool(cfg.get("paper", True)),
            "broker": cfg.get("broker", default_broker),
-           "tool": "paper_gtt_oco" if is_positional_gtt(order) else "place_stock_order",
-           "tool_input": tool_input(order), "why": order.get("why", ""),
+           "tool": (None if _indian_paper_issue(market, cfg) else ("paper_gtt_oco" if is_positional_gtt(order) else "paper_mis")) if market == "IN" else (None if identity_issue else "place_stock_order"),
+           "tool_input": (None if _indian_paper_issue(market, cfg) else tool_input(order)) if market == "IN" else (None if identity_issue else tool_input(order)),
+           "why": order.get("why", ""),
            "bracket": is_bracket(order), "max_loss": loss, "stop": stop,
            "data_tier": prov["data_tier"],
            "is_historical_analysis": prov["is_historical_analysis"],
@@ -1215,7 +1366,7 @@ def _apply_state_meta(state, sim_at=None, lts=None):
         state["last_data_timestamp"] = lts
 
 
-def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simulated_at=None, last_data_timestamp=None, tick=None):
+def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simulated_at=None, last_data_timestamp=None, tick=None, pnl=None):
     """A fill in the log, so trader-risk can count day trades (a buy and a sell the same day)."""
     state = load_state(state_path)
     entry = {
@@ -1223,6 +1374,9 @@ def log_fill(state_path, now, today, symbol, side, qty, price, market="US", simu
         "qty": _str_num(float(qty)), "price": float(price),
         "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price, tick=tick)),
     }
+    if pnl is not None:
+        entry["pnl"] = float(pnl)
+        entry["realized_pnl"] = float(pnl)
     if market == "IN":
         entry["market"] = "IN"
         entry["currency"] = "INR"
@@ -1322,26 +1476,32 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    market = _market_for_order(order, market, cfg)
+    _ensure_indian_paper(market, cfg)
     _assert_tradable_instrument(order.get("symbol", ""), doc=order)
     doc = read_json(a.orders, "orders file", required=False)
     sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
     ready, label, rv = status_of(order, risk, state, today, cfg=cfg, market=market)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
+    identity_issue = _external_identity_issue(order, rv, market)
+    if identity_issue:
+        raise TicketError("order %d cannot be routed externally: %s" % (a.index, identity_issue))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
     if not ok:
         print("Not recorded: %s. Ask the user again with the ticket for order %d." % (why, a.index))
         return 1
-    loss, stop = max_loss(order)
+    loss, stop = max_loss(order, rv)
     explicit_now = bool(getattr(a, "now", None))
     prov = signal_provenance(order, doc=doc, risk=risk, rv=rv, today=today,
                              simulated_at=sim_at, last_data_timestamp=lts,
                              clock_override=explicit_now, now=now, market=market)
     default_broker = "paper" if market == "IN" else "alpaca"
-    rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fingerprint(order),
+    rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index,
+           "fingerprint": fingerprint(order, cfg=cfg, market=market, risk_result=rv),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
-           "plain": plain(order, market=market), "status": "approved", "reply": a.reply,
+           "plain": plain(order, market=market, risk_result=rv), "status": "approved", "reply": a.reply,
            "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", default_broker),
            "data_tier": prov["data_tier"],
            "is_historical_analysis": prov["is_historical_analysis"],
@@ -1358,8 +1518,11 @@ def cmd_approve(a):
     _apply_state_meta(state, sim_at, lts)
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
-    print("Recorded your yes for order %d: %s." % (a.index, plain(order, market=market)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    print("Recorded your yes for order %d: %s." % (a.index, plain(order, market=market, risk_result=rv)))
+    if market == "IN":
+        print("Simulated Indian paper approval recorded. No external order tool was called or prepared.")
+        print("Record the simulated paper result with ticket.py result --index %d --status placed, then ticket.py fill with the simulated fill." % a.index)
+    elif str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     elif is_positional_gtt(order):
         print("Positional paper GTT OCO payload (stop-loss and target remain active across sessions):")
@@ -1376,9 +1539,12 @@ def cmd_approve(a):
 def cmd_decline(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    market = _market_for_order(order, market, cfg)
     doc = read_json(a.orders, "orders file", required=False)
     sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
-    rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fingerprint(order),
+    risk_result, _, risk_fp = _risk_order_verdict(risk, order, today, cfg=cfg, market=market)
+    rec = {"at": ny_iso(now, market=market), "date": today, "index": a.index,
+           "fingerprint": risk_fp or fingerprint(order, cfg=cfg, market=market),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "plain": plain(order, market=market), "status": "declined", "reply": a.reply or "no"}
     if sim_at:
@@ -1395,9 +1561,13 @@ def cmd_decline(a):
 def cmd_result(a):
     orders, cfg, risk, state, today, now, market = _load(a)
     order = _pick(orders, a.index)
+    market = _market_for_order(order, market, cfg)
     doc = read_json(a.orders, "orders file", required=False)
     sim_at, lts = _meta_context(doc, orders, order, risk, now, market, explicit_now=bool(getattr(a, "now", None)))
-    fp = fingerprint(order)
+    _ensure_indian_paper(market, cfg)
+    rv, risk_why, fp = _risk_order_verdict(risk, order, today, cfg=cfg, market=market)
+    if fp is None:
+        raise TicketError("the order no longer matches its risk PASS: %s" % risk_why)
     rec = latest(state, fp, today)
     if not rec or rec.get("status") != "approved":
         raise TicketError("order %d has no yes recorded today; a result can only follow an approval" % a.index)
@@ -1417,7 +1587,8 @@ def cmd_result(a):
             raise TicketError("filled qty %s exceeds approved order qty %s" % (_str_num(fq), _str_num(max_qty)))
     new = {"at": ny_iso(now, market=market), "date": today, "index": a.index, "fingerprint": fp, "symbol": rec["symbol"],
            "side": rec["side"], "plain": rec["plain"], "status": a.status}
-    for k in ("qty", "kind", "max_loss", "stop", "market", "currency", "simulated_at", "last_data_timestamp"):
+    for k in ("qty", "kind", "max_loss", "stop", "market", "currency", "paper", "broker",
+              "simulated_at", "last_data_timestamp"):
         if rec.get(k) is not None:
             new[k] = rec[k]
     if sim_at and "simulated_at" not in new:
@@ -1458,13 +1629,15 @@ def cmd_result(a):
 def cmd_fill(a):
     cfg = read_json(a.config, "config", required=False) or {}
     market = get_market_profile(a, cfg=cfg)
+    _ensure_indian_paper(market, cfg)
     now, today = _clock(a, market=market)
     date = a.date or today
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         raise TicketError("--date wants a date like 2026-10-19")
     pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date, market=market)
     sim_at = ny_iso(now, market=market) if getattr(a, "now", None) else None
-    log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price, market=market, simulated_at=sim_at)
+    pnl = pf.get("last_trade_pnl") if a.side == "sell" else None
+    log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price, market=market, simulated_at=sim_at, pnl=pnl)
     msg = ("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
                                                                   _money(a.price, market=market), date, a.portfolio,
                                                                   _money(pf["cash"], market=market)))
@@ -1488,11 +1661,12 @@ def cmd_flatten(a):
     market = get_market_profile(a, cfg=cfg, risk=plan)
     if market == "US" and (sym.endswith((".NS", ".BO", "-EQ")) or plan.get("market") == "IN"):
         market = "IN"
+    _ensure_indian_paper(market, cfg)
     now, today = _clock(a, market=market)
     plan_for_sym = plan if (isinstance(plan, dict) and str(plan.get("symbol", "")).upper() == sym) else {}
     lts = _check_no_lookahead([plan_for_sym] if plan_for_sym else [], now, today, market=market, strict=bool(getattr(a, "now", None)))
     sim_at = ny_iso(now, market=market) if (getattr(a, "now", None) or (plan_for_sym and plan_for_sym.get("simulated_at"))) else None
-    source = "the broker, get_open_position"
+    source = "the paper portfolio" if market == "IN" else "the broker, get_open_position"
     if a.qty is not None:
         qty = _f(a.qty)
         if qty is None or qty <= 0:
@@ -1508,6 +1682,8 @@ def cmd_flatten(a):
                   if isinstance(p, dict) and str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
         source = a.portfolio
         if qty <= 1e-9:
+            if market == "IN":
+                raise TicketError("nothing to flatten: no %s shares in paper portfolio %s" % (sym, a.portfolio))
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     default_flat = "15:20" if market == "IN" else "15:55"
@@ -1522,9 +1698,9 @@ def cmd_flatten(a):
         why_text = "flat by %s %s: closes the %s day trade before the close (qty from %s)" % (flat_by, time_label, sym, source)
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
              "why": why_text}
-    if market == "IN":
-        order["market"] = "IN"
-        order["currency"] = "INR"
+    order["market"] = market
+    order["currency"] = "INR" if market == "IN" else "USD"
+    order["asset_type"] = str(plan_for_sym.get("asset_type") or "EQUITY").upper()
     if sim_at:
         order["simulated_at"] = sim_at
     if lts:
@@ -1554,9 +1730,13 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
-    print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
-    print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
-    print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    if market == "IN":
+        print("  3. This is a simulated paper close only. Update the paper portfolio with ticket.py result/fill.")
+        print("     No Indian broker or external order tool is available from this workflow.")
+    else:
+        print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
+        print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
+        print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
     return 0
 
 
@@ -1609,7 +1789,7 @@ def main(argv=None):
     common(p)
     p.add_argument("--index", type=int, required=True)
     p.add_argument("--reply")
-    p = sub.add_parser("result", help="record what happened after the Allow once / Deny card")
+    p = sub.add_parser("result", help="record a US order result or Indian simulated paper result")
     common(p)
     p.add_argument("--index", type=int, required=True)
     p.add_argument("--status", required=True, choices=["placed", "denied", "failed"])

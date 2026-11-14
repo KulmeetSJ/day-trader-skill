@@ -55,7 +55,9 @@ python3 <SKILL_DIR>/trader-scanner/scan.py orb --market IN --offline <FIXTURE_DI
 ## What each setup checks
 
 Every rule is deterministic on completed OHLCV bars:
-- `breakout_20d`: latest close exceeds the highest close of the prior 20 sessions.
+- `breakout_20d`: the latest completed session close exceeds the highest close
+  of the 20 immediately preceding completed sessions. The candidate session is
+  excluded from the lookback, and the current incomplete session is excluded.
 - `bull_flag`: strong prior up-leg (`>=10%` over 20 bars into the flag high) followed by a tight, orderly 3-10 day consolidation (`<=8%` range) near highs.
 - `reclaim_ma20`: yesterday's close was below the 20-day simple moving average, today's close is back above it.
 - `oversold` / `oversold_bounce`: 14-period Wilder RSI `< 30`, or bouncing higher out of oversold.

@@ -409,6 +409,13 @@ def _standardize_payload(payload, provider_name, symbol=None, exchange="NSE",
     out["is_live"] = bool(is_live)
     out["is_simulated"] = bool(is_simulated)
     out["is_real_time"] = bool(is_live)
+    out["is_delayed"] = (data_status == DataStatus.DELAYED)
+    out["is_actual"] = bool(not is_simulated and data_status in (DataStatus.CURRENT, DataStatus.DELAYED, DataStatus.HISTORICAL))
+    out["is_estimated"] = bool(out.get("is_estimated", False))
+    out["source_timestamp"] = ts
+    out["retrieval_timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    out["timezone"] = "IST" if exch in ("NSE", "BSE") else "UTC"
+    out["data_age"] = age_secs
     out["last_data_timestamp"] = out.get("last_data_timestamp") or (
         _format_ist_iso(ts) if ts is not None else None
     )

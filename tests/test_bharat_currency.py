@@ -64,11 +64,11 @@ def _in_plan():
         "stop": 1400.0,
         "stop_rule": "or_mid",
         "stop_label": "opening-range midpoint",
-        "target": 1430.0,
-        "target_r": 2.0,
-        "target_label": "2R (two times the risk)",
+        "target": 1440.0,
+        "target_r": 3.0,
+        "target_label": "3R (three times the risk)",
         "risk_per_share": 10.0,
-        "reward_risk": 2.0,
+        "reward_risk": 3.0,
         "flat_by": "15:20",
         "tick_size": 0.05,
     }
@@ -169,7 +169,8 @@ class BudgetCurrencyTests(unittest.TestCase):
             self.assertIn("$", row["how"])
         order = budget_mod.bracket_order(s)
         self.assertIn("$", order["why"])
-        self.assertNotIn("market", order)
+        self.assertEqual((order["market"], order["currency"], order["asset_type"]),
+                         ("US", "USD", "EQUITY"))
 
     def test_weights_mode_india_vs_us(self):
         rows = [

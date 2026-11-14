@@ -71,12 +71,14 @@ if _scanner_dir not in sys.path:
 
 # Cross-skill helpers live in ../trader-alerts and ../trader-scanner
 try:
+    import strategy_rules  # type: ignore
     import calendar_in  # type: ignore
     import symbols_in  # type: ignore
     import instruments  # type: ignore
     import data_in  # type: ignore
     import visuals  # type: ignore
 except ImportError:
+    strategy_rules = None
     calendar_in = None
     symbols_in = None
     instruments = None
@@ -1188,8 +1190,10 @@ def _daily_closes_fallback(series, as_of_utc, market="US"):
 def _find_20d_fallback(closes):
     c = closes
     last = c[-1]
-    hi20 = max(c[-21:-1])
-    tags = ["breakout_20d"] if last > hi20 else []
+    prior_closes = c[:-1]
+    hi20 = (strategy_rules.prior_20d_close_high(prior_closes) if strategy_rules else
+            max(prior_closes[-20:]) if len(prior_closes) >= 20 else None)
+    tags = ["breakout_20d"] if hi20 is not None and last > hi20 else []
     return tags, {"high20": hi20}
 
 
@@ -1222,7 +1226,7 @@ def _daily_ohlc_before(raw_daily, as_of_utc, market="US"):
 
 
 def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US", tick_size=None):
-    """Compute prior 20 completed sessions' highest high entering eval_day without look-ahead."""
+    """Compute the highest close of the 20 completed sessions before eval_day."""
     min_daily = getattr(scanner_mod, "MIN_DAILY_BARS", 30) if scanner_mod else 30
     daily_err = chart.get("daily_error")
     raw_daily = chart.get("daily_bars")
@@ -1254,15 +1258,15 @@ def _analyze_breakout_20d_baseline(chart, now_utc, eval_day, market="US", tick_s
                 "daily_close": r2(latest_daily_close), "prior_high20": None, "missed_sessions": 0}
 
     closes_prior = [c for _, c, _ in prior_bars]
-    highs_prior = [h for _, _, h in prior_bars]
     if scanner_mod is not None:
         prior_tags, _ = scanner_mod.find_setups(closes_prior)
     else:
         prior_tags, _ = _find_20d_fallback(closes_prior)
 
-    # Authoritative 20-day breakout resistance: highest high over the previous 20 completed sessions.
-    breakout_level = float(max(highs_prior[-20:]))
-    prior_high20 = float(max(highs_prior[-21:-1])) if len(highs_prior) >= 21 else breakout_level
+    # Reference level is the highest CLOSE of the 20 completed sessions before
+    # the candidate/current session, shared with the daily scanner.
+    breakout_level = strategy_rules.prior_20d_close_high(closes_prior) if strategy_rules else max(closes_prior[-20:])
+    prior_high20 = float(breakout_level)
     tick = _tick_step(market, tick_size=tick_size)
     anchor_level = _round_tick(breakout_level, tick=tick) if tick_size is not None else breakout_level
     ref_inv = _floor_tick(anchor_level - tick, tick=tick)
@@ -1758,16 +1762,15 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     entry_ref = None
     entry_ref_source = None
     if invalidated_bar is None and not is_non_actionable_window and not stale_detached_zone:
-        if is_extended and trig is not None:
+        if trig is not None and setup in ("breakout_intraday", "breakout_20d", "vwap_reclaim", "ema_alignment"):
             entry_ref = float(trig["c"])
             entry_ref_source = "trigger_close"
+        elif trig is not None and _is_finite_pos(curr_px):
+            entry_ref = float(curr_px)
+            entry_ref_source = px_source
         elif trig is not None:
-            if _is_finite_pos(curr_px):
-                entry_ref = float(curr_px)
-                entry_ref_source = px_source
-            else:
-                entry_ref = float(trig["c"])
-                entry_ref_source = "trigger_close"
+            entry_ref = float(trig["c"])
+            entry_ref_source = "trigger_close"
         elif _is_finite_pos(curr_px):
             entry_ref = float(curr_px)
             entry_ref_source = px_source
@@ -1835,6 +1838,85 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         else _sizing_estimate(entry_ref_out, stop_preview, cfg, market=market, lot_size=lot_sz)
     )
 
+    # A confirmed entry must have a coherent, usable risk plan and a non-zero
+    # quantity preview. Keep diagnostic previews only when they are valid.
+    minimum_rr = cfg.get("min_reward_risk", 2.0) if isinstance(cfg, dict) else 2.0
+    try:
+        minimum_rr = max(2.0, float(minimum_rr))
+        if not math.isfinite(minimum_rr):
+            minimum_rr = 2.0
+    except (TypeError, ValueError, OverflowError):
+        minimum_rr = 2.0
+    size_preview = res.get("sizing_preview")
+    try:
+        planned_entry = float(entry_ref_out)
+        planned_stop = float(stop_preview)
+        planned_risk = float(risk_per_unit)
+        planned_t1 = float(targets_preview.get("t1_1r")) if isinstance(targets_preview, dict) else float("nan")
+        planned_t2 = float(targets_preview.get("t2_2r")) if isinstance(targets_preview, dict) else float("nan")
+        planned_t1_r = float(targets_preview.get("t1_r")) if isinstance(targets_preview, dict) else float("nan")
+        planned_t2_r = float(targets_preview.get("t2_r")) if isinstance(targets_preview, dict) else float("nan")
+        planned_rr = float(rr_preview)
+    except (TypeError, ValueError, OverflowError):
+        planned_entry = planned_stop = planned_risk = planned_t1 = planned_t2 = float("nan")
+        planned_t1_r = planned_t2_r = planned_rr = float("nan")
+    try:
+        sized_qty = int(size_preview.get("qty")) if isinstance(size_preview, dict) else 0
+        sized_risk = float(size_preview.get("risk_per_unit")) if isinstance(size_preview, dict) else float("nan")
+        sized_loss = float(size_preview.get("estimated_max_loss")) if isinstance(size_preview, dict) else float("nan")
+        sized_notional = float(size_preview.get("notional")) if isinstance(size_preview, dict) else float("nan")
+    except (TypeError, ValueError, OverflowError):
+        sized_qty, sized_risk, sized_loss, sized_notional = 0, float("nan"), float("nan"), float("nan")
+    risk_plan_valid = bool(
+        plan is not None
+        and math.isfinite(planned_entry) and planned_entry > 0
+        and math.isfinite(planned_stop) and 0 < planned_stop < planned_entry
+        and math.isfinite(planned_risk) and planned_risk > 0
+        and math.isclose(planned_risk, planned_entry - planned_stop, rel_tol=1e-9, abs_tol=tick / 2.0)
+        and isinstance(targets_preview, dict)
+        and math.isfinite(planned_t1) and planned_entry < planned_t1 < planned_t2
+        and math.isfinite(planned_t2)
+        and math.isfinite(planned_t1_r) and planned_t1_r > 0
+        and math.isfinite(planned_t2_r) and planned_t2_r > 0
+        and math.isfinite(minimum_rr) and minimum_rr > 0
+        and math.isfinite(planned_rr) and planned_rr >= minimum_rr
+        and math.isclose(planned_rr, planned_t2_r, rel_tol=1e-9, abs_tol=0.01)
+    )
+    sizing_valid = bool(
+        isinstance(size_preview, dict)
+        and isinstance(size_preview.get("qty"), int)
+        and not isinstance(size_preview.get("qty"), bool)
+        and sized_qty > 0
+        and math.isfinite(sized_risk) and math.isclose(sized_risk, planned_risk, rel_tol=1e-9, abs_tol=0.0001)
+        and math.isfinite(sized_loss) and sized_loss > 0
+        and math.isclose(sized_loss, round(sized_qty * planned_risk, 2), rel_tol=1e-9, abs_tol=0.01)
+        and math.isfinite(sized_notional) and sized_notional > 0
+        and math.isclose(sized_notional, round(sized_qty * planned_entry, 2), rel_tol=1e-9, abs_tol=0.01)
+    )
+    invalid_risk_plan_reason = None
+    if invalidated_bar is not None:
+        # Invalidation always removes the complete proposed trade geometry.
+        entry_ref_out = stop_preview = risk_per_unit = targets_preview = rr_preview = None
+        entry_ref_source = stop_source = None
+        res["sizing_preview"] = None
+    elif plan is None or not risk_plan_valid:
+        invalid_risk_plan_reason = "no valid risk plan: entry, protective stop, target, or minimum reward/risk is invalid"
+        entry_ref_out = stop_preview = risk_per_unit = targets_preview = rr_preview = None
+        entry_ref_source = stop_source = None
+        res["sizing_preview"] = None
+    elif not sizing_valid:
+        invalid_risk_plan_reason = "no valid position sizing: configured risk/budget cannot size at least one unit"
+        res["sizing_preview"] = None
+
+    # Keep the top-level fields synchronized with any fail-closed clearing.
+    res["entry_reference"] = entry_ref_out
+    res["entry_reference_source"] = entry_ref_source
+    res["stop_preview"] = stop_preview
+    res["stop_preview_source"] = stop_source
+    res["risk_per_unit"] = risk_per_unit
+    res["targets_preview"] = targets_preview
+    res["reward_risk"] = rr_preview
+
     # Decide actionable classification
     no_trade_reason = None
     sub_state = None
@@ -1893,15 +1975,18 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
                     "do not chase: triggered at %s (%.2f), current price %.2f is extended past actionable range"
                     % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px) if curr_px is not None else float(trig["c"]))
                 )
+        elif setup == "options_orb":
+            res["underlying_signal_state"] = "ENTRY CONFIRMED"
+            d_state = "NO TRADE"
+            sub_state = "OPTION_RISK_UNAVAILABLE"
+            no_trade_reason = "OPTION RISK UNAVAILABLE: fresh two-sided premium quotes, authoritative tick size, spread/liquidity limits, costs and actual premium stop/target are not validated"
+        elif invalid_risk_plan_reason is not None:
+            d_state = "NO TRADE"
+            sub_state = "INVALID_RISK_PLAN" if plan is None or not risk_plan_valid else "INVALID_SIZING"
+            no_trade_reason = invalid_risk_plan_reason
         else:
-            if setup == "options_orb":
-                res["underlying_signal_state"] = "ENTRY CONFIRMED"
-                d_state = "NO TRADE"
-                sub_state = "OPTION_RISK_UNAVAILABLE"
-                no_trade_reason = "OPTION RISK UNAVAILABLE: fresh two-sided premium quotes, authoritative tick size, spread/liquidity limits, costs and actual premium stop/target are not validated"
-            else:
-                d_state = "ENTRY CONFIRMED"
-                sub_state = "ACTIONABLE_IN_ZONE"
+            d_state = "ENTRY CONFIRMED"
+            sub_state = "ACTIONABLE_IN_ZONE"
     else:
         # waiting / forming / pre-open
         forming_px = pending["c"] if pending else None
@@ -2176,7 +2261,15 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     """Pure function: the setup's status and actionable intraday decision at now_utc."""
     market = market or chart.get("market") or "US"
     cfg = cfg or dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
-    if setup == "momentum":
+    if setup in ("breakout", "breakout_resistance"):
+        setup = "breakout_intraday"
+    elif setup in ("trend_continuation", "continuation"):
+        setup = "trend"
+    elif setup in ("pullback", "vwap_pullback"):
+        setup = "vwap_reclaim"
+    elif setup in ("reversal", "exhaustion_reversal"):
+        setup = "rsi_momentum"
+    elif setup == "momentum":
         setup = "rsi_momentum"
     if interval not in INTERVALS:
         raise EntryError("--interval is %s" % "/".join(INTERVALS))
@@ -2357,6 +2450,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
 
     by_slot = {}
+    slot_counts = {}
     warmup_bars = []
     for b in chart_bars:
         if b["t"] % step:
@@ -2370,6 +2464,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if et.date() != eval_day or not (open_dt <= et < close_dt):
             continue
         slot = int((et - open_dt).total_seconds()) // step
+        slot_counts[slot] = slot_counts.get(slot, 0) + 1
         by_slot[slot] = dict(b, et=et, end=et + datetime.timedelta(seconds=step), slot=slot)
     warmup_bars.sort(key=lambda x: x["t"])
 
@@ -2538,6 +2633,16 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     }
 
     or_bars = [b for b in bars if b["slot"] < n_or]
+    expected_or_slots = set(range(n_or))
+    completed_or_slots = {b["slot"] for b in or_bars}
+    missing_or_slots = sorted(expected_or_slots - completed_or_slots)
+    duplicate_or_slots = sorted(slot for slot in expected_or_slots if slot_counts.get(slot, 0) > 1)
+    or_complete = bool(
+        not missing_or_slots
+        and not duplicate_or_slots
+        and len(or_bars) == n_or
+        and (replay_full_session or local >= or_end)
+    )
     avg_vol = (sum(b["v"] for b in or_bars) / float(len(or_bars))) if or_bars else None
     if or_bars:
         or_h = max(b["h"] for b in or_bars)
@@ -2545,7 +2650,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res["opening_range"] = {"high": _round_tick(or_h, eff_tick) if explicit_tick else r2(or_h),
                                 "low": _round_tick(or_l, eff_tick) if explicit_tick else r2(or_l),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
-                                "complete": (replay_full_session or local >= or_end), "avg_volume": int(round(avg_vol))}
+                                "complete": or_complete, "avg_volume": int(round(avg_vol))}
     if setup == "options_orb":
         _attach_options_orb_contract(
             res, chart, None, now_utc, eval_day, exchange,
@@ -2556,6 +2661,24 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if not replay_full_session and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
+            return _assess_intraday_decision(
+                res, chart, bars, all_bars, None, None, pending, ind_snapshot,
+                local, eval_day, day, step, market, eff_tick, explicit_tick,
+                cfg, setup, data_tier, data_status, is_live_data, is_fixture,
+                is_simulated, session_is_open, replay_full_session, cutoff,
+                max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
+            )
+        if not or_complete:
+            details = []
+            if missing_or_slots:
+                details.append("missing slots %s" % ",".join(str(x) for x in missing_or_slots))
+            if duplicate_or_slots:
+                details.append("duplicate slots %s" % ",".join(str(x) for x in duplicate_or_slots))
+            no_or_msg = "Opening range incomplete: expected %d completed bars (%s)" % (
+                n_or, "; ".join(details) if details else "expected slots are not all completed"
+            )
+            res.update(status="no-data", phase="open" if session_is_open else "closed", reason=no_or_msg)
+            _mark_no_data(res, is_fixture, is_simulated, past_bar_dates, session_is_open)
             return _assess_intraday_decision(
                 res, chart, bars, all_bars, None, None, pending, ind_snapshot,
                 local, eval_day, day, step, market, eff_tick, explicit_tick,
@@ -2644,6 +2767,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     continue
                 trig = b
                 lvl = win_hi
+                break
         if trig is not None:
             res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
     elif setup == "vwap_reclaim" and vwap_s is not None:
@@ -2666,6 +2790,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     continue
                 trig = b
                 lvl = vw
+                break
         if trig is not None:
             res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
     elif setup == "ema_alignment":
@@ -2687,6 +2812,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     continue
                 trig = b
                 lvl = e9
+                break
         if trig is not None:
             res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
     elif setup == "ma_crossover":

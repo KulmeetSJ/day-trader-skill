@@ -240,7 +240,7 @@ class TestBharatOptionsRisk(unittest.TestCase):
             "limit_price": "2850.00",
             "order_class": "gtt_oco",
             "product": "CNC",
-            "take_profit_limit_price": "2950.00",
+            "take_profit_limit_price": "3050.00",
             "stop_loss_stop_price": "2800.00",
             "trading_style": "positional",
             "time_in_force": "gtc",
@@ -249,11 +249,19 @@ class TestBharatOptionsRisk(unittest.TestCase):
                 "product": "CNC",
                 "time_in_force": "gtc",
                 "persists_across_sessions": True,
-                "triggers": {"stop_loss": "2800.00", "take_profit": "2950.00"},
+                "triggers": {"stop_loss": "2800.00", "take_profit": "3050.00"},
             },
             "market": "IN",
             "currency": "INR",
         }
+        order["transaction_costs"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=3050.0,
+            qty=10, trading_style="positional", as_of_date="2026-10-19",
+        )
+        order["transaction_costs_at_stop"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=2800.0,
+            qty=10, trading_style="positional", as_of_date="2026-10-19",
+        )
         cfg = {
             "budget": 100000,
             "max_order_inr": 50000,

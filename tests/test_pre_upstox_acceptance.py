@@ -401,6 +401,7 @@ class TestPreUpstoxAcceptance(unittest.TestCase):
             code, out, err = run_cli(exit_mod, [
                 "plan",
                 "--from", entry_path,
+                "--target", "4R",
                 "--config", cfg_path,
                 "--market", "IN",
                 "--trading-style", "intraday",

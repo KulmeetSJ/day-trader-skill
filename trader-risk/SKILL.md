@@ -149,8 +149,8 @@ fresh $5,000 paper account with the example config:
 
 ```
 PASS  #1 buy TSLA 8 shares, entry
-          entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share
-          max loss $46.88 (limit $50), reward:risk 1.00 (min 1)
+          entry 364.18 (the plan's entry), stop 358.32, target 375.90: risk 5.86 a share
+          max loss $46.88 (limit $50), reward:risk 2.00 (min 2)
           today before this: 0 of 3 trades, $0 of $150 daily loss
 
 1 passed, 0 blocked at 2026-10-19 10:15 New York. Cash after the passed orders: $2,086.56 (paper account).
@@ -160,15 +160,15 @@ One more share and it is blocked:
 
 ```
 BLOCK #1 buy TSLA 9 shares, entry
-          entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share
-          max loss $52.74 (limit $50), reward:risk 1.00 (min 1)
+          entry 364.18 (the plan's entry), stop 358.32, target 375.90: risk 5.86 a share
+          max loss $52.74 (limit $50), reward:risk 2.00 (min 2)
           today before this: 0 of 3 trades, $0 of $150 daily loss
         - loss: 9 shares x 5.86 risk a share = $52.74 at the stop, over your $50 max loss per trade
 ```
 
 The same 8 shares checked at 10:55 with the real 10:52 quote (366.48) in
 `trader/prices.json` are blocked twice: 8 x 8.16 = $65.28 at the stop, and
-reward:risk 0.44. At 9:40 they are blocked by the window (no new entries
+reward:risk 1.15, under the 2R minimum. At 9:40 they are blocked by the window (no new entries
 before 9:45). The 3:55 PM sell that closes the position passes, even though
 it is after the 3:30 entry cutoff: it is an exit.
 

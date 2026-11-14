@@ -143,11 +143,11 @@ def _in_plan(**overrides):
         "stop": 1465.00,
         "stop_rule": "breakout_invalidation",
         "stop_label": "breakout invalidation",
-        "target": 1645.00,
+        "target": 1705.00,
         "target_rule": "r",
-        "target_label": "2R",
+        "target_label": "3R",
         "risk_per_share": 60.00,
-        "reward_risk": 2.0,
+        "reward_risk": 3.0,
         "entry_time": "10:35 AM",
         "date": "2026-10-19",
         "flat_by": "positional",
@@ -427,7 +427,7 @@ class PositionalOrderSemanticsTests(unittest.TestCase):
             "--market", "IN", "--write", self.entry_path,
         ])[0], 0)
         self.assertEqual(run_cli(exit_mod, [
-            "plan", "--from", self.entry_path, "--config", self.cfg_path,
+            "plan", "--from", self.entry_path, "--target", "4R", "--config", self.cfg_path,
             "--now", "2026-10-19 15:10", "--market", "IN", "--write", self.plan_path,
         ])[0], 0)
 

@@ -194,7 +194,7 @@ class TestBharatReadiness(unittest.TestCase):
             "side": "buy",
             "entry": 2850.00,
             "stop": 2800.00,
-            "target": 2950.00,
+            "target": 3050.00,
             "market": "IN",
             "tick_size": 0.05,
             "date": "2026-10-19",
@@ -231,11 +231,20 @@ class TestBharatReadiness(unittest.TestCase):
             "type": "limit",
             "limit_price": "2850.00",
             "order_class": "bracket",
-            "take_profit_limit_price": "2950.00",
+            "take_profit_limit_price": "3050.00",
             "stop_loss_stop_price": "2800.00",
             "time_in_force": "day",
             "market": "IN",
+            "currency": "INR",
         }]
+        orders[0]["transaction_costs"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=3050.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19",
+        )
+        orders[0]["transaction_costs_at_stop"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=2800.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19",
+        )
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump(orders, fh)
             orders_path = fh.name

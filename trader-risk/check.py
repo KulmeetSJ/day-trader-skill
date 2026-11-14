@@ -37,9 +37,9 @@ What blocks an entry (on top):
   duplicate     the same symbol and side twice in this batch, or already
                 placed today (trader/state/broker.json)
   daily limit   max_orders_per_day orders placed today
-  stop          no stop while "require_stop": true (a bracket stop_loss_stop_price
-                or the order's plan stop); a stop on the wrong side of the entry
-  loss          qty x (entry - stop) over max_loss_per_trade (_inr or _usd). The entry
+  stop          no protective order leg while "require_stop": true; an analytical
+                plan stop does not count as broker protection
+  loss          qty x (entry - protective order stop) over max_loss_per_trade (_inr or _usd). The entry
                 is the limit price for a limit order, else the HIGHER of the plan's
                 entry and a fresh price (under 15 minutes old), so a stale plan
                 cannot understate the risk
@@ -61,13 +61,14 @@ so trader-broker only shows an order as ready if THIS exact order passed today.
 import argparse
 import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-import hashlib
 import json
 import os
 import re
 import sys
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
+if _DIR not in sys.path:
+    sys.path.insert(0, _DIR)
 _ALERT_DIR = os.path.join(os.path.dirname(_DIR), "trader-alerts")
 if _ALERT_DIR not in sys.path:
     sys.path.insert(0, _ALERT_DIR)
@@ -90,10 +91,12 @@ except ImportError:
     calendar_in = None
     instruments = None
 
+import order_fingerprint
+
 DEFAULTS = {
     "budget": None, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_usd": 4000,
     "min_order_usd": 5, "max_loss_per_trade_usd": 50, "max_daily_loss_usd": 150, "max_trades_per_day": 3,
-    "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
+    "max_orders_per_day": 10, "min_reward_risk": 2.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
     "pdt_guard": False,
@@ -102,9 +105,6 @@ ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions")
-FINGERPRINT_FIELDS = ALPACA_FIELDS + (
-    "market", "currency", "trading_style", "product", "multi_session_protection",
-)
 PAPER_MULTI_SESSION_BROKERS = ("paper", "paper_in", "simulated", "mock")
 PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_limit_price",
                 "stop_loss_stop_price", "stop_loss_limit_price")
@@ -451,11 +451,9 @@ def read_json(path, what, required=True):
         raise RiskError("%s is not valid JSON: %s" % (path, e))
 
 
-def fingerprint(order):
-    """Same function in trader-broker/ticket.py: the exact order that was checked."""
-    core = {k: order[k] for k in FINGERPRINT_FIELDS if k in order and order[k] is not None}
-    blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+def fingerprint(order, config=None, market=None, identity=None):
+    """Canonical exact-order and risk-context fingerprint shared with ticket.py."""
+    return order_fingerprint.fingerprint(order, config=config, market=market, identity=identity)
 
 
 def positional_order_issues(order, plan, cfg, market):
@@ -531,6 +529,70 @@ def _sub_unit(x):
 
 
 _cent = _sub_unit
+
+
+_INR_CHARGE_COMPONENTS = (
+    "brokerage", "stt", "exchange_charges", "sebi_charges", "stamp_duty", "gst",
+)
+
+
+def _decimal_money(value):
+    """Parse a finite non-negative monetary amount without float coercion."""
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError, AttributeError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount
+
+
+def _validate_indian_charge_estimate(estimate, scenario, order_currency, entry, exit_price, qty):
+    """Validate the budget engine's INR estimate and that it describes this scenario.
+
+    The charge model lives in trader-budget. Risk consumes its estimates instead of
+    maintaining a second tariff calculation; these checks reject incomplete,
+    malformed, currency-conflicting, or differently-sized scenario estimates.
+    """
+    label = "target" if scenario == "target" else "stop"
+    if not isinstance(estimate, dict):
+        return None, "%s transaction-cost estimate is missing or is not an object" % label
+    if str(order_currency or "").strip().upper() != "INR":
+        return None, "Indian order currency must be INR for %s transaction-cost estimates" % label
+    estimate_currency = estimate.get("currency")
+    if estimate_currency is not None and str(estimate_currency).strip().upper() != "INR":
+        return None, "%s transaction-cost estimate currency must match INR order currency" % label
+    if estimate.get("is_estimate") is not True:
+        return None, "%s transaction-cost estimate is not marked as an estimate" % label
+
+    amounts = {}
+    for key in _INR_CHARGE_COMPONENTS + ("total",):
+        value = _decimal_money(estimate.get(key))
+        if value is None:
+            return None, "%s transaction-cost estimate has missing, malformed, negative, or non-finite %s" % (label, key)
+        amounts[key] = value
+    component_total = sum((amounts[key] for key in _INR_CHARGE_COMPONENTS), Decimal("0"))
+    if abs(component_total - amounts["total"]) > Decimal("0.01"):
+        return None, "%s transaction-cost estimate total does not match its charge components" % label
+
+    try:
+        units = Decimal(str(qty))
+        entry_dec = Decimal(str(entry))
+        exit_dec = Decimal(str(exit_price))
+    except (InvalidOperation, TypeError, ValueError):
+        return None, "%s transaction-cost estimate cannot be matched to valid order prices and quantity" % label
+    if not units.is_finite() or units <= 0 or not entry_dec.is_finite() or not exit_dec.is_finite():
+        return None, "%s transaction-cost estimate cannot be matched to valid order prices and quantity" % label
+    expected = {
+        "buy_value": (entry_dec * units).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "sell_value": (exit_dec * units).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "turnover": ((entry_dec + exit_dec) * units).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+    }
+    for key, wanted in expected.items():
+        got = _decimal_money(estimate.get(key))
+        if got is None or abs(got - wanted) > Decimal("0.01"):
+            return None, "%s transaction-cost estimate %s is missing, malformed, or inconsistent with this order" % (label, key)
+    return amounts["total"], None
 
 
 def _price_scale(x=None, tick=None):
@@ -637,9 +699,43 @@ def day_trades(state, today):
     return len(hits), hits
 
 
+def consecutive_losses_streak(state):
+    """Count trailing consecutive loss trades recorded in state."""
+    trades = [
+        r for r in (state or {}).get("orders", [])
+        if r.get("pnl") is not None or r.get("realized_pnl") is not None
+    ]
+    streak = 0
+    for r in reversed(trades):
+        pnl = _f(r.get("pnl") if r.get("pnl") is not None else r.get("realized_pnl"))
+        if pnl is not None and pnl < -1e-6:
+            streak += 1
+        elif pnl is not None and pnl >= 0:
+            break
+    return streak
+
+
+def weekly_loss_at_risk(state, today_iso):
+    """Compute total max_loss at risk for entries placed during the current week."""
+    try:
+        cur_date = datetime.date.fromisoformat(str(today_iso)[:10])
+        monday = cur_date - datetime.timedelta(days=cur_date.weekday())
+        monday_str = monday.isoformat()
+    except Exception:
+        return 0.0
+
+    total_week_loss = 0.0
+    for rec in (state or {}).get("orders", []):
+        if rec_day(rec) >= monday_str and rec_is_entry(rec):
+            ml = _f(rec.get("max_loss"))
+            if ml is not None:
+                total_week_loss += ml
+    return total_week_loss
+
+
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None, market=None, simulated=False, source_doc=None, instruments_path=None, instruments_cache=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None, market=None, simulated=False, source_doc=None, instruments_path=None, instruments_cache=None, fingerprint_overrides=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its market date is "today"
@@ -647,6 +743,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     raw_cfg = cfg or {}
     c = dict(DEFAULTS)
     c.update(raw_cfg)
+    c["min_reward_risk"] = order_fingerprint.effective_minimum_reward_risk(c.get("min_reward_risk"))
+    fingerprint_overrides = dict(fingerprint_overrides or {})
+    fingerprint_config = dict(c)
+    fingerprint_config.update(fingerprint_overrides)
     if market is None:
         market = get_market_profile(orders=orders, cfg=c)
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
@@ -709,6 +809,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     max_order = _f(_cfg_money(raw_cfg, c, "max_order", market))
     max_loss_trade = _f(_cfg_money(raw_cfg, c, "max_loss_per_trade", market))
     max_daily_loss = _f(_cfg_money(raw_cfg, c, "max_daily_loss", market))
+    max_weekly_loss = _f(_cfg_money(raw_cfg, c, "max_weekly_loss", market))
+    max_consec = int(c.get("max_consecutive_losses") or 0)
+    current_loss_streak = consecutive_losses_streak(state)
+    loss_this_week = weekly_loss_at_risk(state, today)
 
     def fresh(sym):
         if sym not in prices:
@@ -729,7 +833,31 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     if doc_lts_utc is not None and doc_lts_utc <= now_utc:
         permitted_data_times.append(doc_lts_utc)
 
+    if orders is None:
+        orders = [None]
     for i, o in enumerate(orders, 1):
+        if not isinstance(o, dict):
+            invalid_reason = "format: order must be an object, got %s" % type(o).__name__
+            invalid_identity = {}
+            results.append({
+                "index": i, "symbol": "", "side": "", "kind": "entry",
+                "amount": "unavailable", "currency": "INR" if market == "IN" else "USD",
+                "value": None, "entry_ref": None, "entry_ref_from": None,
+                "stop": None, "target": None, "risk_per_share": None, "max_loss": None,
+                "reward_risk": None, "reward_risk_analysis": {
+                    "gross_reward_risk": None, "target_charges": None, "stop_charges": None,
+                    "net_reward": None, "net_risk": None, "net_reward_risk": None,
+                    "minimum_reward_risk": c["min_reward_risk"], "minimum_2r_passed": False,
+                    "validation_error": invalid_reason,
+                },
+                "risk_parameters": order_fingerprint.policy_snapshot(c),
+                "fingerprint_overrides": order_fingerprint.canonical_overrides(fingerprint_overrides),
+                "resolved_identity": invalid_identity,
+                "fingerprint": fingerprint(o, config=fingerprint_config, market=market,
+                                            identity=invalid_identity),
+                "verdict": "BLOCK", "reasons": [invalid_reason], "warnings": [], "info": [],
+            })
+            continue
         reasons, warns, info = [], [], []
         later = []                       # entry-only reasons, turned into warnings for an exit
         sym = str(o.get("symbol", "")).strip().upper()
@@ -963,6 +1091,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         kind = "exit" if exiting else "entry"
         if kind == "entry":
             reasons.extend(positional_order_issues(o, plan, c, market))
+            if market == "IN" and str(o.get("currency") or "").strip().upper() != "INR":
+                later.append("currency: Indian entry orders must declare currency='INR' for transaction-cost validation")
         if kind == "entry" and value is None and q:
             later.append("price: no price for %s to size a %s-share order; add it to "
                          "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
@@ -1134,6 +1264,21 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 later.append("position: %s would be %s, %.1f%% of the %s account, over your %s%% cap"
                              % (sym, money(pos_after, market=market), 100.0 * pos_after / total, money(total, market=market),
                                 _pct(c["max_position_pct"])))
+            sector = str(o.get("sector") or plan.get("sector") or (c.get("sectors") or {}).get(sym) or "").strip().upper()
+            max_sector_pct = float(c.get("max_sector_exposure_pct") or 0)
+            if sector and max_sector_pct > 0 and total > 0:
+                sec_held = 0.0
+                for p_item in (portfolio or {}).get("positions", []):
+                    p_sym = str(p_item.get("ticker") or p_item.get("symbol") or "").upper()
+                    p_sec = str((c.get("sectors") or {}).get(p_sym) or p_item.get("sector") or "").strip().upper()
+                    if p_sec == sector:
+                        sec_held += acct["values"].get(p_sym, 0.0)
+                sec_after = sec_held + value
+                sec_limit = total * max_sector_pct / 100.0
+                if sec_after > sec_limit + CENT:
+                    later.append("sector: %s exposure would reach %s, %.1f%% of the %s account, over your %s%% cap"
+                                 % (sector, money(sec_after, market=market), 100.0 * sec_after / total, money(total, market=market),
+                                    _pct(max_sector_pct)))
         if side == "sell" and sym and kind == "entry":
             if is_opt:
                 reasons.append("options: options selling / naked short options are prohibited (undefined risk)")
@@ -1186,17 +1331,23 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
 
         # day-trade checks: stop, loss, reward:risk, daily loss, trades, window, pdt
         max_loss = risk_ps = rr = stop = target = None
+        reward_risk_analysis = None
         if kind == "entry" and side in ("buy", "sell"):
             long = side == "buy"
-            leg_stop, plan_stop = _f(o.get("stop_loss_stop_price")), _f(plan.get("stop"))
-            stop = leg_stop if leg_stop else plan_stop
+            raw_leg_stop, plan_stop = _f(o.get("stop_loss_stop_price")), _f(plan.get("stop"))
+            # Only recognized broker-supported bracket/GTT structures carry protection.
+            # A plan stop or an orphaned stop field is not a verified protective order.
+            leg_stop = raw_leg_stop if (bracket or is_gtt_oco) else None
+            stop = leg_stop
             target = _f(o.get("take_profit_limit_price")) or _f(plan.get("target"))
             if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
                              "the broker uses" % (_p(leg_stop, tick=eff_tick_dec), _p(plan_stop, tick=eff_tick_dec)))
-            if stop and not leg_stop:
-                warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
-                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop, tick=eff_tick_dec))
+            if plan_stop and not leg_stop:
+                warns.append("the plan stop %s is not represented by a protective order leg and does not cap broker loss"
+                             % _p(plan_stop, tick=eff_tick_dec))
+            if raw_leg_stop and not leg_stop:
+                warns.append("stop_loss_stop_price is present but is not inside a recognized bracket or GTT OCO order; it does not cap broker loss")
             if not stop:
                 if c.get("require_stop", True):
                     later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
@@ -1223,10 +1374,86 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                             later.append("target: the target %s must be %s the entry %s"
                                          % (_p(target, tick=eff_tick_dec), "above" if long else "below", _p(ref, tick=eff_tick_dec)))
                         else:
-                            rr = round(float(abs(Decimal(str(target)) - Decimal(str(ref))) / risk_dec), 2)
-                            if min_rr and rr < min_rr - 1e-9:
+                            rr_exact = abs(Decimal(str(target)) - Decimal(str(ref))) / risk_dec
+                            rr = round(float(rr_exact), 2)
+                            units_dec = Decimal(str(shares))
+                            gross_reward = abs(Decimal(str(target)) - Decimal(str(ref))) * units_dec
+                            gross_risk = risk_dec * units_dec
+                            gross_passed = not min_rr or rr_exact >= Decimal(str(min_rr))
+                            if min_rr and rr_exact < Decimal(str(min_rr)):
                                 later.append("reward:risk: %.2f (target %s, entry %s, stop %s) is under your "
                                              "minimum %s" % (rr, _p(target, tick=eff_tick_dec), _p(ref, tick=eff_tick_dec), _p(stop, tick=eff_tick_dec), _num(min_rr)))
+                            if market == "IN":
+                                target_costs = o.get("transaction_costs")
+                                stop_costs = o.get("transaction_costs_at_stop")
+                                target_total, target_error = _validate_indian_charge_estimate(
+                                    target_costs, "target", o.get("currency"), ref, target, shares,
+                                )
+                                stop_total, stop_error = _validate_indian_charge_estimate(
+                                    stop_costs, "stop", o.get("currency"), ref, stop, shares,
+                                )
+                                net_reward = gross_reward - target_total if target_total is not None else None
+                                net_risk = gross_risk + stop_total if stop_total is not None else None
+                                net_rr = (
+                                    net_reward / net_risk
+                                    if net_reward is not None and net_risk is not None and net_reward > 0 and net_risk > 0
+                                    else None
+                                )
+                                net_passed = bool(
+                                    target_error is None and stop_error is None and net_rr is not None
+                                    and min_rr and net_rr >= Decimal(str(min_rr))
+                                )
+                                validation_errors = [x for x in (target_error, stop_error) if x]
+                                if net_reward is not None and net_reward <= 0:
+                                    validation_errors.append("target charges consume the entire gross reward")
+                                if net_risk is not None and net_risk <= 0:
+                                    validation_errors.append("net risk is not positive")
+                                reward_risk_analysis = {
+                                    "gross_reward": float(gross_reward),
+                                    "gross_risk": float(gross_risk),
+                                    "gross_reward_risk": float(rr_exact),
+                                    "target_charges": float(target_total) if target_total is not None else None,
+                                    "stop_charges": float(stop_total) if stop_total is not None else None,
+                                    "net_reward": float(net_reward) if net_reward is not None else None,
+                                    "net_risk": float(net_risk) if net_risk is not None else None,
+                                    "net_reward_risk": float(net_rr) if net_rr is not None else None,
+                                    "minimum_reward_risk": float(min_rr) if min_rr else 2.0,
+                                    "gross_minimum_passed": bool(gross_passed),
+                                    "minimum_2r_passed": bool(net_passed),
+                                    "validation_error": "; ".join(validation_errors) if validation_errors else None,
+                                }
+                                info.append(
+                                    "gross reward:risk %.4f; target charges %s; stop charges %s; "
+                                    "net reward %s; net risk %s; net reward:risk %s (minimum %.2f: %s)"
+                                    % (
+                                        float(rr_exact),
+                                        money(float(target_total), market="IN") if target_total is not None else "unavailable",
+                                        money(float(stop_total), market="IN") if stop_total is not None else "unavailable",
+                                        money(float(net_reward), market="IN") if net_reward is not None else "unavailable",
+                                        money(float(net_risk), market="IN") if net_risk is not None else "unavailable",
+                                        ("%.4f" % float(net_rr)) if net_rr is not None else "unavailable",
+                                        float(min_rr or 2.0), "PASS" if net_passed else "BLOCK",
+                                    )
+                                )
+                                for validation_error in validation_errors:
+                                    later.append("reward:risk: %s" % validation_error)
+                                if not validation_errors and not net_passed:
+                                    later.append(
+                                        "reward:risk: net %.4f after estimated Indian transaction charges is under the %.2f minimum"
+                                        % (float(net_rr or Decimal("0")), float(min_rr or 2.0))
+                                    )
+                            else:
+                                reward_risk_analysis = {
+                                    "gross_reward": float(gross_reward),
+                                    "gross_risk": float(gross_risk),
+                                    "gross_reward_risk": float(rr_exact),
+                                    "target_charges": None, "stop_charges": None,
+                                    "net_reward": None, "net_risk": None, "net_reward_risk": None,
+                                    "minimum_reward_risk": float(min_rr or 2.0),
+                                    "gross_minimum_passed": bool(gross_passed),
+                                    "minimum_2r_passed": bool(gross_passed),
+                                    "validation_error": None,
+                                }
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
@@ -1237,6 +1464,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     later.append("daily loss: %s already at risk today plus %s for this one = %s, over your %s "
                                  "daily loss limit" % (money(used, market=market), money(max_loss, market=market), money(used + max_loss, market=market),
                                                        money(daily, market=market)))
+            if max_weekly_loss and max_loss is not None:
+                used_w = loss_this_week + batch_loss
+                if used_w + max_loss > max_weekly_loss + CENT:
+                    later.append("weekly loss: %s already at risk this week plus %s for this one = %s, over your %s "
+                                 "weekly loss limit" % (money(used_w, market=market), money(max_loss, market=market), money(used_w + max_loss, market=market),
+                                                        money(max_weekly_loss, market=market)))
+            if max_consec > 0 and current_loss_streak >= max_consec:
+                later.append("consecutive losses: %d consecutive losses recorded (limit %d); cooling-off stop active"
+                             % (current_loss_streak, max_consec))
             cap_t = int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
@@ -1321,6 +1557,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 elif ref and value is not None:
                     acct["shares"][sym] = held - value / ref
         entry_ref_scale = _price_scale(ref, tick=eff_tick_dec) if ref else 2
+        resolved_identity = order_fingerprint.resolved_identity(o, inst)
+        if (
+            market == "US"
+            and str(o.get("market") or "").strip().upper() == "US"
+            and str(o.get("currency") or "").strip().upper() == "USD"
+            and str(o.get("asset_type") or "").strip().upper() in ("EQUITY", "STOCK", "ETF")
+            and bool(TICKER.match(sym))
+        ):
+            resolved_identity["validation_status"] = "RISK_VALIDATED_US_EQUITY"
         res_item = {
             "index": i, "symbol": sym, "side": side, "kind": kind,
             "amount": money(_f(notional) or 0, market=market) if notional is not None else ("%s shares" % qty),
@@ -1328,7 +1573,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             "value": round(value, 2) if value is not None else None,
             "entry_ref": round(ref, entry_ref_scale) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
-            "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
+            "reward_risk": rr,
+            "reward_risk_analysis": reward_risk_analysis,
+            "risk_parameters": order_fingerprint.policy_snapshot(c),
+            "fingerprint_overrides": order_fingerprint.canonical_overrides(fingerprint_overrides),
+            "resolved_identity": resolved_identity,
+            "fingerprint": fingerprint(
+                o, config=fingerprint_config, market=market,
+                identity=resolved_identity,
+            ),
+            "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
         }
         if market != "IN":
@@ -1471,10 +1725,13 @@ def main(argv=None):
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % orders_file)
         cfg = read_json(a.config, "config", required=False) or {}
+        fingerprint_overrides = {}
         if getattr(a, "allow_off_hours", False):
             cfg["allow_off_hours"] = True
+            fingerprint_overrides["allow_off_hours"] = True
         if getattr(a, "exchange", None):
             cfg["exchange"] = a.exchange
+            fingerprint_overrides["exchange"] = a.exchange
         market = getattr(a, "market", None) or get_market_profile(a, orders, cfg)
         now = parse_now(a.now, market=market)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
@@ -1487,6 +1744,7 @@ def main(argv=None):
             orders, cfg, portfolio, prices, state, a.today, now, times,
             market=market, simulated=bool(a.now), source_doc=doc if isinstance(doc, dict) else None,
             instruments_path=getattr(a, "instruments", None),
+            fingerprint_overrides=fingerprint_overrides,
         )
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]

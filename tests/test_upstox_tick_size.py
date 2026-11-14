@@ -27,13 +27,13 @@ for _sub in ("trader-alerts", "trader-entry", "trader-exit", "trader-budget", "t
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import check as risk_mod  # noqa: E402
-import data_in  # noqa: E402
-import entry as entry_mod  # noqa: E402
-import exit as exit_mod  # noqa: E402
-import instruments as inst_mod  # noqa: E402
-import size as size_mod  # noqa: E402
-import ticket as ticket_mod  # noqa: E402
+import check as risk_mod  # type: ignore # noqa: E402
+import data_in  # type: ignore # noqa: E402
+import entry as entry_mod  # type: ignore # noqa: E402
+import exit as exit_mod  # type: ignore # noqa: E402
+import instruments as inst_mod  # type: ignore # noqa: E402
+import size as size_mod  # type: ignore # noqa: E402
+import ticket as ticket_mod  # type: ignore # noqa: E402
 
 
 SAMPLE_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0IiwiZXhwIjoyMDAwMDAwMDAwfQ.sig"
@@ -410,8 +410,8 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         chart_bse = _make_intraday_chart(self.tmp, symbol="RELIANCE.BO", trig_close=1335.44)
 
         for label, exch, sym_arg, chart_p, exp_tick, exp_entry, exp_stop, exp_target in (
-            ("nse", "NSE", "RELIANCE.NS", chart_nse, 0.10, 1335.40, 1331.50, 1343.20),
-            ("bse", "BSE", "RELIANCE.BO", chart_bse, 0.05, 1335.45, 1331.50, 1343.35),
+            ("nse", "NSE", "RELIANCE.NS", chart_nse, 0.10, 1335.40, 1331.50, 1351.00),
+            ("bse", "BSE", "RELIANCE.BO", chart_bse, 0.05, 1335.45, 1331.50, 1351.25),
         ):
             ent_p = os.path.join(self.tmp, "entry_%s.json" % label)
             plan_p = os.path.join(self.tmp, "plan_%s.json" % label)
@@ -434,7 +434,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
 
             # 2. trader-exit (or-mid: high=1335.03 -> 1335.00(NSE)/1335.05(BSE), low=1328.02 -> 1328.00)
             rc_x, _, err_x = _run_cli(exit_mod, [
-                "plan", "--from", ent_p, "--market", "IN", "--exchange", exch,
+                "plan", "--from", ent_p, "--target", "4R", "--market", "IN", "--exchange", exch,
                 "--instruments", cache_path, "--config", cfg_path,
                 "--now", "2026-10-19 09:40", "--write", plan_p,
             ])
@@ -498,7 +498,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         # 1. IDEA (1 paisa = Rs 0.01): 10.13 must stay 10.13 (NOT coerced to 0.05)
         idea_plan = {
             "symbol": "IDEA", "side": "buy", "date": "2026-10-19", "market": "IN", "exchange": "NSE",
-            "entry": 10.13, "stop": 9.87, "target": 10.65, "setup": "level", "tick_size": 0.01,
+            "entry": 10.13, "stop": 9.87, "target": 10.95, "setup": "level", "tick_size": 0.01,
         }
         sized_idea = size_mod.size_trade(
             idea_plan, cfg, limit=10.13, today="2026-10-19", market="IN", instruments_path=cache_path
@@ -506,7 +506,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         self.assertEqual(sized_idea["tick_size"], 0.01)
         self.assertEqual(sized_idea["entry"], 10.13)
         self.assertEqual(sized_idea["stop"], 9.87)
-        self.assertEqual(sized_idea["target"], 10.65)
+        self.assertEqual(sized_idea["target"], 10.95)
         ord_idea = size_mod.build_order(sized_idea, cfg=cfg)
         self.assertEqual(ord_idea["limit_price"], "10.13")
 
@@ -517,10 +517,10 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         self.assertEqual(float(mrf_c["target"]), 152515.0)
 
         # 2b. Sub-paisa derivative tick (0.25 paise = Rs 0.0025): 4-decimal precision preserved end-to-end
-        cur_c = exit_mod.compute(84.1024, "price", 84.0010, "r", Decimal("2"), market="IN", tick_size=0.0025)
+        cur_c = exit_mod.compute(84.1024, "price", 84.0010, "r", Decimal("4"), market="IN", tick_size=0.0025)
         self.assertEqual(float(cur_c["entry"]), 84.1025)
         self.assertEqual(float(cur_c["stop"]), 84.0000)
-        self.assertEqual(float(cur_c["target"]), 84.3075)
+        self.assertEqual(float(cur_c["target"]), 84.5125)
         cur_plan = {
             "symbol": "USDINR26NOVFUT", "side": "buy", "date": "2026-10-19", "market": "IN",
             "exchange": "NSE", "asset_type": "FUTURES", "lot_size": 1000,
@@ -537,12 +537,12 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
         cur_ord = size_mod.build_order(cur_s, cfg=cur_cfg)
         self.assertEqual(cur_ord["limit_price"], "84.1025")
         self.assertEqual(cur_ord["stop_loss_stop_price"], "84.0000")
-        self.assertEqual(cur_ord["take_profit_limit_price"], "84.3075")
+        self.assertEqual(cur_ord["take_profit_limit_price"], "84.5125")
         cur_chk = risk_mod.check([cur_ord], cur_cfg, today="2026-10-19", market="IN", instruments_cache=payload)
         self.assertEqual(cur_chk["results"][0]["verdict"], "PASS", cur_chk["results"][0].get("reasons"))
         cur_plain = ticket_mod.plain(cur_ord, market="IN")
         self.assertIn("84.1025", cur_plain)
-        self.assertIn("84.3075", cur_plain)
+        self.assertIn("84.5125", cur_plain)
 
         # 3. Off-tick order for NSE RELIANCE (tick 0.10): 1335.45 must BLOCK in risk check
         bad_tick_order = {
@@ -946,7 +946,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
             json.dump({
                 "created_by": "trader-exit", "symbol": "SUBPAISA", "side": "buy",
                 "date": "2026-10-19", "market": "IN", "exchange": "NSE", "setup": "orb",
-                "entry": 84.1000, "stop": 84.0000, "target": 84.3000, "tick_size": 0.0025,
+                "entry": 84.1000, "stop": 84.0000, "target": 84.6000, "tick_size": 0.0025,
             }, fh)
         with open(cfg_p, "w", encoding="utf-8") as fh:
             json.dump({
@@ -979,7 +979,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
             json.dump({
                 "created_by": "trader-exit", "symbol": "RELIANCE", "side": "buy",
                 "date": "2026-10-19", "market": "IN", "exchange": "NSE", "setup": "orb",
-                "entry": 1335.40, "stop": 1331.50, "target": 1343.20, "tick_size": 0.10,
+                "entry": 1335.40, "stop": 1331.50, "target": 1351.00, "tick_size": 0.10,
             }, fh)
         with open(rel_prices_p, "w", encoding="utf-8") as fh:
             json.dump({"as_of": "2026-10-19T04:10:00Z", "prices": {"RELIANCE": 1335.42}}, fh)
@@ -1115,7 +1115,7 @@ class TestUpstoxTickSizeNormalization(unittest.TestCase):
             "setup": "orb",
             "entry": 1335.40,
             "stop": 1331.50,
-            "target": 1343.20,
+            "target": 1351.00,
             "tick_size": 0.10,
         }
         plan_p = os.path.join(self.tmp, "plan_in.json")

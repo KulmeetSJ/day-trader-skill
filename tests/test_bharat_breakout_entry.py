@@ -240,6 +240,25 @@ class _LiveBreakoutMockProvider(data_in.MarketDataProvider):
 
 class Breakout20dTests(unittest.TestCase):
 
+    def test_entry_reference_excludes_current_session_daily_bar(self):
+        prior = _sample_breakout_daily_closes(
+            end_date=datetime.date(2026, 10, 16), count=35, prior_high=2820.0, last_close=2848.0
+        )
+        rows = [
+            {"t": _ist_ts(day.year, day.month, day.day, 9, 15), "c": close, "h": close}
+            for day, close in prior
+        ]
+        # An extreme partial daily candle for the evaluation session must not enter the baseline.
+        rows.append({"t": _ist_ts(2026, 10, 19, 9, 15), "c": 99999.0, "h": 99999.0})
+        now = entry.parse_now("2026-10-19 10:35", market="IN")
+        result = entry._analyze_breakout_20d_baseline(
+            {"daily_bars": rows, "daily_error": None, "daily_data_status": "CURRENT"},
+            now, datetime.date(2026, 10, 19), market="IN",
+        )
+        self.assertTrue(result["ok"], result["reason"])
+        self.assertEqual(result["breakout_level"], 2848.0)
+        self.assertEqual(result["daily_close"], 2848.0)
+
     def test_valid_breakout_integration_with_scanner_and_exit_handoff(self):
         """scan.py daily breakout_20d -> entry.py check breakout_20d -> exit.py plan."""
         daily_closes = _sample_breakout_daily_closes(

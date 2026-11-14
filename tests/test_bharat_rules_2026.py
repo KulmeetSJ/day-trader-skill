@@ -270,8 +270,8 @@ class TestBharatRules2026(unittest.TestCase):
 
         # Verify plan_report displays all components (including Stamp Duty & SEBI) and estimate notice
         plan = {
-            "symbol": "RELIANCE", "entry": 1326.0, "stop": 1318.95, "target": 1340.10,
-            "risk_per_share": 7.05, "reward_risk": 2.0, "entry_from": "plan", "flat_by": "15:20",
+            "symbol": "RELIANCE", "entry": 1326.0, "stop": 1323.0, "target": 1340.10,
+            "risk_per_share": 3.0, "reward_risk": 4.7, "entry_from": "plan", "flat_by": "15:20",
             "market": "IN", "currency": "INR", "tick_size": 0.05, "trading_style": "intraday"
         }
         cfg = {

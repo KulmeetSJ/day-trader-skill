@@ -10,6 +10,7 @@ from _load import load, ROOT, FIX
 
 ticket = load("trader-broker", "ticket")
 check = load("trader-risk", "check")
+budget_size = load("trader-budget", "size")
 
 CFG_PATH = os.path.join(ROOT, "trader-budget", "config.example.json")
 ORDERS_PATH = os.path.join(FIX, "trader-risk", "orders-tsla.json")
@@ -19,8 +20,8 @@ TODAY = "2026-10-19"
 AAPL = {"symbol": "AAPL", "side": "buy", "notional": "1250", "type": "market", "time_in_force": "day"}
 BATCH = ["AAPL", "AXP", "GOOGL", "KO", "BAC"]
 TSLA_CALL = {"symbol": "TSLA", "side": "buy", "qty": "8", "type": "market", "time_in_force": "day",
-             "order_class": "bracket", "take_profit_limit_price": "370.04", "stop_loss_stop_price": "358.32"}
-TSLA_PLAIN = ("BUY 8 TSLA, market, good for today / stop-loss 358.32 / take-profit 370.04 / max loss about "
+             "order_class": "bracket", "take_profit_limit_price": "375.90", "stop_loss_stop_price": "358.32"}
+TSLA_PLAIN = ("BUY 8 TSLA, market, good for today / stop-loss 358.32 / take-profit 375.90 / max loss about "
               "$46.88 if the stop fills at 358.32 (it can fill worse in a fast market)")
 
 
@@ -61,7 +62,7 @@ class ExplicitYes(unittest.TestCase):
 
     def test_a_bracket_yes(self):
         o = tsla()
-        for r in ("yes", "yes 8 TSLA", "yes 358.32", "yes max loss 46.88", "yes target 370.04"):
+        for r in ("yes", "yes 8 TSLA", "yes 358.32", "yes max loss 46.88", "yes target 375.90"):
             self.assertTrue(self.yes(r, o, ["TSLA"]), r)
         for r in ("yes 9", "yes 10 TSLA", "yes but stop at 357", "yes, stop 358.32", "yes AAPL", "sure"):
             self.assertFalse(self.yes(r, o, ["TSLA", "AAPL"]), r)
@@ -119,9 +120,9 @@ class TicketShape(unittest.TestCase):
                          {"symbol": "KO", "side": "buy", "qty": "3", "type": "limit", "limit_price": "89.5",
                           "time_in_force": "day"})
 
-    def test_the_bracket_call_leaves_out_why_and_plan(self):
+    def test_the_bracket_call_leaves_out_why_and_plan_but_risk_fingerprint_keeps_them(self):
         self.assertEqual(ticket.tool_input(tsla()), TSLA_CALL)
-        self.assertEqual(ticket.fingerprint(tsla()), ticket.fingerprint(TSLA_CALL))
+        self.assertNotEqual(ticket.fingerprint(tsla()), ticket.fingerprint(TSLA_CALL))
 
     def test_plain_english(self):
         self.assertEqual(ticket.plain(AAPL), "BUY $1,250 of AAPL, market order, good for today")
@@ -428,11 +429,19 @@ class IndianPortfolioAccountingTest(unittest.TestCase):
     def test_duplicate_result_and_atomic_fill_validation(self):
         order = {
             "symbol": "RELIANCE", "side": "buy", "qty": "56", "type": "market", "time_in_force": "day",
-            "order_class": "bracket", "take_profit_limit_price": "1350.00", "stop_loss_stop_price": "1310.00",
+            "order_class": "bracket", "take_profit_limit_price": "1410.00", "stop_loss_stop_price": "1310.00",
             "market": "IN", "currency": "INR",
-            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1350.0,
-                     "risk_per_share": 16.0, "reward_risk": 1.5, "max_loss": 896.0}
+            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1410.0,
+                     "risk_per_share": 16.0, "reward_risk": 5.25, "max_loss": 896.0}
         }
+        order["transaction_costs"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1410.0,
+            qty=56, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        order["transaction_costs_at_stop"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1310.0,
+            qty=56, trading_style="intraday", as_of_date="2026-10-19"
+        )
         with open(self.orders, "w", encoding="utf-8") as fh:
             json.dump({"orders": [order]}, fh)
         with redirect_stdout(io.StringIO()):
@@ -474,18 +483,34 @@ class IndianPortfolioAccountingTest(unittest.TestCase):
     def test_multi_order_batch_confirmation_and_fingerprint_gates(self):
         rel = {
             "symbol": "RELIANCE", "side": "buy", "qty": "26", "type": "market", "time_in_force": "day",
-            "order_class": "bracket", "take_profit_limit_price": "1350.00", "stop_loss_stop_price": "1310.00",
+            "order_class": "bracket", "take_profit_limit_price": "1410.00", "stop_loss_stop_price": "1310.00",
             "market": "IN", "currency": "INR",
-            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1350.0,
-                     "risk_per_share": 16.0, "reward_risk": 1.5, "max_loss": 416.0},
+            "plan": {"symbol": "RELIANCE", "entry": 1326.0, "stop": 1310.0, "target": 1410.0,
+                     "risk_per_share": 16.0, "reward_risk": 5.25, "max_loss": 416.0},
         }
         tcs = {
             "symbol": "TCS", "side": "buy", "qty": "10", "type": "market", "time_in_force": "day",
-            "order_class": "bracket", "take_profit_limit_price": "3960.00", "stop_loss_stop_price": "3880.00",
+            "order_class": "bracket", "take_profit_limit_price": "4000.00", "stop_loss_stop_price": "3880.00",
             "market": "IN", "currency": "INR",
-            "plan": {"symbol": "TCS", "entry": 3900.0, "stop": 3880.0, "target": 3960.0,
-                     "risk_per_share": 20.0, "reward_risk": 3.0, "max_loss": 200.0},
+            "plan": {"symbol": "TCS", "entry": 3900.0, "stop": 3880.0, "target": 4000.0,
+                     "risk_per_share": 20.0, "reward_risk": 5.0, "max_loss": 200.0},
         }
+        rel["transaction_costs"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1410.0,
+            qty=26, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        rel["transaction_costs_at_stop"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1310.0,
+            qty=26, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        tcs["transaction_costs"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=3900.0, exit_price=4000.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        tcs["transaction_costs_at_stop"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=3900.0, exit_price=3880.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19"
+        )
         with open(self.orders, "w", encoding="utf-8") as fh:
             json.dump({"orders": [rel, tcs]}, fh)
 
@@ -512,6 +537,22 @@ class IndianPortfolioAccountingTest(unittest.TestCase):
                                    "--state", self.state, "--now", "2026-10-19 10:35", "--market", "IN"])
         self.assertEqual(c_tamp, 1)
         self.assertIn("was not in the last risk check", err_tamp)
+        rel["transaction_costs"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1410.0,
+            qty=26, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        rel["transaction_costs_at_stop"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=1326.0, exit_price=1310.0,
+            qty=26, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        tcs["transaction_costs"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=3900.0, exit_price=4000.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        tcs["transaction_costs_at_stop"] = budget_size.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=3900.0, exit_price=3880.0,
+            qty=10, trading_style="intraday", as_of_date="2026-10-19"
+        )
         with open(self.orders, "w", encoding="utf-8") as fh:
             json.dump({"orders": [rel, tcs]}, fh)
 
@@ -533,9 +574,11 @@ class IndianPortfolioAccountingTest(unittest.TestCase):
 
         with open(self.state, encoding="utf-8") as fh:
             st1 = json.load(fh)
+        with open(self.risk, encoding="utf-8") as fh:
+            risk_after = json.load(fh)
         self.assertEqual(len(st1["orders"]), 1)
         self.assertEqual(st1["orders"][0]["symbol"], "RELIANCE")
-        self.assertEqual(st1["orders"][0]["fingerprint"], ticket.fingerprint(rel))
+        self.assertEqual(st1["orders"][0]["fingerprint"], risk_after["results"][0]["fingerprint"])
 
         # Order #2 cannot record placement/fill yet because confirmation covered only order #1
         c_res2, _, err_res2 = run(["result", "--index", "2", "--status", "placed", "--filled-qty", "10",

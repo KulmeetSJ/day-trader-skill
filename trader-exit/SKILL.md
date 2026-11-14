@@ -3,13 +3,13 @@ name: trader-exit
 description: >-
   Exit & Position Manager. Plans pre-entry stops/targets (or-mid, or-low,
   breakout-invalidation, price, pct, ATR; US 0.01 USD and IN authoritative
-  INR tick sizes; 2R/1R/target) and evaluates open positions at any session
+  INR tick sizes; minimum 2R target) and evaluates open positions at any session
   hour via exit.py manage/check. Outputs HOLD, UPDATE TRAILING STOP, PARTIAL
   EXIT, EXIT (stop/VWAP/trend/flat-by/expiry), or fail-closed NO_ACTION on
   stale/missing data. Respects intraday flat-by cutoffs without forcing
   evening square-off on positional delivery holds. Writes trader/plan.json for
   /trader-timemachine, /trader-budget, and /trader-alerts. Long side only.
-argument-hint: "[plan|manage] [--stop ...] [--target 2R|1R|price:X] [--interval 1m|5m|15m|30m|1h]"
+argument-hint: "[plan|manage] [--stop ...] [--target 2R|price:X] [--interval 1m|5m|15m|30m|1h]"
 ---
 
 # trader-exit
@@ -29,7 +29,7 @@ and a neat plan does not change that.
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/entry.json: midpoint stop, 2R target
-python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 2R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo or --offline)
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --market IN --exchange NSE --instruments trader/state/instruments.json --entry 2950.10 --or-high 2950 --or-low 2920 --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --trading-style positional --market IN --exchange NSE --symbol RELIANCE --entry 2950.10 --stop pct:2 --write
@@ -49,7 +49,7 @@ entry.json), `--offline PATH` (bars for `atr:K`), `--now "2026-10-19 10:15"`,
 | file | what |
 | --- | --- |
 | `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range, exchange, `tick_size`, `invalidation_level` |
-| `trader/config.json` | `flat_by` (`15:55` ET / `15:20` IST) and `min_reward_risk` (`1.0`: noted here, trader-risk enforces it) |
+| `trader/config.json` | `flat_by` (`15:55` ET / `15:20` IST) and `min_reward_risk` (2.0 minimum; may be raised, never lowered) |
 | `trader/state/instruments.json` | NSE/BSE master cache for exchange-isolated INR `tick_size` and F&O `lot_size` (India) |
 | Yahoo / India provider | only for an `atr:K` stop: session bars up to the entry bar (Yahoo is free and unofficial) |
 | `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by, `tick_size`, `lot_size`, `exchange`, `trading_style` |
@@ -76,8 +76,8 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   as `0.0025` keep 4 decimal places in rendered reports and plan fields;
   standard ticks such as `0.05` or `0.10` keep 2 decimals. Conflicting
   `--exchange` or `tick_size` metadata fails closed.
-- **Refused, with the reason.** A stop at or above the entry. A target at or
-  below it. A risk under 0.05% of the price: too tight to survive the
+- **Refused, with the reason.** A stop at or above the entry. A target below
+  2R after tick-size rounding. A risk under 0.05% of the price: too tight to survive the
   spread, normal wiggle would stop you out. An `entry.json` that has not
   triggered (unless you give `--entry`). A short: v2 plans longs only.
 - **Flat by and positional mode.** Intraday plans default to `15:55` ET (US,
@@ -110,13 +110,13 @@ A level setup has no opening range to lean on, so it needs a stop you name.
 
 TSLA, Monday 2026-10-19. The entry is 364.18 at 10:15 AM (the 10:10 bar,
 bar 8) and the opening range is 354.47 to 362.18. `exit.py plan --stop
-or-mid --target 1R --write`:
+or-mid --target 2R --write`:
 
 ```
 Exit plan: TSLA long, Mon 2026-10-19, opening-range breakout on 5-minute bars
   Entry         $364.18 at 10:15 AM (bar 8)
   Stop          $358.32  opening-range midpoint: ($362.18 + $354.47) / 2 = $358.325, rounded down
-  Target        $370.04  1R (one times the risk)
+  Target        $375.90  2R (two times the risk)
   Risk a share  $5.86 (1.61% of the entry)
   Reward:risk   1.0
   Flat by       15:55 ET, win or lose: no overnight hold
@@ -131,7 +131,7 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 - Never move a stop further from the entry once the trade is on.
 - Plain numbers only: entry, stop, target, risk a share, reward:risk. It
   never prints a P&L or a return.
-- Nothing here promises winning trades or money. A 1R target is not a
+- Nothing here promises winning trades or money. A 2R target is not a
   prediction that the price gets there.
 - Long side only. v2 plans longs only.
 

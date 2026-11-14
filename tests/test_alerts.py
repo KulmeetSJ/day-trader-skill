@@ -265,7 +265,7 @@ class Rules(unittest.TestCase):
         rules = plan_rules()
         self.assertEqual([(r["id"], r["type"]) for r in rules],
                          [("tsla-plan-stop", "stop"), ("tsla-plan-target", "target"), ("tsla-flat-by", "time")])
-        self.assertEqual((rules[0]["price"], rules[1]["price"]), (358.32, 370.04))
+        self.assertEqual((rules[0]["price"], rules[1]["price"]), (358.32, 375.90))
         self.assertEqual((rules[2]["at"], rules[2]["label"], rules[2]["before_close"]), ("15:55", "flat by close", True))
         self.assertTrue(all(r["date"] == "2026-10-19" for r in rules))
         rings, st = self.at("2026-10-19 10:52", rules)          # the real 10:52 quote, 366.475
@@ -276,7 +276,7 @@ class Rules(unittest.TestCase):
         self.assertEqual([r["id"] for r in rings], ["tsla-plan-stop"])
         self.assertIn("TSLA is $358.10: at or below your stop $358.32 (plan stop: opening-range midpoint)",
                       rings[0]["message"])
-        q["TSLA"]["price"] = 370.04
+        q["TSLA"]["price"] = 375.90
         self.assertEqual([r["id"] for r in self.at("2026-10-19 12:00", rules, st, q)[0]], ["tsla-plan-target"])
 
     def test_flat_by_close_rings_once_per_trading_day(self):

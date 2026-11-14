@@ -584,13 +584,40 @@ def history_replay(sessions, rule, last, side="buy"):
             ((cl - e) if long else (e - cl)) / risk
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
                        "outcome": oc or "close", "R": round(R, 2)})
+
+    win_cnt = sum(1 for x in trades if x["R"] > 0)
+    win_rate = round(win_cnt / float(len(trades)) * 100.0, 1) if trades else 0.0
+    pos_r = sum(x["R"] for x in trades if x["R"] > 0)
+    neg_r = abs(sum(x["R"] for x in trades if x["R"] < 0))
+    profit_factor = round(pos_r / neg_r, 2) if neg_r > 0 else (round(pos_r, 2) if pos_r > 0 else 0.0)
+
+    cum_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    for x in trades:
+        cum_r += x["R"]
+        if cum_r > peak_r:
+            peak_r = cum_r
+        dd = peak_r - cum_r
+        if dd > max_dd_r:
+            max_dd_r = dd
+
+    r_vals = [x["R"] for x in trades]
+    avg_r = round(statistics.mean(r_vals), 3) if trades else None
+    sharpe = round(avg_r / statistics.stdev(r_vals), 2) if len(r_vals) > 1 and statistics.stdev(r_vals) > 0 else None
+
     return {
         "sessions": len(sessions), "triggered": len(trades),
         "target": sum(1 for x in trades if x["outcome"] == "target"),
         "stop": sum(1 for x in trades if x["outcome"] == "stop"),
         "close": sum(1 for x in trades if x["outcome"] == "close"),
-        "green": sum(1 for x in trades if x["R"] > 0),
-        "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
+        "green": win_cnt,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "expectancy": avg_r,
+        "max_drawdown_r": round(max_dd_r, 2),
+        "sharpe_ratio": sharpe,
+        "avg_R": avg_r,
         "rule": rule, "trades": trades,
     }
 

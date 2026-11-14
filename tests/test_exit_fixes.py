@@ -148,6 +148,44 @@ class ExitFixesTests(unittest.TestCase):
         self.assertNotEqual(ev["action"], "EXIT_PENDING_NEXT_SESSION")
         self.assertNotEqual(ev["reason_code"], "INTRADAY_CARRYOVER")
 
+    def test_prior_session_quote_after_close_cannot_drive_price_actions(self):
+        position = {
+            "symbol": "RELIANCE", "shares": 10, "avg_cost": 100, "stop": 95,
+            "target": 110, "trading_style": "positional",
+        }
+        ev = exit_mod.evaluate_position(
+            position,
+            {"bars": [], "current_quote": {"price": 90.0, "timestamp": bar_ts(2026, 11, 12, 15, 25)},
+             "provider": "offline", "data_tier": "CURRENT"},
+            ist_utc(2026, 11, 13, 15, 35), market="IN", simulated=True,
+        )
+        self.assertEqual((ev["action"], ev["reason_code"]), ("NO_ACTION", "STALE_DATA"))
+        self.assertIsNone(ev["current_price"])
+        self.assertEqual(ev["data_tier"], "STALE")
+        self.assertEqual(ev["price_source"], "unavailable")
+
+    def test_fresh_current_session_quote_can_drive_stop_exit(self):
+        ev = exit_mod.evaluate_position(
+            {"symbol": "RELIANCE", "shares": 10, "avg_cost": 100, "stop": 95,
+             "trading_style": "positional"},
+            {"bars": [], "current_quote": {"price": 90.0, "timestamp": bar_ts(2026, 11, 13, 15, 25)},
+             "provider": "offline", "data_tier": "CURRENT"},
+            ist_utc(2026, 11, 13, 15, 35), market="IN", simulated=True,
+        )
+        self.assertEqual((ev["action"], ev["reason_code"]), ("EXIT", "STOP_HIT"))
+        self.assertEqual(ev["current_price"], 90.0)
+
+    def test_untimestamped_quote_is_not_used_for_price_dependent_action(self):
+        ev = exit_mod.evaluate_position(
+            {"symbol": "RELIANCE", "shares": 10, "avg_cost": 100, "stop": 95,
+             "trading_style": "positional"},
+            {"bars": [], "current_quote": {"price": 90.0},
+             "provider": "offline", "data_tier": "CURRENT"},
+            ist_utc(2026, 11, 13, 12, 0), market="IN", simulated=True,
+        )
+        self.assertEqual((ev["action"], ev["reason_code"]), ("NO_ACTION", "STALE_DATA"))
+        self.assertIsNone(ev["current_price"])
+
 
 if __name__ == "__main__":
     unittest.main()

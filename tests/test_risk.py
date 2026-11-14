@@ -93,23 +93,23 @@ class TheReel(unittest.TestCase):
         self.assertEqual(r["verdict"], "PASS", r["reasons"])
         self.assertEqual(r["reasons"], [])
         self.assertEqual(r["warnings"], [])
-        self.assertEqual((r["kind"], r["entry_ref"], r["stop"], r["target"]), ("entry", 364.18, 358.32, 370.04))
-        self.assertEqual((r["risk_per_share"], r["max_loss"], r["reward_risk"]), (5.86, 46.88, 1.0))
+        self.assertEqual((r["kind"], r["entry_ref"], r["stop"], r["target"]), ("entry", 364.18, 358.32, 375.90))
+        self.assertEqual((r["risk_per_share"], r["max_loss"], r["reward_risk"]), (5.86, 46.88, 2.0))
         self.assertEqual(r["value_usd"], 2913.44)
         self.assertEqual(res["cash_after"], 2086.56)
         self.assertEqual(res["date"], TODAY)
         self.assertIs(res["paper"], True)
 
-    def test_nine_shares_is_blocked_by_the_max_loss_only(self):
+    def test_nine_shares_is_blocked_by_max_loss(self):
         res = check.check([tsla(qty="9")], cfg(), now=at(NOW))
         self.assertEqual(verdicts(res), ["BLOCK"])
-        self.assertEqual(res["results"][0]["reasons"],
-                         ["loss: 9 shares x 5.86 risk a share = $52.74 at the stop, over your $50 max loss per trade"])
+        self.assertIn("loss: 9 shares x 5.86 risk a share = $52.74 at the stop, over your $50 max loss per trade",
+                      reasons(res))
 
     def test_fingerprint_is_shared_with_the_broker(self):
         o = tsla()
         self.assertEqual(check.fingerprint(o), ticket.fingerprint(o))
-        self.assertEqual(check.fingerprint(dict(o, why="anything", plan={})), check.fingerprint(o))
+        self.assertNotEqual(check.fingerprint(dict(o, plan={})), check.fingerprint(o))
         self.assertNotEqual(check.fingerprint(dict(o, qty="9")), check.fingerprint(o))
         self.assertNotEqual(check.fingerprint(dict(o, stop_loss_stop_price="358.00")), check.fingerprint(o))
         self.assertEqual(check.ALPACA_FIELDS, ticket.ALPACA_FIELDS)
@@ -125,15 +125,16 @@ class TheReel(unittest.TestCase):
             text = buf.getvalue()
             self.assertEqual(code, 0)
             self.assertIn("PASS  #1 buy TSLA 8 shares, entry", text)
-            self.assertIn("entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share", text)
-            self.assertIn("max loss $46.88 (limit $50), reward:risk 1.00 (min 1)", text)
+            self.assertIn("entry 364.18 (the plan's entry), stop 358.32, target 375.90: risk 5.86 a share", text)
+            self.assertIn("max loss $46.88 (limit $50), reward:risk 2.00 (min 2)", text)
             self.assertIn("1 passed, 0 blocked at 2026-10-19 10:15 New York", text)
             self.assertIn("not financial advice", text)
             with open(out) as fh:
                 rec = json.load(fh)
             self.assertEqual(rec["date"], TODAY)
             self.assertEqual(rec["results"][0]["kind"], "entry")
-            self.assertEqual(rec["results"][0]["fingerprint"], check.fingerprint(tsla()))
+            self.assertEqual(rec["results"][0]["fingerprint"], check.fingerprint(
+                tsla(), cfg(), market="US", identity=rec["results"][0]["resolved_identity"]))
 
 
 class DayTradeChecks(unittest.TestCase):
@@ -151,14 +152,15 @@ class DayTradeChecks(unittest.TestCase):
         self.assertEqual(verdicts(res), ["PASS"])
         self.assertIn("no stop", warnings(res))
 
-    def test_a_plan_stop_counts_but_warns(self):
+    def test_a_plan_only_stop_does_not_count_as_broker_protection(self):
         o = tsla()
         for k in ("order_class", "take_profit_limit_price", "stop_loss_stop_price"):
             o.pop(k)
         res = self.one(o)
-        self.assertEqual(verdicts(res), ["PASS"])
-        self.assertIn("in the plan only", warnings(res))
-        self.assertEqual(res["results"][0]["max_loss"], 46.88)
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("plan stop", warnings(res))
+        self.assertIn("stop: no stop", reasons(res))
+        self.assertIsNone(res["results"][0]["max_loss"])
 
     def test_stop_and_target_on_the_right_side(self):
         self.assertIn("must be below the entry 364.18", reasons(self.one(tsla(stop_loss_stop_price="365.00"))))
@@ -168,7 +170,8 @@ class DayTradeChecks(unittest.TestCase):
     def test_reward_risk(self):
         res = self.one(tsla(take_profit_limit_price="368.00"))
         self.assertIn("reward:risk: 0.65", reasons(res))
-        self.assertEqual(verdicts(self.one(tsla(take_profit_limit_price="368.00"), min_reward_risk=0.5)), ["PASS"])
+        self.assertEqual(verdicts(self.one(tsla(take_profit_limit_price="368.00"), min_reward_risk=0.5)), ["BLOCK"])
+        self.assertEqual(verdicts(self.one(tsla(), min_reward_risk=0.5)), ["PASS"])
 
     def test_a_fresh_higher_price_is_the_entry(self):
         later = at("2026-10-19 10:55")
@@ -217,7 +220,7 @@ class DayTradeChecks(unittest.TestCase):
         self.assertEqual(res["today"]["entries_placed"], 1)
 
     def test_the_batch_counts_toward_the_daily_limits(self):
-        orders = [bracket(s, 1, 50.0, 10.0, 90.0) for s in ("AAA", "BBB", "CCC", "DDD")]
+        orders = [bracket(s, 1, 50.0, 10.0, 130.0) for s in ("AAA", "BBB", "CCC", "DDD")]
         res = check.check(orders, cfg(), now=at(NOW))
         self.assertEqual(verdicts(res), ["PASS", "PASS", "PASS", "BLOCK"])
         why = reasons(res, 3)
@@ -270,13 +273,13 @@ class DayTradeChecks(unittest.TestCase):
 
     def test_a_short_entry_when_allowed(self):
         short = {"symbol": "TSLA", "side": "sell", "qty": "8", "type": "market", "time_in_force": "day",
-                 "order_class": "bracket", "take_profit_limit_price": "358.32", "stop_loss_stop_price": "370.04",
+                 "order_class": "bracket", "take_profit_limit_price": "352.46", "stop_loss_stop_price": "370.04",
                  "plan": {"entry": 364.18}}
         res = self.one(short)
         self.assertIn("short: selling more TSLA than you hold", reasons(res))
         res = self.one(short, allow_short=True)
         r = res["results"][0]
-        self.assertEqual((r["verdict"], r["kind"], r["max_loss"], r["reward_risk"]), ("PASS", "entry", 46.88, 1.0))
+        self.assertEqual((r["verdict"], r["kind"], r["max_loss"], r["reward_risk"]), ("PASS", "entry", 46.88, 2.0))
         res = self.one(dict(short, stop_loss_stop_price="360.00"), allow_short=True)
         self.assertIn("must be above the entry 364.18 for a sell", reasons(res))
 
@@ -494,7 +497,7 @@ class Cli(unittest.TestCase):
             with open(out) as fh:
                 rec = json.load(fh)
             self.assertEqual(rec["date"], V1_TODAY)
-            self.assertTrue(all(len(r["fingerprint"]) == 16 for r in rec["results"]))
+            self.assertTrue(all(len(r["fingerprint"]) == 24 for r in rec["results"]))
             bad = os.path.join(d, "orders.json")
             with open(bad, "w") as fh:
                 json.dump({"orders": v1_orders() + [buy("AAPL", 100)]}, fh)

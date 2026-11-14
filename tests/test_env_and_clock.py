@@ -364,7 +364,7 @@ class TestNowClockOverrideSemantics(unittest.TestCase):
                 self.assertEqual(edoc["data_tier"], "HISTORICAL")
 
                 self.assertEqual(_run_cli(exit_mod, [
-                    "plan", "--from", entry_p, "--market", "IN", "--config", cfg_p, "--write", plan_p,
+                    "plan", "--from", entry_p, "--target", "4R", "--market", "IN", "--config", cfg_p, "--write", plan_p,
                 ])[0], 0)
                 self.assertEqual(_run_cli(size_mod, [
                     "--plan", plan_p, "--market", "IN", "--config", cfg_p, "--now", "2026-10-19 10:35", "--write", orders_p,

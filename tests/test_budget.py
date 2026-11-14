@@ -21,7 +21,7 @@ PRICES = {"AAPL": 341.27, "AXP": 309.84, "GOOGL": 353.78, "KO": 90.11, "BAC": 53
 CONTRACT_CFG = {
     "budget": 5000, "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_usd": 4000, "min_order_usd": 5,
     "max_loss_per_trade_usd": 50, "max_daily_loss_usd": 150, "max_trades_per_day": 3, "max_orders_per_day": 10,
-    "min_reward_risk": 1.0, "require_stop": True,
+    "min_reward_risk": 2.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
@@ -87,7 +87,7 @@ class TheReel(unittest.TestCase):
         self.assertEqual(s["risk_per_share"], 5.86)
         self.assertEqual(s["cost"], 2913.44)
         self.assertEqual(s["max_loss"], 46.88)
-        self.assertEqual(s["reward_risk"], 1.0)
+        self.assertEqual(s["reward_risk"], 2.0)
         self.assertEqual(s["cash_buffer"], 500)
         self.assertEqual([(l["name"], l["shares"]) for l in s["limits"]],
                          [("max loss", 8), ("position cap", 10), ("max order", 10), ("cash", 12)])
@@ -98,10 +98,12 @@ class TheReel(unittest.TestCase):
         o = size.bracket_order(size.size_trade(plan(), cfg(), today=TODAY))
         why = o.pop("why")
         self.assertEqual(o, {
-            "symbol": "TSLA", "side": "buy", "qty": "8", "type": "market", "time_in_force": "day",
-            "order_class": "bracket", "take_profit_limit_price": "370.04", "stop_loss_stop_price": "358.32",
-            "plan": {"entry": 364.18, "stop": 358.32, "target": 370.04, "risk_per_share": 5.86,
-                     "max_loss": 46.88, "setup": "orb", "entry_time": "10:15 AM", "flat_by": "15:55"}})
+            "symbol": "TSLA", "market": "US", "currency": "USD", "asset_type": "EQUITY",
+            "side": "buy", "qty": "8", "type": "market", "time_in_force": "day",
+            "order_class": "bracket", "take_profit_limit_price": "375.90", "stop_loss_stop_price": "358.32",
+            "plan": {"entry": 364.18, "stop": 358.32, "target": 375.90, "risk_per_share": 5.86,
+                     "max_loss": 46.88, "setup": "orb", "entry_time": "10:15 AM", "flat_by": "15:55",
+                     "market": "US", "currency": "USD", "asset_type": "EQUITY"}})
         self.assertIn("bound by your $50 max loss", why)
         self.assertIn("$46.88", why)
 
@@ -145,6 +147,29 @@ class TheReel(unittest.TestCase):
 
 
 class PlanRules(unittest.TestCase):
+    def test_indian_minimum_is_two_net_of_estimated_costs(self):
+        in_plan = {
+            "created_by": "trader-exit", "symbol": "RELIANCE", "side": "buy", "market": "IN",
+            "currency": "INR", "exchange": "NSE", "date": TODAY, "entry": 2850.0,
+            "stop": 2830.0, "target": 2890.0, "tick_size": 0.05, "setup": "orb",
+        }
+        in_cfg = {
+            "market": "IN", "currency": "INR", "exchange": "NSE", "budget": 100000,
+            "cash_buffer_pct": 10, "max_position_pct": 75, "max_order_inr": 75000,
+            "min_order_inr": 100, "max_loss_per_trade_inr": 2000, "paper": True,
+            "min_reward_risk": 0,
+        }
+        gross_2r = size.size_trade(in_plan, in_cfg, today=TODAY, market="IN")
+        self.assertEqual(gross_2r["reward_risk"], 2.0)
+        self.assertLess(gross_2r["net_reward_risk"], 2.0)
+        self.assertIn("net reward:risk", gross_2r["refusal"])
+        self.assertIsNone(size.bracket_order(gross_2r))
+
+        higher_target = size.size_trade(dict(in_plan, target=2930.0), in_cfg, today=TODAY, market="IN")
+        self.assertGreaterEqual(higher_target["net_reward_risk"], 2.0)
+        self.assertIsNone(higher_target["refusal"])
+        self.assertIsNotNone(size.bracket_order(higher_target))
+
     def test_zero_shares_is_a_plain_refusal(self):
         s = size.size_trade(plan(stop=300.0), cfg(), today=TODAY)
         self.assertEqual(s["qty"], 0)
@@ -173,10 +198,10 @@ class PlanRules(unittest.TestCase):
     def test_a_fresh_higher_price_means_a_bigger_risk(self):
         s = size.size_trade(plan(), cfg(min_reward_risk=0), price=366.475, today=TODAY)
         self.assertEqual((s["entry"], s["entry_from"], s["risk_per_share"]), (366.48, "price", 8.16))
-        self.assertEqual((s["qty"], s["max_loss"], s["reward_risk"]), (6, 48.96, 0.44))
-        self.assertIsNone(s["refusal"])
+        self.assertEqual((s["qty"], s["max_loss"]), (6, 48.96))
+        self.assertIsNotNone(s["refusal"])
         s = size.size_trade(plan(), cfg(), price=366.475, today=TODAY)
-        self.assertIn("reward:risk 0.44 (target 370.04, entry 366.48, stop 358.32) is under your minimum 1",
+        self.assertIn("reward:risk 1.15 (target 375.90, entry 366.48, stop 358.32) is under your minimum 2",
                       s["refusal"])
         self.assertIsNone(size.bracket_order(s))
         lower = size.size_trade(plan(), cfg(), price=363.00, today=TODAY)
@@ -214,7 +239,7 @@ class PlanRules(unittest.TestCase):
                 size.size_trade(p, cfg(), today=TODAY)
             self.assertIn(word, str(e.exception))
         with self.assertRaises(size.SizeError) as e:
-            size.size_trade(plan(), cfg(), price=371.00, today=TODAY)
+            size.size_trade(plan(), cfg(), price=380.00, today=TODAY)
         self.assertIn("already happened", str(e.exception))
         with self.assertRaises(size.SizeError) as e:
             size.size_trade(plan(), cfg(blocked=["tsla"]), today=TODAY)
@@ -224,7 +249,7 @@ class PlanRules(unittest.TestCase):
         self.assertIn("make a new plan", str(e.exception))
 
     def test_under_the_minimum_order(self):
-        cheap = plan(symbol="ABC", entry=4.0, stop=3.0, target=5.0)
+        cheap = plan(symbol="ABC", entry=4.0, stop=3.0, target=6.0)
         s = size.size_trade(cheap, cfg(max_loss_per_trade_usd=1), today=TODAY)
         self.assertEqual(s["qty"], 1)
         self.assertIn("under your $5 minimum order", s["refusal"])

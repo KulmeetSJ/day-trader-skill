@@ -93,7 +93,7 @@ DEFAULTS = {
     "max_daily_loss_usd": 150,
     "max_trades_per_day": 3,
     "max_orders_per_day": 10,
-    "min_reward_risk": 1.0,
+    "min_reward_risk": 2.0,
     "require_stop": True,
     "no_entries_before": "09:45",
     "no_entries_after": "15:30",
@@ -571,6 +571,16 @@ def _f(x):
         return None
 
 
+def _effective_min_reward_risk(value):
+    try:
+        requested = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return 2.0
+    if not requested.is_finite():
+        return 2.0
+    return float(max(Decimal("2.0"), requested))
+
+
 def parse_weights(data):
     """Accept a weights file, a {ticker: weight} dict or a list of rows.
 
@@ -817,6 +827,7 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     raw_cfg = cfg or {}
     c = dict(DEFAULTS)
     c.update(raw_cfg)
+    c["min_reward_risk"] = _effective_min_reward_risk(c.get("min_reward_risk"))
     if not isinstance(plan, dict):
         raise SizeError("the plan is not a JSON object")
     raw_sym = str(plan.get("symbol") or "").strip().upper()
@@ -1180,6 +1191,32 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
             trading_style=trading_style,
             as_of_date=today,
         )
+        if qty > 0:
+            costs_at_stop = calculate_indian_transaction_charges(
+                asset_type=asset_type,
+                side="buy",
+                entry_price=ref,
+                exit_price=stop,
+                qty=qty,
+                trading_style=trading_style,
+                as_of_date=today,
+            )
+            gross_reward = reward * qty
+            gross_risk = risk * qty
+            net_reward = gross_reward - float(res["transaction_costs"].get("total") or 0)
+            net_risk = gross_risk + float(costs_at_stop.get("total") or 0)
+            net_rr = (net_reward / net_risk) if net_reward > 0 and net_risk > 0 else 0.0
+            res["transaction_costs_at_stop"] = costs_at_stop
+            res["net_reward_after_costs"] = round(net_reward, 2)
+            res["net_risk_including_costs"] = round(net_risk, 2)
+            res["net_reward_risk"] = round(net_rr, 4)
+            if not is_t2t and refusal is None and net_rr < c["min_reward_risk"] - 1e-9:
+                refusal = (
+                    "net reward:risk %.4f after estimated Indian transaction charges is under the %.2f minimum; "
+                    "no order. Increase the target or skip the trade."
+                    % (net_rr, c["min_reward_risk"])
+                )
+                res["refusal"] = refusal
     for k in PROVENANCE_KEYS:
         if k in plan:
             res[k] = plan[k]
@@ -1280,9 +1317,12 @@ def build_order(s, cfg=None):
             o["plan"]["trading_style"] = "intraday"
             o["plan"]["product"] = o["product"]
 
-    if s.get("asset_type") and s["asset_type"] != "EQUITY":
-        o["asset_type"] = s["asset_type"]
-        o["plan"]["asset_type"] = s["asset_type"]
+    o["market"] = market
+    o["currency"] = "INR" if market == "IN" else "USD"
+    o["asset_type"] = s.get("asset_type") or "EQUITY"
+    o["plan"]["market"] = market
+    o["plan"]["currency"] = o["currency"]
+    o["plan"]["asset_type"] = o["asset_type"]
     if s.get("lot_size") and s["lot_size"] > 1:
         o["lot_size"] = s["lot_size"]
         o["contracts"] = int(s["qty"]) // s["lot_size"]
@@ -1294,10 +1334,13 @@ def build_order(s, cfg=None):
     if s.get("transaction_costs"):
         o["transaction_costs"] = s["transaction_costs"]
         o["plan"]["transaction_costs"] = s["transaction_costs"]
+    if s.get("transaction_costs_at_stop"):
+        o["transaction_costs_at_stop"] = s["transaction_costs_at_stop"]
+        o["plan"]["transaction_costs_at_stop"] = s["transaction_costs_at_stop"]
+    if s.get("net_reward_risk") is not None:
+        o["net_reward_risk"] = s["net_reward_risk"]
+        o["plan"]["net_reward_risk"] = s["net_reward_risk"]
     if market == "IN":
-        o["market"] = "IN"
-        o["currency"] = "INR"
-        o["plan"]["market"] = "IN"
         if s.get("tick_size") is not None:
             o["tick_size"] = s["tick_size"]
             o["plan"]["tick_size"] = s["tick_size"]

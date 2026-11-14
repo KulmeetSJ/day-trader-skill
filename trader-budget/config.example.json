@@ -8,7 +8,7 @@
   "max_daily_loss_usd": 150,
   "max_trades_per_day": 3,
   "max_orders_per_day": 10,
-  "min_reward_risk": 1.0,
+  "min_reward_risk": 2.0,
   "require_stop": true,
   "no_entries_before": "09:45",
   "no_entries_after": "15:30",

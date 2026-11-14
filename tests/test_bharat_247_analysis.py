@@ -261,7 +261,7 @@ class TestIntradayStrategyHistoricalCandleAnalysis(unittest.TestCase):
                     "check", "RELIANCE", "--now", "2026-10-19 10:35", "--market", "IN", "--write", entry_p
                 ])[0], 0)
             self.assertEqual(run_cli(exit_mod, [
-                "plan", "--from", entry_p, "--market", "IN", "--config", cfg_p, "--write", plan_p
+                "plan", "--from", entry_p, "--target", "4R", "--market", "IN", "--config", cfg_p, "--write", plan_p
             ])[0], 0)
             self.assertEqual(run_cli(budget_mod, [
                 "--now", "2026-10-19 10:35", "trade", "--plan", plan_p, "--market", "IN",
@@ -569,6 +569,7 @@ class TestWorkflowEndToEnd247(unittest.TestCase):
         code, out, _ = run_cli(exit_mod, [
             "plan",
             "--from", self.entry_path,
+            "--target", "4R",
             "--market", "IN",
             "--config", self.cfg_path,
             "--write", self.plan_path

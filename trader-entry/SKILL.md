@@ -71,8 +71,8 @@ Flags on `check`, `watch`, and `watchlist`:
   `9:30`, `9:35`, `9:40` ET bars (US) or `9:15`, `9:20`, `9:25` IST bars
   (India), or fifteen 1-minute bars. The level to beat is the range high.
 - **Level.** A price you give, like a level from `/trader-scanner`.
-- **20-day breakout (`breakout_20d`).** Derives the prior 20-day closing high
-  from completed daily sessions strictly before the evaluation date and
+- **20-day breakout (`breakout_20d`).** Derives the highest close among the
+  20 completed sessions before the candidate/current session and
   requires a completed intraday bar closing strictly above that breakout
   level. A daily scanner hit never triggers without intraday confirmation;
   stale or missing daily history returns `no-data`. Also records

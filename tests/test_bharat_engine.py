@@ -227,7 +227,7 @@ class TestBharatBudgetAndSizing(unittest.TestCase):
 
     def test_bracket_order_generation_inr(self):
         plan = {
-            "symbol": "RELIANCE", "side": "buy", "entry": 2850.00, "stop": 2830.00, "target": 2890.00,
+            "symbol": "RELIANCE", "side": "buy", "entry": 2850.00, "stop": 2830.00, "target": 2910.00,
             "risk_per_share": 20.00, "market": "IN", "tick_size": 0.05,
             "setup": "orb", "entry_time": "09:35 AM", "flat_by": "15:20"
         }
@@ -302,10 +302,18 @@ class TestBharatPreTradeRisk(unittest.TestCase):
     def test_risk_pass_valid_indian_order(self):
         order = {
             "symbol": "RELIANCE", "side": "buy", "qty": "20", "type": "market", "time_in_force": "day",
-            "order_class": "bracket", "take_profit_limit_price": "2890.00", "stop_loss_stop_price": "2830.00",
-            "plan": {"entry": 2850.0, "stop": 2830.0, "target": 2890.0, "risk_per_share": 20.0, "setup": "orb", "flat_by": "15:20", "market": "IN"},
+            "order_class": "bracket", "take_profit_limit_price": "2910.00", "stop_loss_stop_price": "2830.00",
+            "plan": {"entry": 2850.0, "stop": 2830.0, "target": 2910.0, "risk_per_share": 20.0, "setup": "orb", "flat_by": "15:20", "market": "IN"},
             "market": "IN", "currency": "INR"
         }
+        order["transaction_costs"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=2910.0,
+            qty=20, trading_style="intraday", as_of_date="2026-10-19"
+        )
+        order["transaction_costs_at_stop"] = budget_mod.calculate_indian_transaction_charges(
+            asset_type="EQUITY", side="buy", entry_price=2850.0, exit_price=2830.0,
+            qty=20, trading_style="intraday", as_of_date="2026-10-19"
+        )
         at_now = risk_mod.parse_now("2026-10-19 10:15", market="IN")
         res = risk_mod.check([order], self.cfg, now=at_now)
         self.assertEqual(res["results"][0]["verdict"], "PASS")
@@ -399,7 +407,7 @@ class TestBharatEndToEndPipeline(unittest.TestCase):
             "--symbol", "RELIANCE",
             "--entry", "2850.00",
             "--stop", "pct:0.7",
-            "--target", "2R",
+            "--target", "3R",
             "--date", "2026-10-19",
             "--time", "09:35",
             "--market", "IN",
@@ -469,7 +477,7 @@ class TestBharatEndToEndPipeline(unittest.TestCase):
 
         # 3. Exit planner
         code, out, _ = run_cli(exit_mod, [
-            "plan", "--from", self.entry_path, "--market", "IN", "--write", self.plan_path
+            "plan", "--from", self.entry_path, "--target", "4R", "--market", "IN", "--write", self.plan_path
         ])
         self.assertEqual(code, 0)
         with open(self.plan_path, encoding="utf-8") as f:
@@ -479,11 +487,11 @@ class TestBharatEndToEndPipeline(unittest.TestCase):
         self.assertEqual(plan["tick_size"], 0.05)
 
         # 4. Position sizing
-        code, out, _ = run_cli(budget_mod, [
+        code, out, err = run_cli(budget_mod, [
             "--plan", self.plan_path, "--config", self.config_path,
             "--now", "2026-10-19 10:35", "--market", "IN", "--write", self.orders_path
         ])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 0, "out:\n" + out + "\nerr:\n" + err)
         with open(self.orders_path, encoding="utf-8") as f:
             ord_doc = json.load(f)
         order = ord_doc["orders"][0]

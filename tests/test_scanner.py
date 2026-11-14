@@ -267,6 +267,14 @@ class Daily(unittest.TestCase):
         blk = [h for h in hits if h["symbol"] == "BLK"][0]
         self.assertEqual((blk["price"], blk["rsi"], blk["close_date"]), (1134.38, 63.7, "2026-10-16"))
 
+    def test_20d_reference_excludes_candidate_close_and_uses_only_twenty_prior_closes(self):
+        history = [float(value) for value in range(1, 26)]
+        candidate = 10000.0
+        tags, metrics = scan.find_setups(history + [candidate])
+        self.assertEqual(metrics["high20"], 25.0)
+        self.assertIn("breakout_20d", tags)
+        self.assertEqual(scan.strategy_rules.prior_20d_close_high(history), 25.0)
+
     def test_the_in_progress_bar_is_dropped(self):
         before = scan.scan_daily(self.data, self.syms, scan.parse_now("2026-10-19 09:00"), 0, 0)
         during = scan.scan_daily(self.data, self.syms, scan.parse_now("2026-10-19 10:50"), 0, 0)

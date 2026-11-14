@@ -4,7 +4,7 @@ enter, so you know when to get out. Standard library only. Long side only.
 It never places an order.
 
     python3 exit.py plan                                    # from trader/entry.json: or-mid stop, 2R target
-    python3 exit.py plan --stop or-mid --target 1R --write  # the reel: stop 358.32, target 370.04
+    python3 exit.py plan --stop or-mid --target 2R --write  # the reel: stop 358.32, target 375.90
     python3 exit.py plan --symbol TSLA --entry 364.18 --or-high 362.18 --or-low 354.47
     python3 exit.py plan --stop atr:1.5 --offline TSLA.json # ATR needs the session's bars
     python3 exit.py plan --symbol NVDA --entry 190.25 --setup level --stop pct:1
@@ -21,7 +21,7 @@ Stops (a long's stop rounds DOWN to the tick: cent/0.01 in US, 0.05 rupee/paise 
   A level setup has no opening-range default: give a stop.
 
 Targets (round half up to the tick):
-  2R (default), 1R, 1.5R ...   entry + R x risk, where risk = entry - stop
+  2R (default), or higher     entry + R x risk, where risk = entry - stop
   price:X                      your price
 
 Refused, with the reason: a stop at or above the entry, a target at or below
@@ -31,8 +31,8 @@ plans longs only).
 
 flat_by (default 15:55 ET for US / 15:20 IST for IN, or "flat_by" in
 trader/config.json): out by then, win or lose. On a 1:00 p.m. NYSE early close
-it moves up with the close (12:55). "min_reward_risk" in the config (default
-1.0) only warns here; trader-risk enforces it.
+it moves up with the close (12:55). "min_reward_risk" in the config defaults
+to 2.0 and may raise, but never lower, the minimum reward:risk.
 
 A stop is a plan, not a guarantee: a gap or a fast market can fill past it.
 Exit codes: plan 0 = a plan, 1 = refused or an error. show 0 = a plan exists.
@@ -42,6 +42,7 @@ import argparse
 import datetime
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -73,8 +74,8 @@ BACKOFF = 5.0
 HOSTS = ("query2", "query1")
 INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 DEFAULT_EXIT_STATE = "trader/state/exit_decisions.json"
-DEFAULTS = {"flat_by": "15:55", "min_reward_risk": 1.0}
-DEFAULTS_IN = {"flat_by": "15:20", "min_reward_risk": 1.0}
+DEFAULTS = {"flat_by": "15:55", "min_reward_risk": 2.0}
+DEFAULTS_IN = {"flat_by": "15:20", "min_reward_risk": 2.0}
 ATR_BARS = 14
 MIN_RISK_PCT = Decimal("0.05")     # risk under 0.05% of the price is inside the spread's noise
 CENT = Decimal("0.01")
@@ -432,12 +433,12 @@ def parse_target(text):
     if m:
         r = D(m.group(1), "--target")
         if r <= 0:
-            raise PlanError("--target needs an R multiple above 0, like 1R or 2R")
+            raise PlanError("--target must be at least 2R after tick-size rounding")
         return "r", r
     m = re.match(r"^price:\s*(?:\$|\u20b9|rs\.?\s*)?([0-9][0-9,]*\.?[0-9]*)$", t.lower())
     if m:
         return "price", D(m.group(1), "--target")
-    raise PlanError("--target is 2R, 1R, 1.5R ... or price:X (got %r)" % text)
+    raise PlanError("--target is 2R or higher, or price:X (got %r)" % text)
 
 
 def r_label(r):
@@ -446,7 +447,7 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None, market="US", tick_size=None):
+            atr=None, atr_bars=None, market="US", tick_size=None, min_reward_risk=2.0):
     """The stop, the target and the risk, in exact ticks. Raises PlanError with the reason."""
     if tick_size is not None:
         if isinstance(tick_size, bool):
@@ -520,7 +521,17 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
                         % (money(target, market=market, tick=tick), money(e, market=market, tick=tick)))
-    rr = ((target - e) / risk).quantize(CENT, rounding=ROUND_HALF_UP)
+    rr_exact = (target - e) / risk
+    try:
+        minimum_rr = max(Decimal("2.0"), Decimal(str(min_reward_risk)))
+    except (InvalidOperation, TypeError, ValueError):
+        minimum_rr = Decimal("2.0")
+    if not minimum_rr.is_finite():
+        minimum_rr = Decimal("2.0")
+    if rr_exact < minimum_rr:
+        raise PlanError("reward:risk %s after tick-size rounding is under the %.2f minimum; choose a target at 2R or higher"
+                        % (ratio(rr_exact), float(minimum_rr)))
+    rr = rr_exact.quantize(CENT, rounding=ROUND_HALF_UP)
     if t_label is None:
         t_label = "your price (%sR)" % ratio(rr)
     return {"entry": e, "stop": stop, "stop_label": label, "stop_detail": detail, "target": target,
@@ -785,6 +796,12 @@ def read_config(path, market="US"):
                     cfg[k] = v
             if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
                 cfg["market"] = "IN"
+    try:
+        cfg["min_reward_risk"] = max(2.0, float(cfg.get("min_reward_risk", 2.0)))
+        if not math.isfinite(cfg["min_reward_risk"]):
+            cfg["min_reward_risk"] = 2.0
+    except (TypeError, ValueError, OverflowError):
+        cfg["min_reward_risk"] = 2.0
     return cfg
 
 
@@ -1093,7 +1110,8 @@ def build_plan(a, now_utc=None):
             last_bar_end = atr_now
         chart_last_ts_iso = chart.get("last_data_timestamp") or _market_iso(last_bar_end, market=market)
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
-                atr, atr_n, market=market, tick_size=tick_size)
+                atr, atr_n, market=market, tick_size=tick_size,
+                min_reward_risk=cfg_market.get("min_reward_risk", 2.0))
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(round_tick(info["or_high"], tick=c["tick_size"])),
@@ -1475,9 +1493,17 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
     quote_ts = None
     if isinstance(q_raw, dict) and q_raw.get("price") is not None:
         q_t = q_raw.get("timestamp")
-        if q_t is None or int(q_t) <= now_ts:
-            quote_px = float(q_raw["price"])
-            quote_ts = int(q_t) if q_t is not None else None
+        try:
+            parsed_q_t = int(q_t) if q_t is not None else None
+            parsed_q_px = float(q_raw["price"])
+        except (TypeError, ValueError, OverflowError):
+            parsed_q_t = None
+            parsed_q_px = None
+        # An untimestamped quote cannot establish freshness. A timestamped
+        # completed candle may still provide a separately validated fallback.
+        if parsed_q_t is not None and parsed_q_t <= now_ts and parsed_q_px is not None and math.isfinite(parsed_q_px) and parsed_q_px > 0:
+            quote_px = parsed_q_px
+            quote_ts = parsed_q_t
 
     last_closed = session_bars_closed[-1] if session_bars_closed else (completed_all[-1] if completed_all else None)
     curr_px = quote_px if quote_px is not None else (last_closed["c"] if last_closed else None)
@@ -1485,18 +1511,34 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
     prov_name = str((chart or {}).get("provider") or "yahoo")
     d_tier = str((chart or {}).get("data_tier") or "DELAYED").upper()
     d_stat = str((chart or {}).get("provider_data_status") or (chart or {}).get("data_status") or d_tier).upper()
-    is_fix = bool((chart or {}).get("is_offline"))
-    is_sim = bool((chart or {}).get("is_simulated"))
-    dt_val = (chart or {}).get("data_time")
-    lag_sec = (now_ts - int(dt_val)) if dt_val is not None else (
-        (now_ts - quote_ts) if quote_ts is not None else (
-            (now_ts - (last_closed["t"] + step)) if last_closed else None
-        )
-    )
+    # Freshness is a property of the price timestamp, not of the market clock
+    # or provider mode. This also keeps a prior-session close from looking
+    # current during post-close checks or deterministic replay.
+    price_ts = quote_ts if quote_px is not None else (last_closed["t"] + step if last_closed else None)
+    lag_sec = now_ts - price_ts if price_ts is not None else None
+    price_date = to_local(utc_of(price_ts), market=market).date() if price_ts is not None else None
     is_stale = bool(
-        session_open and not simulated and not is_fix and not is_sim
-        and (d_stat == "STALE" or (lag_sec is not None and lag_sec > max(1800, step + 600)))
+        d_stat == "STALE"
+        or price_ts is None
+        or price_ts > now_ts
+        or price_date != day
+        or lag_sec is None
+        or lag_sec > max(1800, step + 600)
     )
+    # Only same-session, recent completed bars may participate in bar-based
+    # stops, targets, trend decisions or trailing-stop calculations.
+    last_closed_lag = (now_ts - (last_closed["t"] + step)) if last_closed else None
+    closed_bar_fresh = bool(
+        last_closed is not None
+        and last_closed["date"] == day.isoformat()
+        and last_closed_lag is not None
+        and 0 <= last_closed_lag <= max(1800, step + 600)
+        and d_stat != "STALE"
+    )
+    if is_stale:
+        d_tier = "STALE"
+        d_stat = "STALE"
+        curr_px = None
 
     closes_all = [b["c"] for b in completed_all]
     ema9 = _manage_ema(closes_all, 9) if closes_all else []
@@ -1574,7 +1616,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
 
     # 3. Stop-loss / trailing stop breach
     if action == "HOLD" and active_stop is not None and curr_px is not None:
-        closed_stop_hit = bool(last_closed and (last_closed["c"] <= active_stop or last_closed["l"] <= active_stop))
+        closed_stop_hit = bool(closed_bar_fresh and (last_closed["c"] <= active_stop or last_closed["l"] <= active_stop))
         quote_stop_hit = bool(curr_px <= active_stop)
         if quote_stop_hit or closed_stop_hit:
             action = "EXIT"
@@ -1590,7 +1632,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         reasons.append("Unrealized loss %.2f exceeds max_loss_per_trade %.2f" % (unrealized_pnl, float(max_loss_cap)))
 
     # 5. Trend deterioration / VWAP breakdown on COMPLETED bars (any time of day)
-    if action == "HOLD" and last_closed is not None and last_closed["date"] == day.isoformat():
+    if action == "HOLD" and closed_bar_fresh:
         bear_ema = (ema9_v is not None and ema21_v is not None and last_closed["c"] < ema21_v and ema9_v < ema21_v)
         below_vwap = (vwap_v is not None and last_closed["c"] < vwap_v)
         weak_rsi = (rsi14 is not None and rsi14 < 45.0)
@@ -1608,9 +1650,9 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
     # 6. Target & Partial Exit logic
     can_partial = bool(allow_partial and int(qty // lot_size) >= 2 and not position.get("partial_done"))
     if action == "HOLD" and target_px is not None and curr_px is not None:
-        target_hit = (curr_px >= target_px) or bool(last_closed and last_closed["h"] >= target_px)
+        target_hit = (curr_px >= target_px) or bool(closed_bar_fresh and last_closed["h"] >= target_px)
         if target_hit:
-            bullish_run = bool(ema9_v and ema21_v and curr_px > ema9_v > ema21_v)
+            bullish_run = bool(closed_bar_fresh and ema9_v and ema21_v and curr_px > ema9_v > ema21_v)
             if can_partial and bullish_run:
                 half_lots = max(1, int(qty // lot_size) // 2)
                 exit_qty = int(half_lots * lot_size)
@@ -1642,9 +1684,9 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         trail_cands = []
         if entry_px > 0 and r_mult >= float(trail_activate_r):
             trail_cands.append(entry_px)
-        if atr_val and atr_val > 0 and last_closed:
+        if atr_val and atr_val > 0 and closed_bar_fresh:
             trail_cands.append(last_closed["c"] - float(trail_atr_k) * float(atr_val))
-        if ema21_v and ema21_v > 0 and curr_px > ema21_v:
+        if closed_bar_fresh and ema21_v and ema21_v > 0 and curr_px > ema21_v:
             trail_cands.append(ema21_v - (0.1 * float(atr_val or 0)))
         valid_cands = [float(floor_tick(x, tick)) for x in trail_cands if x > 0 and x < curr_px - float(tick)]
         if valid_cands:
@@ -1673,7 +1715,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
         "exit_qty": exit_qty if action == "PARTIAL EXIT" else (qty if action == "EXIT" else 0),
         "entry": entry_px,
         "current_price": None if carryover_pending else curr_px,
-        "price_source": "unavailable" if carryover_pending else ("current_quote" if quote_px is not None else ("completed_candle" if last_closed else "unavailable")),
+        "price_source": "unavailable" if carryover_pending or is_stale else ("current_quote" if quote_px is not None else ("completed_candle" if last_closed else "unavailable")),
         "active_stop": active_stop,
         "recommended_stop": recommended_stop,
         "target": target_px,
@@ -1694,7 +1736,7 @@ def evaluate_position(position, chart, now_utc, interval="5m", market=None, cfg=
                 "is_complete": True,
             } if last_closed else None,
             "forming_candle": forming_bar,
-            "current_quote": {"price": quote_px, "timestamp": quote_ts} if quote_px is not None else None,
+            "current_quote": {"price": quote_px, "timestamp": quote_ts} if quote_px is not None and not is_stale else None,
         },
         "data_tier": d_tier,
         "data_status": d_stat,
@@ -1915,7 +1957,7 @@ def main(argv=None):
     p.add_argument("--interval", choices=["1m", "5m", "15m", "30m", "1h"])
     p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
     p.add_argument("--stop", help="or-mid (orb default), or-low, price:X, pct:X, atr:K")
-    p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
+    p.add_argument("--target", help="2R minimum (default), higher R multiple, or price:X")
     p.add_argument("--flat-by", help="HH:MM market time (default: config flat_by, 15:55 ET or 15:20 IST)")
     p.add_argument("--asset-type", choices=["EQUITY", "FUTURES", "OPTIONS"], help="asset type")
     p.add_argument("--trading-style", choices=["intraday", "positional"], help="trading style")

@@ -12,10 +12,10 @@
   "stop": 358.32,
   "stop_rule": "or_mid",
   "stop_label": "opening-range midpoint",
-  "target": 370.04,
-  "target_r": 1.0,
-  "target_label": "1R (one times the risk)",
+  "target": 375.90,
+  "target_r": 2.0,
+  "target_label": "2R (two times the risk)",
   "risk_per_share": 5.86,
-  "reward_risk": 1.0,
+  "reward_risk": 2.0,
   "flat_by": "15:55"
 }

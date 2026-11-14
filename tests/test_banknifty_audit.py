@@ -367,9 +367,9 @@ class BankNiftyAuditTests(unittest.TestCase):
         self.assertIsNone(res_exp["entry_zone"])
         self.assertEqual(res_exp["decision_state"], "NO TRADE")
 
-    def test_breakout_20d_uses_20d_highest_high_and_prevents_lookahead_for_banknifty_and_nifty(self):
+    def test_breakout_20d_uses_prior_completed_closes_and_prevents_lookahead_for_banknifty_and_nifty(self):
         prior_days = _trading_days_before(datetime.date(2026, 11, 11), 34)
-        # Case 1: BANKNIFTY - 2026-11-11 close=60792.40, high=61394.30 (higher than close and all prior 19 highs)
+        # Case 1: BANKNIFTY - breakout reference is the highest close, not an intraday high.
         bn_daily = []
         for idx, d in enumerate(prior_days):
             if idx == len(prior_days) - 1:
@@ -383,9 +383,9 @@ class BankNiftyAuditTests(unittest.TestCase):
             {"t": _ist_ts(2026, 11, 12, 9, 15), "o": 60850.0, "h": 62500.0, "l": 60723.1, "c": 61518.5, "v": 1000},
         ]
 
-        # Intraday bar closes at 61000.00 (above prev close 60792.40, BELOW prior 20d high 61394.30) -> waiting
+        # The intraday close remains below the prior completed session's highest close -> waiting.
         bars_below = [
-            {"t": _ist_ts(2026, 11, 12, 9, 15 + 5 * i), "o": 60900.0, "h": 61100.0, "l": 60850.0, "c": 61000.0, "v": 1000}
+            {"t": _ist_ts(2026, 11, 12, 9, 15 + 5 * i), "o": 60650.0, "h": 60750.0, "l": 60600.0, "c": 60700.0, "v": 1000}
             for i in range(6)
         ]
         ch_wait = dict(_make_5m_chart("BANKNIFTY", bars_below, prev_close=60792.40), daily_bars=bn_daily_with_today)
@@ -393,30 +393,31 @@ class BankNiftyAuditTests(unittest.TestCase):
             ch_wait, _utc_from_ts(bars_below[-1]["t"] + 310),
             setup="breakout_20d", market="IN",
         )
-        self.assertEqual(res_wait["breakout_level"], 61394.30)
-        self.assertEqual(res_wait["level"], 61394.30)
+        self.assertEqual(res_wait["breakout_level"], 60792.40)
+        self.assertEqual(res_wait["level"], 60792.40)
         self.assertEqual(res_wait["daily_close"], 60792.40)
         self.assertEqual(res_wait["daily_close_date"], "2026-11-11")
         self.assertEqual(res_wait["status"], "waiting")
         self.assertIsNone(res_wait["trigger"])
 
-        # Now add a bar closing at 61394.80 (> 61394.30) -> MUST confirm breakout
+        # A close above the highest completed daily close confirms the breakout.
         bars_brk = bars_below + [
-            {"t": _ist_ts(2026, 11, 12, 9, 45), "o": 61280.0, "h": 61410.0, "l": 61267.20, "c": 61394.80, "v": 2000},
+            {"t": _ist_ts(2026, 11, 12, 9, 45), "o": 60780.0, "h": 60910.0, "l": 60767.20, "c": 60793.00, "v": 2000},
         ]
         ch_trig = dict(_make_5m_chart("BANKNIFTY", bars_brk, prev_close=60792.40), daily_bars=bn_daily_with_today)
         res_trig = entry.evaluate(
             ch_trig, _utc_from_ts(bars_brk[-1]["t"] + 310),
             setup="breakout_20d", market="IN",
         )
-        self.assertEqual(res_trig["breakout_level"], 61394.30)
+        self.assertEqual(res_trig["breakout_level"], 60792.40)
         self.assertEqual(res_trig["status"], "triggered")
-        self.assertEqual(res_trig["confirmation_price"], 61394.80)
-        self.assertEqual(res_trig["entry_reference"], 61394.80)
-        self.assertEqual(res_trig["stop_preview"], 61267.20)
-        self.assertEqual(res_trig["reward_risk"], 2.0)
+        self.assertEqual(res_trig["confirmation_price"], 60793.00)
+        # Spot indices may display the analytical trigger but cannot carry a trade plan.
+        self.assertIsNone(res_trig["entry_reference"])
+        self.assertIsNone(res_trig["stop_preview"])
+        self.assertIsNone(res_trig["reward_risk"])
 
-        # Case 2: NIFTY - 2026-11-11 close=25255.05, 20d highest high=25424.35; intraday close=25299.35 must NOT trigger
+        # Case 2: NIFTY - a prior intraday high does not become the closing-high reference.
         nf_daily = []
         for idx, d in enumerate(prior_days):
             if idx == len(prior_days) - 3:
@@ -436,9 +437,9 @@ class BankNiftyAuditTests(unittest.TestCase):
             ch_nf, _utc_from_ts(nf_bars[-1]["t"] + 310),
             setup="breakout_20d", market="IN",
         )
-        self.assertEqual(res_nf["breakout_level"], 25424.35)
-        self.assertEqual(res_nf["status"], "waiting")
-        self.assertIsNone(res_nf["trigger"])
+        self.assertEqual(res_nf["breakout_level"], 25255.05)
+        self.assertEqual(res_nf["status"], "triggered")
+        self.assertIsNotNone(res_nf["trigger"])
 
 
 if __name__ == "__main__":

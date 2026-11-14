@@ -86,12 +86,14 @@ if os.path.isdir(_alerts_dir) and _alerts_dir not in sys.path:
 
 # Cross-skill helpers live in ../trader-alerts (added to sys.path above)
 try:
+    import strategy_rules  # type: ignore
     import symbols_in  # type: ignore
     import calendar_in  # type: ignore
     import data_in  # type: ignore
     import instruments  # type: ignore
     import visuals  # type: ignore
 except ImportError:
+    strategy_rules = None
     symbols_in = None
     calendar_in = None
     data_in = None
@@ -1128,7 +1130,9 @@ def find_setups(closes, strategy_cfg=None):
     """closes (oldest first, >= 30) -> (setup keys, numbers)."""
     c = closes
     last = c[-1]
-    hi20 = max(c[-21:-1])
+    prior_closes = c[:-1]
+    hi20 = (strategy_rules.prior_20d_close_high(prior_closes) if strategy_rules else
+            max(prior_closes[-20:]) if len(prior_closes) >= 20 else None)
     ma20 = sum(c[-20:]) / 20.0
     ma20_prev = sum(c[-21:-1]) / 20.0
     run = c[-6] / c[-16] - 1 if c[-16] > 0 else 0.0
@@ -1136,7 +1140,7 @@ def find_setups(closes, strategy_cfg=None):
     r = rsi(c)
     r_prev = rsi(c[:-1])
     tags = []
-    if last > hi20:
+    if hi20 is not None and last > hi20:
         tags.append("breakout_20d")
     if run > 0.10 and rng5 < 0.05:
         tags.append("bull_flag")
@@ -2077,9 +2081,11 @@ def analyze_index_series(sym, series_doc, interval="1d", ema_periods=(20, 50), i
     breakdown_level = None
     breakout_signal = None
     if len(closes) >= 21:
-        breakout_level = round(max(closes[-21:-1]), 2)
+        prior_close_high = (strategy_rules.prior_20d_close_high(closes[:-1]) if strategy_rules else
+                            max(closes[-21:-1]))
+        breakout_level = round(prior_close_high, 2) if prior_close_high is not None else None
         breakdown_level = round(min(closes[-21:-1]), 2)
-        if last_close > breakout_level:
+        if breakout_level is not None and last_close > breakout_level:
             breakout_signal = "breakout_20_high"
         elif last_close < breakdown_level:
             breakout_signal = "breakdown_20_low"
@@ -2191,6 +2197,17 @@ def summarize_index_breadth(results):
     avg_rsi = round(sum(rsis) / float(len(rsis)), 1) if rsis else None
     neutral_cnt = max(0, len(valid) - bull_trend - bear_trend)
 
+    CANONICAL_REGIME_MAP = {
+        "broad_bullish": "STRONG_BULLISH",
+        "mild_bullish": "BULLISH",
+        "broad_bearish": "STRONG_BEARISH",
+        "mild_bearish": "BEARISH",
+        "range_bound": "SIDEWAYS",
+        "mixed_divergent": "HIGH_VOLATILITY",
+        "insufficient_data": "UNCERTAIN",
+    }
+    canonical_regime = CANONICAL_REGIME_MAP.get(regime, "UNCERTAIN")
+
     return {
         "analyzed_count": len(valid),
         "limited_count": len(limited),
@@ -2205,6 +2222,8 @@ def summarize_index_breadth(results):
         "bullish_trend_count": bull_trend,
         "bearish_trend_count": bear_trend,
         "regime": regime,
+        "canonical_regime": canonical_regime,
+        "market_regime": canonical_regime,
         "divergence_notes": divergence_notes,
     }
 
