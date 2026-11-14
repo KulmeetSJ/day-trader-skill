@@ -783,19 +783,18 @@ def read_json(path, what):
         raise PlanError("%s is not valid JSON: %s" % (path, e))
 
 
-def read_config(path, market="US"):
-    cfg = dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
-    if path and os.path.exists(path):
-        doc = read_json(path, "config")
-        if isinstance(doc, dict):
-            for k, v in doc.items():
-                if k in DEFAULTS:
-                    if v is not None:
-                        cfg[k] = v
-                elif v is not None:
-                    cfg[k] = v
-            if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
-                cfg["market"] = "IN"
+def read_config(path=None, market="US"):
+    _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    try:
+        from config.loader import load_config as central_load_config, ConfigError
+        cfg = central_load_config(path=path, market=market)
+    except ConfigError as err:
+        raise PlanError(str(err))
+    except Exception as err:
+        raise PlanError("Failed to load config: %s" % err)
+
     try:
         cfg["min_reward_risk"] = max(2.0, float(cfg.get("min_reward_risk", 2.0)))
         if not math.isfinite(cfg["min_reward_risk"]):

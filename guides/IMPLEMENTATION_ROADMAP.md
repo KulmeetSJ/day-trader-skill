@@ -59,7 +59,7 @@ This document tracks the phased transformation of the Day Trader repository from
 - **Status**: Completed & 100% Verified.
 - **Accomplishments**:
   - Enforced strict prohibition of naked short options.
-  - Mandated defined-risk vertical credit spreads with validated protective legs.
+  - Correctly bounded options status: BUY CE analytical signal only (options_orb), order execution sizing disabled in size.py, BUY PE unsupported in entry.py, and multi-leg credit spread execution unsupported.
   - Enforced integer contract lot sizing and net 2R target verification after option STT.
   - Published `guides/OPTIONS_RISK_SPEC.md` with the 7-stage recommendation lifecycle.
 

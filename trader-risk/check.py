@@ -215,6 +215,19 @@ def get_market_profile(a=None, orders=None, cfg=None):
     return "US"
 
 
+def load_config(path=None, market=None, overrides=None):
+    _ROOT = os.path.dirname(_DIR)
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    try:
+        from config.loader import load_config as central_load_config, ConfigError
+        return central_load_config(path=path, market=market, overrides=overrides)
+    except ConfigError as err:
+        raise RiskError(str(err))
+    except Exception as err:
+        raise RiskError("Failed to load config: %s" % err)
+
+
 # ---------------------------------------------------------------- time
 
 def _nth_sunday(year, month, n):
@@ -1724,15 +1737,22 @@ def main(argv=None):
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % orders_file)
-        cfg = read_json(a.config, "config", required=False) or {}
         fingerprint_overrides = {}
         if getattr(a, "allow_off_hours", False):
-            cfg["allow_off_hours"] = True
             fingerprint_overrides["allow_off_hours"] = True
         if getattr(a, "exchange", None):
-            cfg["exchange"] = a.exchange
             fingerprint_overrides["exchange"] = a.exchange
-        market = getattr(a, "market", None) or get_market_profile(a, orders, cfg)
+        market = getattr(a, "market", None) or get_market_profile(a, orders)
+        central_cfg = load_config(a.config, market=market, overrides=fingerprint_overrides)
+        if a.config and os.path.isfile(a.config):
+            cfg = read_json(a.config, "config", required=False) or {}
+            cfg.update(fingerprint_overrides)
+        else:
+            cfg = dict(central_cfg)
+        prov = central_cfg.get("_provenance")
+        if prov:
+            cfg["_provenance"] = prov
+            cfg["provenance"] = prov
         now = parse_now(a.now, market=market)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
             raise RiskError("--today wants a date like 2026-10-19")

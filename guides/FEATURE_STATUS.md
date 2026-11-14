@@ -21,9 +21,10 @@
 | **Volume & Flow** | Market depth & book imbalance | Implemented | `trader-alerts/volume_flow.py` | `tests/test_volume_flow.py` | Requires L2 depth |
 | **Strategy Engine**| 10 Intraday Strategies | Implemented | `trader-entry/entry.py` | `tests/test_entry.py` | Long bias default |
 | **Strategy Engine**| Opportunity ranking formula | Implemented | `guides/STRATEGY_SPEC.md` | Specification | Deterministic composite |
-| **Options Engine** | BUY CE & BUY PE (Long calls/puts)| Implemented | `trader-alerts/symbols_in.py` | `tests/test_bharat_derivatives.py` | Spot mapped strikes |
-| **Options Engine** | Defined-risk Credit Spreads | Implemented | `trader-risk/check.py` | `tests/test_bharat_options_risk.py` | Protective leg required |
-| **Options Engine** | Naked short options prohibition | Implemented | `trader-risk/check.py` | `tests/test_bharat_options_risk.py` | Blocked unconditionally |
+| **Options Engine** | BUY CE (Long calls) | Analytical Signal Only | `trader-entry/entry.py` | `tests/test_bharat_derivatives.py` | BUY CE analytical signal only (options_orb); execution sizing disabled in size.py |
+| **Options Engine** | BUY PE (Long puts) | Unsupported | `trader-entry/entry.py` | Doc verification | BUY PE is unsupported in entry.py:2140 |
+| **Options Engine** | Defined-risk Credit Spreads | Unsupported (Execution) | `trader-risk/check.py` | `tests/test_bharat_options_risk.py` | Order generation and multi-leg execution sizing currently unsupported |
+| **Options Engine** | Naked short options prohibition | Prohibited | `trader-risk/check.py` | `tests/test_bharat_options_risk.py` | Blocked unconditionally (short options fail closed) |
 | **Options Engine** | Option Greeks & IV solver | Implemented | `trader-alerts/data_in.py` | `tests/test_bharat_derivatives.py` | Black-Scholes analytic |
 | **Options Engine** | 7-stage state machine | Implemented | `guides/OPTIONS_RISK_SPEC.md` | Specification | None |
 | **Risk Engine** | Pre-trade order checks | Implemented | `trader-risk/check.py` | `tests/test_risk.py` | Fail-closed |

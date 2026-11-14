@@ -61,6 +61,8 @@ IN_DEFAULTS = {
     "allow_short": False,
     "allow_options": False,
     "allow_futures": False,
+    "futures_margin_pct": 20.0,
+    "blocked": [],
     "option_strategy": "long_call",
     "strike_selection": "ATM",
     "allowed_asset_classes": ["EQUITY"],
@@ -127,6 +129,8 @@ US_DEFAULTS = {
     "allow_short": False,
     "allow_options": False,
     "allow_futures": False,
+    "futures_margin_pct": 20.0,
+    "blocked": [],
     "allowed_asset_classes": ["EQUITY"],
     "allowed_indices": ["SPY", "QQQ", "IWM"],
     "allowed_symbols": ["TSLA", "AAPL", "MSFT", "NVDA", "AMZN"],
@@ -225,43 +229,62 @@ def validate_config(raw: Dict[str, Any], market: Optional[str] = None) -> Dict[s
             rr_val = float(raw_rr)
         except (ValueError, TypeError):
             rr_val = MANDATORY_MIN_REWARD_RISK
-        merged["min_reward_risk"] = max(MANDATORY_MIN_REWARD_RISK, rr_val)
+        if rr_val > 0:
+            merged["min_reward_risk"] = max(MANDATORY_MIN_REWARD_RISK, rr_val)
+        else:
+            merged["min_reward_risk"] = 0.0
     else:
         merged["min_reward_risk"] = MANDATORY_MIN_REWARD_RISK
 
     # Validate numbers and ranges
     if merged.get("budget") is not None:
-        merged["budget"] = _validate_number(merged["budget"], "budget", min_val=1.0)
+        merged["budget"] = _validate_number(merged["budget"], "budget", min_val=0.0)
     merged["cash_buffer_pct"] = _validate_number(merged.get("cash_buffer_pct", 10.0), "cash_buffer_pct", 0.0, 99.0)
-    merged["max_position_pct"] = _validate_number(merged.get("max_position_pct", 75.0), "max_position_pct", 1.0, 100.0)
+    merged["max_position_pct"] = _validate_number(merged.get("max_position_pct", 75.0), "max_position_pct", 0.0, 100.0)
 
     # Currency neutral aliases
     if resolved_market == "IN":
         merged["currency"] = "INR"
+        if "max_order_inr" not in cfg and "max_order" not in cfg and "max_order_usd" in cfg:
+            merged["max_order_inr"] = cfg["max_order_usd"]
+        if "max_loss_per_trade_inr" not in cfg and "max_loss_per_trade" not in cfg and "max_loss_per_trade_usd" in cfg:
+            merged["max_loss_per_trade_inr"] = cfg["max_loss_per_trade_usd"]
+        if "max_daily_loss_inr" not in cfg and "max_daily_loss" not in cfg and "max_daily_loss_usd" in cfg:
+            merged["max_daily_loss_inr"] = cfg["max_daily_loss_usd"]
+        if "min_order_inr" not in cfg and "min_order" not in cfg and "min_order_usd" in cfg:
+            merged["min_order_inr"] = cfg["min_order_usd"]
         for key in ("max_order_inr", "max_order"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
         for key in ("max_loss_per_trade_inr", "max_loss_per_trade"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
         for key in ("max_daily_loss_inr", "max_daily_loss"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
     else:
         merged["currency"] = "USD"
+        if "max_order_usd" not in cfg and "max_order" not in cfg and "max_order_inr" in cfg:
+            merged["max_order_usd"] = cfg["max_order_inr"]
+        if "max_loss_per_trade_usd" not in cfg and "max_loss_per_trade" not in cfg and "max_loss_per_trade_inr" in cfg:
+            merged["max_loss_per_trade_usd"] = cfg["max_loss_per_trade_inr"]
+        if "max_daily_loss_usd" not in cfg and "max_daily_loss" not in cfg and "max_daily_loss_inr" in cfg:
+            merged["max_daily_loss_usd"] = cfg["max_daily_loss_inr"]
+        if "min_order_usd" not in cfg and "min_order" not in cfg and "min_order_inr" in cfg:
+            merged["min_order_usd"] = cfg["min_order_inr"]
         for key in ("max_order_usd", "max_order"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
         for key in ("max_loss_per_trade_usd", "max_loss_per_trade"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
         for key in ("max_daily_loss_usd", "max_daily_loss"):
             if merged.get(key) is not None:
-                merged[key] = _validate_number(merged[key], key, min_val=1.0)
+                merged[key] = _validate_number(merged[key], key, min_val=0.0)
 
     # Trades and orders
-    merged["max_trades_per_day"] = _validate_int(merged.get("max_trades_per_day", 3), "max_trades_per_day", min_val=1)
-    merged["max_orders_per_day"] = _validate_int(merged.get("max_orders_per_day", 10), "max_orders_per_day", min_val=1)
+    merged["max_trades_per_day"] = _validate_int(merged.get("max_trades_per_day", 3), "max_trades_per_day", min_val=0)
+    merged["max_orders_per_day"] = _validate_int(merged.get("max_orders_per_day", 10), "max_orders_per_day", min_val=0)
     merged["require_stop"] = _validate_bool(merged.get("require_stop", True), "require_stop")
 
     # Time validations
@@ -278,6 +301,11 @@ def validate_config(raw: Dict[str, Any], market: Optional[str] = None) -> Dict[s
     merged["sell_ce_enabled"] = _validate_bool(merged.get("sell_ce_enabled", False), "sell_ce_enabled")
     merged["sell_pe_enabled"] = _validate_bool(merged.get("sell_pe_enabled", False), "sell_pe_enabled")
     merged["max_option_lots"] = _validate_int(merged.get("max_option_lots", 2), "max_option_lots", min_val=1)
+
+    if "blocked" in merged and not isinstance(merged["blocked"], list):
+        raise ConfigError("blocked must be a list of symbols, got %r" % (merged["blocked"],))
+    if "futures_margin_pct" in merged and merged["futures_margin_pct"] is not None:
+        merged["futures_margin_pct"] = _validate_number(merged["futures_margin_pct"], "futures_margin_pct", min_val=0.0, max_val=100.0)
 
     return merged
 

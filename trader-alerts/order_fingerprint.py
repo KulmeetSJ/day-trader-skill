@@ -127,6 +127,8 @@ def _without_secrets(value):
     if isinstance(value, dict):
         clean = {}
         for key, item in value.items():
+            if str(key) in ("_provenance", "provenance"):
+                continue
             low = str(key).lower().replace("-", "_")
             if any(part in low for part in ("token", "secret", "password", "credential")):
                 continue

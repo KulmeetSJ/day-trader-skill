@@ -35,7 +35,7 @@ Day Trader is an AI-orchestrated, deterministically verified intraday trading re
 | **Trading Currency** | Indian Rupee (INR / ₹) | US Dollar (USD / $) |
 | **Tick Size Model** | Authoritative Master Tick (₹0.05, ₹0.01) | Sub-penny / $0.01 standard |
 | **Minimum Net R:R** | Mandatory $\ge 2.0$ after all statutory charges | Mandatory $\ge 2.0$ net floor |
-| **Options Capabilities** | BUY CE, BUY PE, Defined-risk Credit Spreads | BUY Calls, BUY Puts, Defined Spreads |
+| **Options Capabilities** | Analytical signal only (BUY CE options_orb); execution sizing disabled; BUY PE unsupported; defined-risk spreads unsupported; naked options prohibited | Analytical signal only; execution sizing disabled; naked options prohibited |
 | **Lot Size Multiples** | Enforced integer F&O contract lot multiples | Standard 100-share contract units |
 | **T2T Restrictions** | Trade-to-Trade (BE/BZ/T) intraday blocked | Day-trading pattern / margin rules |
 | **Trading Windows** | Entries: 09:30 - 15:00 IST; Flat-by: 15:20 | Entries: 09:45 - 15:30 ET; Flat-by: 15:55 |

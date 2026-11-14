@@ -557,11 +557,17 @@ def read_json(path, what):
         raise SizeError("%s is not valid JSON: %s" % (path, e))
 
 
-def load_config(path):
-    cfg = dict(DEFAULTS)
-    if path and os.path.exists(path):
-        cfg.update(read_json(path, "config"))
-    return cfg
+def load_config(path=None, market=None, overrides=None):
+    _ROOT = os.path.dirname(_DIR)
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    try:
+        from config.loader import load_config as central_load_config, ConfigError
+        return central_load_config(path=path, market=market, overrides=overrides)
+    except ConfigError as err:
+        raise SizeError(str(err))
+    except Exception as err:
+        raise SizeError("Failed to load config: %s" % err)
 
 
 def _f(x):
@@ -1984,7 +1990,19 @@ def main(argv=None):
     g.add_argument("--cents", action="store_true", help="size to the sub-unit (cent/paise) instead of whole units")
     a = ap.parse_args(argv)
     try:
-        cfg = load_config(a.config)
+        plan_doc = None
+        if not (a.weights or a.targets) and getattr(a, "plan", None):
+            try:
+                plan_doc = read_json(a.plan, "plan", required=False)
+            except Exception:
+                pass
+        market = getattr(a, "market", None) or get_market_profile(a, plan_doc)
+        overrides = {}
+        if getattr(a, "trading_style", None):
+            overrides["trading_style"] = a.trading_style
+        if getattr(a, "exchange", None):
+            overrides["exchange"] = a.exchange
+        cfg = load_config(a.config, market=market, overrides=overrides)
         if a.weights or a.targets:
             return run_weights(a, cfg)
         if a.top or a.whole_shares or a.cents:

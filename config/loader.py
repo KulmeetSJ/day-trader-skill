@@ -18,13 +18,22 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
-from schema import (
-    ConfigError,
-    IN_DEFAULTS,
-    US_DEFAULTS,
-    validate_config,
-    MANDATORY_MIN_REWARD_RISK,
-)
+try:
+    from config.schema import (
+        ConfigError,
+        IN_DEFAULTS,
+        US_DEFAULTS,
+        validate_config,
+        MANDATORY_MIN_REWARD_RISK,
+    )
+except ImportError:
+    from schema import (
+        ConfigError,
+        IN_DEFAULTS,
+        US_DEFAULTS,
+        validate_config,
+        MANDATORY_MIN_REWARD_RISK,
+    )
 
 CONFIG_DIR = _DIR
 DEFAULT_RUNTIME_CONFIG = os.path.join(os.path.dirname(_DIR), "trader", "config.json")
@@ -54,17 +63,37 @@ def load_config(
     3. Market profile template (config.in.json or config.us.json)
     4. Authoritative built-in defaults
     """
+    env_mkt = os.environ.get("BHARAT_MARKET", "").strip().upper()
+    if not market and env_mkt in ("IN", "INDIA"):
+        market = "IN"
+
     raw_cfg = {}
     resolved_source = "defaults"
 
-    target_path = path or DEFAULT_RUNTIME_CONFIG
+    norm_path = os.path.abspath(path) if path else None
+    norm_default = os.path.abspath(DEFAULT_RUNTIME_CONFIG)
+    is_default_path = (path is None or path == "trader/config.json" or norm_path == norm_default)
+
+    if not is_default_path:
+        if not os.path.isfile(path):
+            if must_exist:
+                raise ConfigError("Config file not found: %s" % path)
+            target_path = None
+        else:
+            target_path = path
+    else:
+        if path and os.path.isfile(path):
+            target_path = path
+        else:
+            target_path = DEFAULT_RUNTIME_CONFIG
+
     if target_path and os.path.isfile(target_path):
         try:
             with open(target_path, "r", encoding="utf-8") as fh:
                 raw_cfg = json.load(fh)
             resolved_source = os.path.abspath(target_path)
         except Exception as e:
-            raise ConfigError("Failed to parse config file %s: %s" % (target_path, e))
+            raise ConfigError("%s is not valid JSON: %s" % (target_path, e))
     elif must_exist:
         raise ConfigError("Config file not found: %s" % target_path)
     else:
@@ -81,6 +110,25 @@ def load_config(
                 pass
 
     if overrides:
+        mkt = str(market or raw_cfg.get("market") or "US").strip().upper()
+        if mkt == "IN":
+            if "max_order_inr" not in overrides and "max_order" not in overrides and "max_order_usd" in overrides:
+                raw_cfg["max_order_inr"] = overrides["max_order_usd"]
+            if "max_loss_per_trade_inr" not in overrides and "max_loss_per_trade" not in overrides and "max_loss_per_trade_usd" in overrides:
+                raw_cfg["max_loss_per_trade_inr"] = overrides["max_loss_per_trade_usd"]
+            if "max_daily_loss_inr" not in overrides and "max_daily_loss" not in overrides and "max_daily_loss_usd" in overrides:
+                raw_cfg["max_daily_loss_inr"] = overrides["max_daily_loss_usd"]
+            if "min_order_inr" not in overrides and "min_order" not in overrides and "min_order_usd" in overrides:
+                raw_cfg["min_order_inr"] = overrides["min_order_usd"]
+        elif mkt == "US":
+            if "max_order_usd" not in overrides and "max_order" not in overrides and "max_order_inr" in overrides:
+                raw_cfg["max_order_usd"] = overrides["max_order_inr"]
+            if "max_loss_per_trade_usd" not in overrides and "max_loss_per_trade" not in overrides and "max_loss_per_trade_inr" in overrides:
+                raw_cfg["max_loss_per_trade_usd"] = overrides["max_loss_per_trade_inr"]
+            if "max_daily_loss_usd" not in overrides and "max_daily_loss" not in overrides and "max_daily_loss_inr" in overrides:
+                raw_cfg["max_daily_loss_usd"] = overrides["max_daily_loss_inr"]
+            if "min_order_usd" not in overrides and "min_order" not in overrides and "min_order_inr" in overrides:
+                raw_cfg["min_order_usd"] = overrides["min_order_inr"]
         raw_cfg.update(overrides)
 
     # Validate and resolve

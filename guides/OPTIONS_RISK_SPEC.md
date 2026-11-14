@@ -3,11 +3,12 @@
 ## 1. Safety Principles & Non-Negotiables
 
 1. **Indian Options are Strictly PAPER-ONLY**: Under no circumstances does an Indian option order route to live broker execution.
-2. **Prohibition of Naked Short Options**: Undefined-risk option positions (naked short calls, naked short puts) are strictly prohibited and failed closed by `trader-risk/check.py`.
-3. **Defined-Risk Spreads ONLY**: Any short option position must be part of a defined-risk vertical credit spread with an explicit, verified long protective leg.
-4. **Mandatory Net 2R After STT and Charges**: Indian options are subject to 0.125% STT on sell turnover and high statutory levies. The 2R requirement is calculated strictly on net premium after roundtrip levies.
-5. **Contract Whole Lot Sizing**: All option orders must be sized in exact positive integer multiples of the exchange-mandated contract lot size (e.g., 25 for NIFTY, 15 for BANKNIFTY). Fractional option lots are rejected.
-6. **Expiry Day Circuit Breaker**: New option entries are blocked after 14:30 IST on contract expiry day to protect against rapid pin risk and illiquid expiry spreads.
+2. **Options Execution Status**: All option execution sizing is currently disabled in `trader-budget/size.py` (`SizeError: OPTION RISK UNAVAILABLE`). BUY CE is supported as an analytical signal only (`options_orb` in `trader-entry/entry.py`). BUY PE is currently unsupported in `trader-entry/entry.py`. Defined-risk credit spreads are specification-only and currently unsupported for multi-leg order generation or execution sizing.
+3. **Prohibition of Naked Short Options**: Undefined-risk option positions (naked short calls, naked short puts) are strictly prohibited and failed closed by `trader-risk/check.py`. Any single-leg short option (`side == "sell"`) is rejected unconditionally.
+4. **Defined-Risk Spreads ONLY (Specification)**: When multi-leg spread execution is implemented in future releases, any short option position must be part of a defined-risk vertical credit spread with an explicit, verified long protective leg. Currently multi-leg spread execution is unsupported.
+5. **Mandatory Net 2R After STT and Charges**: Indian options are subject to 0.125% STT on sell turnover and high statutory levies. The 2R requirement is calculated strictly on net premium after roundtrip levies.
+6. **Contract Whole Lot Sizing**: All option orders must be sized in exact positive integer multiples of the exchange-mandated contract lot size (e.g., 25 for NIFTY, 15 for BANKNIFTY). Fractional option lots are rejected.
+7. **Expiry Day Circuit Breaker**: New option entries are blocked after 14:30 IST on contract expiry day to protect against rapid pin risk and illiquid expiry spreads.
 
 ---
 
@@ -53,22 +54,25 @@ Every options analysis or proposal must resolve to one of seven explicit, unambi
 
 ---
 
-## 3. Allowed Option Strategies
+## 3. Option Strategies & Status
 
-### A. Long Call (BUY CE)
+### A. Long Call (BUY CE) [Analytical Signal Only]
+- **Status**: Analytical signal implemented via `options_orb` in `trader-entry/entry.py`. Order execution sizing disabled in `trader-budget/size.py`.
 - **Outlook**: Bullish breakout or momentum continuation.
 - **Strike Selection**: ATM (At-The-Money) or Delta $0.45 - 0.55$.
 - **Risk**: Max loss strictly capped at premium paid $\times$ lot size.
 - **Stop**: Technical invalidation on underlying mapped to premium stop (or fixed $20\%-25\%$ premium stop).
 - **Target**: Minimum 2.0R Net reward.
 
-### B. Long Put (BUY PE)
+### B. Long Put (BUY PE) [Unsupported]
+- **Status**: Currently unsupported in `trader-entry/entry.py` (line 2140: "only bullish BUY CE setup signals are implemented; BUY PE, SELL CE and SELL PE are unsupported").
 - **Outlook**: Bearish breakdown or VWAP rejection.
 - **Strike Selection**: ATM (At-The-Money) or Delta $-0.45$ to $-0.55$.
 - **Risk**: Max loss strictly capped at premium paid $\times$ lot size.
 - **Stop**: Invalidation above breakdown level or premium stop.
 
-### C. Bear Call Credit Spread (SELL CE with Long Protective CE)
+### C. Bear Call Credit Spread (SELL CE with Long Protective CE) [Unsupported for Execution]
+- **Status**: Specification only; multi-leg credit spread execution structure is currently unsupported. Naked short calls are prohibited.
 - **Outlook**: Bearish to Neutral.
 - **Structure**:
   - Sell Strike $K_1$ (lower strike, higher premium).
@@ -76,7 +80,8 @@ Every options analysis or proposal must resolve to one of seven explicit, unambi
 - **Max Loss**: $(K_2 - K_1 - \text{Net Credit}) \times \text{Lot Size} + \text{Charges}$.
 - **Safety Gate**: Long leg must be validated and executed simultaneously or prior to short leg.
 
-### D. Bull Put Credit Spread (SELL PE with Long Protective PE)
+### D. Bull Put Credit Spread (SELL PE with Long Protective PE) [Unsupported for Execution]
+- **Status**: Specification only; multi-leg credit spread execution structure is currently unsupported. Naked short puts are prohibited.
 - **Outlook**: Bullish to Neutral.
 - **Structure**:
   - Sell Strike $K_2$ (higher strike, higher premium).

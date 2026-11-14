@@ -1601,15 +1601,17 @@ def symbols_from_file(path):
     return out
 
 
-def read_config(path):
-    if not path or not os.path.exists(path):
-        return {}
+def read_config(path=None, market=None):
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
     try:
-        with open(path, encoding="utf-8") as fh:
-            cfg = json.load(fh)
-    except ValueError as e:
-        raise ScanError("%s is not valid JSON: %s" % (path, e))
-    return cfg if isinstance(cfg, dict) else {}
+        from config.loader import load_config as central_load_config, ConfigError
+        return central_load_config(path=path, market=market)
+    except ConfigError as err:
+        raise ScanError(str(err))
+    except Exception as err:
+        raise ScanError("Failed to load config: %s" % err)
 
 
 def write_json(path, doc):
@@ -1829,7 +1831,7 @@ def cmd_orb(a):
     market = get_market_profile(a)
     now = parse_now(a.now, market="IN") if market == "IN" else parse_now(a.now)
     at = (parse_hhmm(a.at, "--at", market="IN") if market == "IN" else parse_hhmm(a.at)) if a.at else None
-    cfg = read_config(a.config)
+    cfg = read_config(a.config, market=market)
     default_until = "15:00" if market == "IN" else "15:30"
     until_str = a.until or cfg.get("no_entries_after") or default_until
     until = parse_hhmm(until_str, "--until", market="IN") if market == "IN" else parse_hhmm(until_str, "--until")

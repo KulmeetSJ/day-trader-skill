@@ -100,6 +100,9 @@ INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 INTRADAY_DECISION_SETUPS = (
     "breakout_intraday",
     "vwap_reclaim",
+    "vwap_rejection",
+    "pullback",
+    "reversal",
     "ema_alignment",
     "ma_crossover",
     "trend",
@@ -957,25 +960,21 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
 
 # ---------------------------------------------------------------- the rule
 
-def read_config(path, market="US"):
-    cfg = dict(DEFAULTS_IN if market == "IN" else DEFAULTS)
-    if path and os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-        except ValueError as e:
-            raise EntryError("%s is not valid JSON: %s" % (path, e))
-        if isinstance(doc, dict):
-            for k, v in doc.items():
-                if k in DEFAULTS:
-                    if v:
-                        cfg[k] = v
-                elif v is not None:
-                    cfg[k] = v
-            if str(doc.get("market", "")).upper() in ("IN", "INDIA"):
-                cfg["market"] = "IN"
-    for k in DEFAULTS:
-        parse_hhmm(cfg[k], k, market=market)
+def read_config(path=None, market="US"):
+    _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    try:
+        from config.loader import load_config as central_load_config, ConfigError
+        cfg = central_load_config(path=path, market=market)
+    except ConfigError as err:
+        raise EntryError(str(err))
+    except Exception as err:
+        raise EntryError("Failed to load config: %s" % err)
+
+    for k in ("no_entries_before", "no_entries_after"):
+        if k in cfg and cfg[k]:
+            parse_hhmm(cfg[k], k, market=market)
     return cfg
 
 
@@ -1659,6 +1658,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
                               max_chase_pct=None, max_chase_atr=None):
     """Assign ENTRY CONFIRMED / ENTRY CANDIDATE / SETUP / NO TRADE + anti-chasing & R:R preview."""
     tick = _tick_step(market, tick_size=eff_tick)
+    is_short = (setup == "vwap_rejection")
     cctx = _build_candle_context(bars, pending, chart, market=market, eff_tick=eff_tick, explicit_tick=explicit_tick)
     res["candle_context"] = cctx
     if indicators:
@@ -1682,11 +1682,11 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
 
     anchor = None
     if trig is not None:
-        if setup in ("rsi_momentum", "ma_crossover", "trend"):
+        if setup in ("rsi_momentum", "ma_crossover", "trend", "vwap_rejection"):
             anchor = float(trig["c"])
         else:
             anchor = float(lvl) if _is_finite_pos(lvl) else float(trig["c"])
-    elif _is_finite_pos(lvl) and setup not in ("rsi_momentum", "ma_crossover", "trend"):
+    elif _is_finite_pos(lvl) and setup not in ("rsi_momentum", "ma_crossover", "trend", "vwap_rejection"):
         anchor = float(lvl)
 
     zone = None
@@ -1694,14 +1694,18 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         pct_tol = anchor * (chase_pct_lim / 100.0)
         atr_tol = (atr_val * chase_atr_lim) if (atr_val is not None) else pct_tol
         tol = max(2.0 * tick, min(pct_tol, atr_tol))
-        z_low = _floor_tick(max(tick, anchor - 0.25 * tol), tick=tick)
-        z_high = _round_tick(anchor + tol, tick=tick)
+        if is_short:
+            z_high = _round_tick(anchor + 0.25 * tol, tick=tick)
+            z_low = _floor_tick(max(tick, anchor - tol), tick=tick)
+        else:
+            z_low = _floor_tick(max(tick, anchor - 0.25 * tol), tick=tick)
+            z_high = _round_tick(anchor + tol, tick=tick)
         if z_high <= z_low:
             z_high = _round_tick(z_low + 2.0 * tick, tick=tick)
         zone = {"low": z_low, "high": z_high, "anchor": _tick_fmt(anchor, market, eff_tick, explicit_tick)}
     stale_detached_zone = False
     if trig is not None and zone is not None:
-        z_gap = float(trig["c"]) - float(zone["high"])
+        z_gap = (float(zone["low"]) - float(trig["c"])) if is_short else (float(trig["c"]) - float(zone["high"]))
         if z_gap > 0:
             pct_gap_lim = float(trig["c"]) * 0.03
             atr_gap_lim = (atr_val * 5.0) if atr_val is not None else pct_gap_lim
@@ -1716,13 +1720,26 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     inv_level = res.get("invalidation_level")
     inv_rule = "existing_setup_invalidation" if inv_level is not None else None
     if inv_level is None and trig is not None:
-        inv_anchor = min(float(trig["l"]), float(lvl) if lvl is not None else float(trig["l"]))
-        inv_level = _floor_tick(inv_anchor, tick=tick)
-        if inv_level >= float(trig["c"]):
-            inv_level = _floor_tick(float(trig["c"]) - tick, tick=tick)
-        if inv_level > 0:
-            res["invalidation_level"] = inv_level
+        if is_short:
+            inv_anchor = max(float(trig["h"]), float(lvl) if lvl is not None else float(trig["h"]))
+            inv_level = _ceil_tick(inv_anchor + tick, tick=tick)
+            inv_rule = "rejection_high_or_vwap"
+        elif setup == "pullback":
+            inv_anchor = min(float(trig["l"]), float(bars[trig["slot"] - 1]["l"]) if trig["slot"] > 0 else float(trig["l"]))
+            inv_level = _floor_tick(inv_anchor - tick, tick=tick)
+            inv_rule = "pullback_pivot_low"
+        elif setup == "reversal":
+            inv_anchor = min(float(trig["l"]), float(bars[trig["slot"] - 1]["l"]) if trig["slot"] > 0 else float(trig["l"]))
+            inv_level = _floor_tick(inv_anchor - tick, tick=tick)
+            inv_rule = "exhaustion_low"
+        else:
+            inv_anchor = min(float(trig["l"]), float(lvl) if lvl is not None else float(trig["l"]))
+            inv_level = _floor_tick(inv_anchor, tick=tick)
+            if inv_level >= float(trig["c"]):
+                inv_level = _floor_tick(float(trig["c"]) - tick, tick=tick)
             inv_rule = "trigger_bar_low_or_level"
+        if inv_level and inv_level > 0:
+            res["invalidation_level"] = inv_level
     elif inv_level is None and anchor is not None:
         ema21_v = (indicators or {}).get("ema21")
         vwap_v = (indicators or {}).get("vwap")
@@ -1741,15 +1758,23 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     invalidated_bar = None
     if trig is not None and inv_level is not None:
         for b in bars:
-            if b["slot"] > trig["slot"] and float(b["c"]) < float(inv_level):
-                invalidated_bar = b
-                break
-        if invalidated_bar is None and _is_finite_pos(curr_px) and float(curr_px) <= float(inv_level):
-            invalidated_bar = {"et": local, "c": float(curr_px)}
+            if is_short:
+                if b["slot"] > trig["slot"] and float(b["c"]) > float(inv_level):
+                    invalidated_bar = b
+                    break
+            else:
+                if b["slot"] > trig["slot"] and float(b["c"]) < float(inv_level):
+                    invalidated_bar = b
+                    break
+        if invalidated_bar is None and _is_finite_pos(curr_px):
+            if is_short and float(curr_px) >= float(inv_level):
+                invalidated_bar = {"et": local, "c": float(curr_px)}
+            elif not is_short and float(curr_px) <= float(inv_level):
+                invalidated_bar = {"et": local, "c": float(curr_px)}
 
     anti_chase = compute_anti_chasing(
         curr_px, zone, trig=trig, atr_val=atr_val, px_source=px_source,
-        market=market, eff_tick=eff_tick, explicit_tick=explicit_tick, side="buy",
+        market=market, eff_tick=eff_tick, explicit_tick=explicit_tick, side="sell" if is_short else "buy",
     )
     if stale_detached_zone and not anti_chase.get("chase_blocked"):
         anti_chase["chase_blocked"] = True
@@ -1762,7 +1787,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     entry_ref = None
     entry_ref_source = None
     if invalidated_bar is None and not is_non_actionable_window and not stale_detached_zone:
-        if trig is not None and setup in ("breakout_intraday", "breakout_20d", "vwap_reclaim", "ema_alignment"):
+        if trig is not None and setup in ("breakout_intraday", "breakout_20d", "vwap_reclaim", "vwap_rejection", "pullback", "reversal", "ema_alignment"):
             entry_ref = float(trig["c"])
             entry_ref_source = "trigger_close"
         elif trig is not None and _is_finite_pos(curr_px):
@@ -1786,23 +1811,31 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     stop_source = None
     if invalidated_bar is None and _is_finite_pos(entry_ref):
         ref_f = float(entry_ref)
-        if setup in ("orb", "options_orb") and orr:
-            mid_s = _floor_tick((float(orr["high"]) + float(orr["low"])) / 2.0, tick=tick)
-            low_s = _floor_tick(float(orr["low"]), tick=tick)
-            if mid_s < ref_f:
-                stop_cand, stop_source = mid_s, "or_midpoint"
-            elif low_s < ref_f:
-                stop_cand, stop_source = low_s, "or_low"
+        if is_short:
+            if inv_level is not None and float(inv_level) > ref_f:
+                stop_cand, stop_source = float(inv_level), "invalidation_level"
+            elif atr_val is not None:
+                atr_s = _ceil_tick(ref_f + atr_val, tick=tick)
+                if atr_s > ref_f:
+                    stop_cand, stop_source = atr_s, "atr_stop"
+        else:
+            if setup in ("orb", "options_orb") and orr:
+                mid_s = _floor_tick((float(orr["high"]) + float(orr["low"])) / 2.0, tick=tick)
+                low_s = _floor_tick(float(orr["low"]), tick=tick)
+                if mid_s < ref_f:
+                    stop_cand, stop_source = mid_s, "or_midpoint"
+                elif low_s < ref_f:
+                    stop_cand, stop_source = low_s, "or_low"
+                elif inv_level is not None and float(inv_level) < ref_f:
+                    stop_cand, stop_source = float(inv_level), "invalidation_level"
             elif inv_level is not None and float(inv_level) < ref_f:
                 stop_cand, stop_source = float(inv_level), "invalidation_level"
-        elif inv_level is not None and float(inv_level) < ref_f:
-            stop_cand, stop_source = float(inv_level), "invalidation_level"
-        elif atr_val is not None:
-            atr_s = _floor_tick(max(tick, ref_f - atr_val), tick=tick)
-            if atr_s < ref_f:
-                stop_cand, stop_source = atr_s, "atr_stop"
+            elif atr_val is not None:
+                atr_s = _floor_tick(max(tick, ref_f - atr_val), tick=tick)
+                if atr_s < ref_f:
+                    stop_cand, stop_source = atr_s, "atr_stop"
 
-    plan = compute_risk_reward_plan(entry_ref, stop_cand, side="buy", tick=tick) if (
+    plan = compute_risk_reward_plan(entry_ref, stop_cand, side="sell" if is_short else "buy", tick=tick) if (
         invalidated_bar is None and entry_ref is not None and stop_cand is not None
     ) else None
     if plan is not None:
@@ -1870,11 +1903,11 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     risk_plan_valid = bool(
         plan is not None
         and math.isfinite(planned_entry) and planned_entry > 0
-        and math.isfinite(planned_stop) and 0 < planned_stop < planned_entry
+        and math.isfinite(planned_stop) and ((0 < planned_entry < planned_stop) if is_short else (0 < planned_stop < planned_entry))
         and math.isfinite(planned_risk) and planned_risk > 0
-        and math.isclose(planned_risk, planned_entry - planned_stop, rel_tol=1e-9, abs_tol=tick / 2.0)
+        and math.isclose(planned_risk, (planned_stop - planned_entry) if is_short else (planned_entry - planned_stop), rel_tol=1e-9, abs_tol=tick / 2.0)
         and isinstance(targets_preview, dict)
-        and math.isfinite(planned_t1) and planned_entry < planned_t1 < planned_t2
+        and math.isfinite(planned_t1) and ((planned_t2 < planned_t1 < planned_entry) if is_short else (planned_entry < planned_t1 < planned_t2))
         and math.isfinite(planned_t2)
         and math.isfinite(planned_t1_r) and planned_t1_r > 0
         and math.isfinite(planned_t2_r) and planned_t2_r > 0
@@ -1930,7 +1963,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         d_state = "NO TRADE"
         sub_state = res.get("option_contract_sub_state") or "NO_LISTED_FO_CONTRACT"
         no_trade_reason = res.get("option_contract_unavailable_reason") or "UNAVAILABLE -- NO LISTED F&O CONTRACT"
-    elif res.get("status") == "no-data" or (setup == "vwap_reclaim" and (indicators or {}).get("vwap_unavailable")):
+    elif res.get("status") == "no-data" or (setup in ("vwap_reclaim", "vwap_rejection") and (indicators or {}).get("vwap_unavailable")):
         d_state = "NO TRADE"
         sub_state = "STALE_DATA" if data_status == "stale" else "NO_DATA"
         no_trade_reason = res.get("reason") or "required market data unavailable"
@@ -1965,11 +1998,18 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
             d_state = "NO TRADE"
             sub_state = "EXTENDED"
             if zone is not None:
-                no_trade_reason = (
-                    "do not chase: triggered at %s (%.2f), current price %.2f is +%s%% above entry zone upper bound %.2f"
-                    % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px),
-                       ext_pct if ext_pct is not None else 0.0, float(zone["high"]))
-                )
+                if is_short:
+                    no_trade_reason = (
+                        "do not chase: triggered at %s (%.2f), current price %.2f is -%s%% below entry zone lower bound %.2f"
+                        % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px),
+                           ext_pct if ext_pct is not None else 0.0, float(zone["low"]))
+                    )
+                else:
+                    no_trade_reason = (
+                        "do not chase: triggered at %s (%.2f), current price %.2f is +%s%% above entry zone upper bound %.2f"
+                        % (trig["et"].strftime("%H:%M"), float(trig["c"]), float(curr_px),
+                           ext_pct if ext_pct is not None else 0.0, float(zone["high"]))
+                    )
             else:
                 no_trade_reason = (
                     "do not chase: triggered at %s (%.2f), current price %.2f is extended past actionable range"
@@ -2265,10 +2305,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         setup = "breakout_intraday"
     elif setup in ("trend_continuation", "continuation"):
         setup = "trend"
-    elif setup in ("pullback", "vwap_pullback"):
-        setup = "vwap_reclaim"
-    elif setup in ("reversal", "exhaustion_reversal"):
-        setup = "rsi_momentum"
+    elif setup == "vwap_pullback":
+        setup = "pullback"
+    elif setup == "exhaustion_reversal":
+        setup = "reversal"
     elif setup == "momentum":
         setup = "rsi_momentum"
     if interval not in INTERVALS:
@@ -2281,7 +2321,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
     valid_setups = (
         "orb", "level", "breakout_20d", "breakout_intraday",
-        "vwap_reclaim", "ema_alignment", "ma_crossover", "trend",
+        "vwap_reclaim", "vwap_rejection", "pullback", "reversal",
+        "ema_alignment", "ma_crossover", "trend",
         "rsi_momentum", "options_orb",
     )
     if setup not in valid_setups:
@@ -2301,7 +2342,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     exchange = eff_exch if market == "IN" else "NYSE"
     is_clock_override = bool(simulated or chart.get("clock_override"))
     is_sim_run = bool(simulated or chart.get("clock_override") or chart.get("simulated_at"))
-    res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
+    res = {"symbol": chart["symbol"], "setup": setup, "side": "sell" if setup == "vwap_rejection" else "buy", "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
@@ -2705,8 +2746,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         lvl = float(level)
     elif setup == "breakout_20d":
         lvl = float(b20["breakout_level"])
-    elif setup == "vwap_reclaim":
+    elif setup in ("vwap_reclaim", "vwap_rejection"):
         lvl = float(vwap_s[-1]) if (vwap_s and vwap_s[-1] is not None) else None
+    elif setup == "pullback":
+        lvl = float(ema21_s[-1]) if (ema21_s and ema21_s[-1] is not None) else (float(vwap_s[-1]) if (vwap_s and vwap_s[-1] is not None) else None)
+    elif setup == "reversal":
+        lvl = float(bars[-1]["l"]) if bars else None
     elif setup == "ema_alignment":
         lvl = float(ema9_s[-1]) if (ema9_s and ema9_s[-1] is not None) else None
     elif setup == "breakout_intraday":
@@ -2793,6 +2838,80 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 break
         if trig is not None:
             res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "vwap_rejection" and vwap_s is not None:
+        for i in range(1, len(bars)):
+            b = bars[i]
+            vw = vwap_s[i]
+            vw_prev = vwap_s[i - 1]
+            if vw is None or vw_prev is None or b["end"] < before or b["end"] > cutoff:
+                continue
+            approached_from_below = (float(bars[i - 1]["c"]) <= vw_prev * 1.002 or float(b["o"]) <= vw)
+            touched_or_breached = float(b["h"]) >= vw * 0.9995
+            closed_below_vw = float(b["c"]) < vw
+            prior_low = float(bars[i - 1]["l"])
+            prior_open = float(bars[i - 1]["o"])
+            prior_close = float(bars[i - 1]["c"])
+            bearish_candle = float(b["c"]) < float(b["o"]) and (float(b["c"]) < prior_low or float(b["c"]) < prior_open or float(b["c"]) < prior_close)
+            if approached_from_below and touched_or_breached and closed_below_vw and bearish_candle:
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = vw
+                break
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "pullback":
+        for i in range(1, len(bars)):
+            b = bars[i]
+            e9 = ema9_s[i] if (ema9_s and i < len(ema9_s)) else None
+            e21 = ema21_s[i] if (ema21_s and i < len(ema21_s)) else None
+            vw = vwap_s[i] if (vwap_s and i < len(vwap_s)) else None
+            if e9 is None or e21 is None or b["end"] < before or b["end"] > cutoff:
+                continue
+            uptrend = (e9 > e21) and (float(bars[i - 1]["c"]) >= e21 * 0.998)
+            support_level = max(float(e21), float(vw) if vw else float(e21))
+            dipped_to_support = float(b["l"]) <= support_level * 1.002 or float(b["l"]) <= float(e9) * 1.002
+            bullish_hold = (float(b["c"]) > float(b["o"])) and (float(b["c"]) > support_level) and (float(b["c"]) >= (float(b["h"]) + float(b["l"])) / 2.0)
+            if uptrend and dipped_to_support and bullish_hold:
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = support_level
+                break
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "reversal":
+        for i in range(1, len(bars)):
+            b = bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            prev_b = bars[i - 1]
+            r_prev = rsi_val(all_closes[:off + i]) if (all_closes and (off + i) >= 15) else None
+            ref_v = _rolling_avg_vol(bars, i) or avg_vol
+            oversold_rsi = (r_prev is not None and float(r_prev) <= 38.0)
+            vol_exhaustion = bool(ref_v and prev_b["v"] >= 1.6 * ref_v and float(prev_b["c"]) < float(prev_b["o"]))
+            consec_down = (i >= 3 and all(float(bars[k]["c"]) < float(bars[k]["o"]) for k in range(i - 3, i)))
+            exhaustion = oversold_rsi or vol_exhaustion or consec_down
+
+            green_candle = float(b["c"]) > float(b["o"])
+            engulfs_or_reclaims = float(b["c"]) > float(prev_b["c"]) and float(b["c"]) >= (float(prev_b["o"]) + float(prev_b["c"])) / 2.0
+            strong_close = float(b["c"]) >= float(b["l"]) + 0.5 * (float(b["h"]) - float(b["l"]))
+            if exhaustion and green_candle and engulfs_or_reclaims and strong_close:
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = float(prev_b["l"])
+                break
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
     elif setup == "ema_alignment":
         for i in range(1, len(bars)):
             b = bars[i]
@@ -2867,6 +2986,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             trig_reason = "the %s bar closed above intraday resistance %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "vwap_reclaim":
             trig_reason = "the %s bar reclaimed session VWAP (%s%.2f) closing at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "vwap_rejection":
+            trig_reason = "the %s bar rejected session VWAP (%s%.2f) closing below at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "pullback":
+            trig_reason = "the %s bar completed bullish pullback holding support %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "reversal":
+            trig_reason = "the %s bar confirmed bullish exhaustion reversal above %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "ema_alignment":
             trig_reason = "the %s bar confirmed bullish EMA alignment above %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "rsi_momentum":
@@ -2991,6 +3116,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         what = "close above intraday resistance %s%.2f" % (curr, lvl) if lvl is not None else "form intraday resistance breakout"
     elif setup == "vwap_reclaim":
         what = "reclaim session VWAP %s%.2f" % (curr, lvl) if lvl is not None else "reclaim session VWAP"
+    elif setup == "vwap_rejection":
+        what = "reject session VWAP %s%.2f" % (curr, lvl) if lvl is not None else "reject session VWAP"
+    elif setup == "pullback":
+        what = "hold pullback support %s%.2f" % (curr, lvl) if lvl is not None else "hold pullback support"
+    elif setup == "reversal":
+        what = "confirm bullish reversal above %s%.2f" % (curr, lvl) if lvl is not None else "confirm bullish reversal"
     elif setup == "ema_alignment":
         what = "align close > EMA9 > EMA21"
     elif setup == "rsi_momentum":
@@ -3018,7 +3149,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
         )
     res["phase"] = "open"
-    if setup == "vwap_reclaim" and ind_snapshot.get("vwap_unavailable"):
+    if setup in ("vwap_reclaim", "vwap_rejection") and ind_snapshot.get("vwap_unavailable"):
         res["reason"] = "session VWAP unavailable (zero volume / spot index)"
     elif lvl is not None and last["c"] > lvl and last in thin:
         res["reason"] = ("the %s bar closed above at %s%.2f but on %.2fx the %s volume, under your %.2fx" % (
@@ -3083,7 +3214,7 @@ def entry_doc(res, now_utc):
         sym = sym.split(".")[0]
     provider_name = res.get("provider") or "yahoo"
     doc_source = "yahoo" if (provider_name == "offline" or res.get("market") != "IN") else provider_name
-    doc = {"created_by": "trader-entry", "symbol": sym, "setup": res["setup"], "side": "buy",
+    doc = {"created_by": "trader-entry", "symbol": sym, "setup": res["setup"], "side": res.get("side", "buy"),
            "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
            "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
            "interval": res["interval"],
@@ -3187,6 +3318,12 @@ def setup_name(res):
         return "intraday breakout"
     if res["setup"] == "vwap_reclaim":
         return "VWAP reclaim (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "VWAP reclaim"
+    if res["setup"] == "vwap_rejection":
+        return "VWAP rejection (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "VWAP rejection"
+    if res["setup"] == "pullback":
+        return "Pullback to support (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "Pullback to support"
+    if res["setup"] == "reversal":
+        return "Exhaustion reversal (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "Exhaustion reversal"
     if res["setup"] == "ema_alignment":
         return "EMA alignment (EMA9 > EMA21)"
     if res["setup"] == "ma_crossover":
@@ -3546,7 +3683,7 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 # ---------------------------------------------------------------- commands
 
 def _opts(a, cfg):
-    if a.side in ("sell", "short"):
+    if a.side in ("sell", "short") and getattr(a, "setup", None) != "vwap_rejection":
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
     if a.setup in ("orb", "options_orb", "breakout_20d") and a.level is not None:
         if a.setup == "breakout_20d":
