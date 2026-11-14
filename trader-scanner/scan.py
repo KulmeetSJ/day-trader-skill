@@ -2698,6 +2698,7 @@ def scan_intraday(symbols, now_utc, strategies=None, interval="5m", range_str=No
                 "decision_state": d_state,
                 "sub_state": sub_state,
                 "actionable": bool(dec.get("actionable")),
+                "side": res.get("side", "buy"),
                 "status": res.get("status"),
                 "price": dec.get("current_price") if dec.get("current_price") is not None else last_px,
                 "level": res.get("level"),

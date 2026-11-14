@@ -73,6 +73,7 @@ The tools need Python 3.8 or newer. Nothing to pip install. Standard library onl
 | `/trader-alerts` | Price Alerts | Rings when a price, stop, target, or closing time (15:20 IST / 15:55 ET) hits. |
 | `/trader-analyst` | Earnings Analyst | Reads corporate filings and financial reports and sums up what changed. |
 | `/trader-pelosi` | Smart Money / Disclosures | Reads institutional, insider and regulatory trading disclosures. |
+| `/trader-options` | Options Intelligence | Evaluates, models, and ranks directional and non-directional options setups (BUY CE, BUY PE, SELL CE, SELL PE, Spreads) for Indian indices and F&O equities. |
 
 ## How to use it
 
@@ -731,6 +732,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-options/     SKILL.md, options.py, orchestrator.py, replay.py
 tests/              unittest suite + offline fixtures
 ```
 

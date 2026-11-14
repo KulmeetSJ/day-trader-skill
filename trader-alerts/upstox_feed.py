@@ -8,6 +8,7 @@ bearer tokens or authorized WSS signatures in errors or state.
 """
 
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -466,10 +467,11 @@ def normalize_feed_message(raw_message: Any) -> Dict[str, Any]:
         ltpc = entry.get("ltpc")
         full = entry.get("fullFeed")
         flwg = entry.get("firstLevelWithGreeks")
-        if not ltpc and isinstance(full, dict) and full:
+        if isinstance(full, dict) and full:
             mff = full.get("marketFF") or {}
             iff = full.get("indexFF") or {}
-            ltpc = mff.get("ltpc") or iff.get("ltpc")
+            if not ltpc:
+                ltpc = mff.get("ltpc") or iff.get("ltpc")
             if mff:
                 if mff.get("atp") is not None:
                     flat["atp"] = mff["atp"]
@@ -491,16 +493,21 @@ def normalize_feed_message(raw_message: Any) -> Dict[str, Any]:
                     if quotes:
                         flat["bid"] = quotes[0].get("bidP")
                         flat["ask"] = quotes[0].get("askP")
+                        flat["bid_qty"] = quotes[0].get("bidQ")
+                        flat["ask_qty"] = quotes[0].get("askQ")
                 if mff.get("marketOHLC"):
                     flat["ohlc"] = (mff["marketOHLC"] or {}).get("ohlc") or []
             elif iff and iff.get("marketOHLC"):
                 flat["ohlc"] = (iff["marketOHLC"] or {}).get("ohlc") or []
-        elif not ltpc and isinstance(flwg, dict) and flwg:
-            ltpc = flwg.get("ltpc")
+        elif isinstance(flwg, dict) and flwg:
+            if not ltpc:
+                ltpc = flwg.get("ltpc")
             if flwg.get("firstDepth"):
                 flat["depth"] = [flwg["firstDepth"]]
                 flat["bid"] = flwg["firstDepth"].get("bidP")
                 flat["ask"] = flwg["firstDepth"].get("askP")
+                flat["bid_qty"] = flwg["firstDepth"].get("bidQ")
+                flat["ask_qty"] = flwg["firstDepth"].get("askQ")
             if flwg.get("optionGreeks"):
                 flat["greeks"] = flwg["optionGreeks"]
             if flwg.get("vtt") is not None:
@@ -519,6 +526,31 @@ def normalize_feed_message(raw_message: Any) -> Dict[str, Any]:
                 flat["ltq"] = int(ltpc["ltq"])
             if ltpc.get("ltt") is not None:
                 flat["ltt"] = int(ltpc["ltt"])
+
+        # Feed & Exchange Timestamps (Requirement 2 & 4: never treat receipt time as exchange time)
+        curr_ts = decoded.get("currentTs")
+        if curr_ts is not None:
+            try:
+                flat["feed_timestamp"] = int(curr_ts)
+            except (ValueError, TypeError):
+                pass
+
+        exch_epoch_ms = flat.get("ltt")
+        if exch_epoch_ms is None:
+            exch_epoch_ms = flat.get("feed_timestamp")
+
+        if exch_epoch_ms is not None:
+            try:
+                dt_exch = datetime.datetime.fromtimestamp(float(exch_epoch_ms) / 1000.0, tz=datetime.timezone.utc)
+                flat["exchange_timestamp"] = dt_exch.isoformat()
+                flat["quote_timestamp"] = dt_exch.isoformat()
+            except (ValueError, OSError, OverflowError):
+                flat["exchange_timestamp"] = None
+                flat["quote_timestamp"] = None
+        else:
+            flat["exchange_timestamp"] = None
+            flat["quote_timestamp"] = None
+
         feeds_out[ikey] = flat
 
     return {
@@ -1150,6 +1182,14 @@ class UpstoxMarketDataStreamer:
             merged = dict(self.last_ticks.get(ikey) or {})
             merged.update(flat)
             merged["received_at"] = now_t
+            try:
+                dt_recv = datetime.datetime.now(datetime.timezone.utc)
+                merged["retrieval_timestamp"] = dt_recv.isoformat()
+            except Exception:
+                pass
+            merged["is_live"] = True
+            merged["tier"] = "REAL_TIME"
+            merged["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
             self.last_ticks[ikey] = merged
         if self.on_message is not None:
             self.on_message(event)
@@ -1256,6 +1296,136 @@ class UpstoxMarketDataStreamer:
             "reconnect_count": self.reconnect_count,
             "subscribed_count": len(self.active_keys()),
             "subscriptions_by_mode": {m: sorted(keys) for m, keys in self._subscriptions.items() if keys},
+        }
+
+    def get_live_quote(
+        self,
+        instrument_key: str,
+        max_age_seconds: float = 30.0,
+        now_dt: Optional[datetime.datetime] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Validate and return verified live WebSocket quote for an instrument key.
+
+        Returns (quote_dict, error_code). Fails closed if:
+        - Feed is not connected
+        - Key is not subscribed
+        - No tick update received
+        - Exchange timestamp is missing or unparsable
+        - Exchange quote is stale (> max_age_seconds)
+        - Exchange quote is in the future (> 5s)
+        - Bid or ask is invalid or zero
+        - Market is crossed (bid >= ask)
+        """
+        if not self.is_connected:
+            return None, "WEBSOCKET_FEED_DISCONNECTED"
+
+        ikey = str(instrument_key or "").strip()
+        if not ikey:
+            return None, "UNCERTAIN_INSTRUMENT_MAPPING"
+
+        if ikey not in self.active_keys():
+            return None, "KEY_NOT_SUBSCRIBED"
+
+        if ikey not in self.last_ticks:
+            return None, "MISSING_TICK_UPDATE"
+
+        tick = dict(self.last_ticks[ikey])
+        raw_quote_ts = tick.get("quote_timestamp") or tick.get("exchange_timestamp")
+        if not raw_quote_ts:
+            return None, "MISSING_QUOTE_TIMESTAMP"
+
+        # Freshness verification
+        ref_dt = now_dt or datetime.datetime.now(datetime.timezone.utc)
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=datetime.timezone.utc)
+
+        try:
+            q_dt = datetime.datetime.fromisoformat(str(raw_quote_ts).replace("Z", "+00:00"))
+            if q_dt.tzinfo is None:
+                q_dt = q_dt.replace(tzinfo=datetime.timezone.utc)
+            age = (ref_dt - q_dt).total_seconds()
+            if age > float(max_age_seconds):
+                return None, "STALE_QUOTE_DATA"
+            if age < -5.0:
+                return None, "FUTURE_QUOTE_TIMESTAMP"
+        except Exception:
+            return None, "UNPARSABLE_QUOTE_TIMESTAMP"
+
+        # Bid/Ask sanity checks
+        bid = tick.get("bid")
+        ask = tick.get("ask")
+        if bid is not None and ask is not None:
+            try:
+                b_val = float(bid)
+                a_val = float(ask)
+                if b_val <= 0.0 or a_val <= 0.0:
+                    return None, "INVALID_BID_ASK"
+                if b_val >= a_val:
+                    return None, "CROSSED_BID_ASK"
+            except (ValueError, TypeError):
+                return None, "INVALID_BID_ASK"
+
+        return tick, None
+
+    def apply_live_quotes(
+        self,
+        option_chain: Any,
+        max_age_seconds: float = 30.0,
+        now_dt: Optional[datetime.datetime] = None,
+    ) -> Dict[str, Any]:
+        """Apply verified live WebSocket quotes to an OptionChain in-place.
+
+        Only updates contracts that satisfy all freshness, connectivity, and
+        bid/ask sanity checks. Other contracts remain untouched as indicative snapshots.
+        """
+        updated_count = 0
+        failed_count = 0
+        errors = {}  # type: Dict[str, str]
+
+        strikes_data = getattr(option_chain, "strikes_data", {}) or {}
+        for strike, legs in strikes_data.items():
+            if not isinstance(legs, dict):
+                continue
+            for leg_type in ("ce", "pe"):
+                contract = legs.get(leg_type)
+                if not isinstance(contract, dict):
+                    continue
+                ikey = contract.get("instrument_key")
+                if not ikey:
+                    continue
+                live_tick, err = self.get_live_quote(ikey, max_age_seconds=max_age_seconds, now_dt=now_dt)
+                if live_tick is not None and err is None:
+                    # Update contract in-place with verified live feed data
+                    if live_tick.get("last_price") is not None:
+                        contract["last_price"] = float(live_tick["last_price"])
+                    if live_tick.get("bid") is not None:
+                        contract["bid"] = float(live_tick["bid"])
+                    if live_tick.get("ask") is not None:
+                        contract["ask"] = float(live_tick["ask"])
+                    if live_tick.get("bid_qty") is not None:
+                        contract["bid_qty"] = int(live_tick["bid_qty"])
+                    if live_tick.get("ask_qty") is not None:
+                        contract["ask_qty"] = int(live_tick["ask_qty"])
+                    if live_tick.get("volume") is not None:
+                        contract["volume"] = int(live_tick["volume"])
+                    if live_tick.get("oi") is not None:
+                        contract["open_interest"] = float(live_tick["oi"])
+                    contract["quote_timestamp"] = live_tick.get("quote_timestamp")
+                    contract["exchange_timestamp"] = live_tick.get("exchange_timestamp")
+                    contract["retrieval_timestamp"] = live_tick.get("retrieval_timestamp")
+                    contract["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
+                    contract["is_live"] = True
+                    contract["tier"] = "REAL_TIME"
+                    contract["data_status"] = "CURRENT"
+                    updated_count += 1
+                else:
+                    errors[ikey] = err or "UNKNOWN_ERROR"
+                    failed_count += 1
+
+        return {
+            "updated_contracts": updated_count,
+            "failed_contracts": failed_count,
+            "errors": errors,
         }
 
     def _close_socket_only(self) -> None:

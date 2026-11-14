@@ -99,6 +99,8 @@ HOSTS = ("query2", "query1")
 INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 INTRADAY_DECISION_SETUPS = (
     "breakout_intraday",
+    "breakdown_intraday",
+    "orb_breakdown",
     "vwap_reclaim",
     "vwap_rejection",
     "pullback",
@@ -936,7 +938,8 @@ def get_chart(sym, interval, day=None, offline=None, today=None, market="US", cf
 
     if not _chart_symbol_matches(ch["symbol"], sym, market=market):
         raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
-    gran = ch["meta"].get("dataGranularity")
+    meta = ch.get("meta")
+    gran = meta.get("dataGranularity") if isinstance(meta, dict) else None
     if gran and gran != interval:
         raise EntryError("%s has %s bars, not %s: use --interval %s" % (sym, gran, interval, gran))
 
@@ -1658,7 +1661,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
                               max_chase_pct=None, max_chase_atr=None):
     """Assign ENTRY CONFIRMED / ENTRY CANDIDATE / SETUP / NO TRADE + anti-chasing & R:R preview."""
     tick = _tick_step(market, tick_size=eff_tick)
-    is_short = (setup == "vwap_rejection")
+    is_short = (setup in ("vwap_rejection", "breakdown_intraday", "orb_breakdown") or str(res.get("side", "")).lower() in ("sell", "short"))
     cctx = _build_candle_context(bars, pending, chart, market=market, eff_tick=eff_tick, explicit_tick=explicit_tick)
     res["candle_context"] = cctx
     if indicators:
@@ -1787,7 +1790,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     entry_ref = None
     entry_ref_source = None
     if invalidated_bar is None and not is_non_actionable_window and not stale_detached_zone:
-        if trig is not None and setup in ("breakout_intraday", "breakout_20d", "vwap_reclaim", "vwap_rejection", "pullback", "reversal", "ema_alignment"):
+        if trig is not None and setup in ("breakout_intraday", "breakdown_intraday", "breakout_20d", "vwap_reclaim", "vwap_rejection", "pullback", "reversal", "ema_alignment", "orb_breakdown"):
             entry_ref = float(trig["c"])
             entry_ref_source = "trigger_close"
         elif trig is not None and _is_finite_pos(curr_px):
@@ -1812,7 +1815,16 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
     if invalidated_bar is None and _is_finite_pos(entry_ref):
         ref_f = float(entry_ref)
         if is_short:
-            if inv_level is not None and float(inv_level) > ref_f:
+            if setup == "orb_breakdown" and orr:
+                mid_s = _ceil_tick((float(orr["high"]) + float(orr["low"])) / 2.0, tick=tick)
+                high_s = _ceil_tick(float(orr["high"]), tick=tick)
+                if mid_s > ref_f:
+                    stop_cand, stop_source = mid_s, "or_midpoint"
+                elif high_s > ref_f:
+                    stop_cand, stop_source = high_s, "or_high"
+                elif inv_level is not None and float(inv_level) > ref_f:
+                    stop_cand, stop_source = float(inv_level), "invalidation_level"
+            elif inv_level is not None and float(inv_level) > ref_f:
                 stop_cand, stop_source = float(inv_level), "invalidation_level"
             elif atr_val is not None:
                 atr_s = _ceil_tick(ref_f + atr_val, tick=tick)
@@ -2320,7 +2332,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
     valid_setups = (
-        "orb", "level", "breakout_20d", "breakout_intraday",
+        "orb", "orb_breakdown", "level", "breakout_20d", "breakout_intraday", "breakdown_intraday",
         "vwap_reclaim", "vwap_rejection", "pullback", "reversal",
         "ema_alignment", "ma_crossover", "trend",
         "rsi_momentum", "options_orb",
@@ -2329,8 +2341,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         raise EntryError("--setup is %s" % ", ".join(valid_setups))
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
-    if setup == "breakout_intraday" and int(lookback_bars or 0) < 2:
-        raise EntryError("--lookback-bars must be >= 2 for breakout_intraday")
+    if setup in ("breakout_intraday", "breakdown_intraday") and int(lookback_bars or 0) < 2:
+        raise EntryError("--lookback-bars must be >= 2 for %s" % setup)
     n_or = or_minutes * 60 // step
     local = to_local(now_utc, market=market)
     day = local.date()
@@ -2342,7 +2354,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     exchange = eff_exch if market == "IN" else "NYSE"
     is_clock_override = bool(simulated or chart.get("clock_override"))
     is_sim_run = bool(simulated or chart.get("clock_override") or chart.get("simulated_at"))
-    res = {"symbol": chart["symbol"], "setup": setup, "side": "sell" if setup == "vwap_rejection" else "buy", "date": day.isoformat(),
+    res = {"symbol": chart["symbol"], "setup": setup, "side": "sell" if setup in ("vwap_rejection", "breakdown_intraday", "orb_breakdown") else "buy", "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
@@ -2698,7 +2710,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             instruments_path=instruments_path, cfg=cfg, strike_selection=strike_selection, fetch_chain=False,
             option_strategy=option_strategy,
         )
-    if setup in ("orb", "options_orb"):
+    if setup in ("orb", "options_orb", "orb_breakdown"):
         if not replay_full_session and local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
@@ -2741,7 +2753,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 is_simulated, session_is_open, replay_full_session, cutoff,
                 max_chase_pct=max_chase_pct, max_chase_atr=max_chase_atr,
             )
-        lvl = max(b["h"] for b in or_bars)
+        lvl = min(b["l"] for b in or_bars) if setup == "orb_breakdown" else max(b["h"] for b in or_bars)
     elif setup == "level":
         lvl = float(level)
     elif setup == "breakout_20d":
@@ -2761,13 +2773,20 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             lvl = max(float(x["h"]) for x in win) if win else float(bars[-1]["h"])
         else:
             lvl = None
+    elif setup == "breakdown_intraday":
+        lb_req = max(2, int(lookback_bars or 12))
+        if len(bars) >= 3:
+            win = bars[max(0, len(bars) - lb_req - 1):-1]
+            lvl = min(float(x["l"]) for x in win) if win else float(bars[-1]["l"])
+        else:
+            lvl = None
     elif setup in ("rsi_momentum", "ma_crossover", "trend"):
         lvl = None
     else:
         lvl = float(chart.get("prev_close") or (bars[0]["c"] if bars else 100.0))
     res["level"] = (_round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)) if lvl is not None else None
 
-    first_slot = n_or if setup in ("orb", "options_orb") else 0
+    first_slot = n_or if setup in ("orb", "options_orb", "orb_breakdown") else 0
     trig, thin = None, []
 
     if setup in ("orb", "level", "options_orb"):
@@ -2776,6 +2795,18 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 continue
             if b["c"] > lvl:
                 ref_v = avg_vol if setup in ("orb", "options_orb") else (_rolling_avg_vol(bars, i) or avg_vol)
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                break
+    elif setup == "orb_breakdown":
+        for i, b in enumerate(bars):
+            if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
+                continue
+            if b["c"] < lvl:
+                ref_v = avg_vol
                 vx = (b["v"] / ref_v) if ref_v else None
                 if min_volume_x and (vx is None or vx < min_volume_x):
                     thin.append(b)
@@ -2812,6 +2843,26 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                     continue
                 trig = b
                 lvl = win_hi
+                break
+        if trig is not None:
+            res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
+    elif setup == "breakdown_intraday":
+        lb_req = max(2, int(lookback_bars or 12))
+        for i in range(2, len(bars)):
+            b = bars[i]
+            if b["end"] < before or b["end"] > cutoff:
+                continue
+            prior_win = bars[max(0, i - lb_req):i]
+            win_lo = min(float(x["l"]) for x in prior_win)
+            prev_c = float(bars[i - 1]["c"])
+            if float(b["c"]) < win_lo and prev_c >= win_lo:
+                ref_v = _rolling_avg_vol(bars, i) or avg_vol
+                vx = (b["v"] / ref_v) if ref_v else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    continue
+                trig = b
+                lvl = win_lo
                 break
         if trig is not None:
             res["level"] = _round_tick(lvl, eff_tick) if explicit_tick else r2(lvl)
@@ -2977,13 +3028,17 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if trig:
         trig_i = bars.index(trig) if trig in bars else max(0, len(bars) - 1)
-        ref_v = avg_vol if setup in ("orb", "options_orb") else (_rolling_avg_vol(bars, trig_i) or avg_vol)
+        ref_v = avg_vol if setup in ("orb", "options_orb", "orb_breakdown") else (_rolling_avg_vol(bars, trig_i) or avg_vol)
         vx = (trig["v"] / ref_v) if ref_v else None
         pct_over = r2(100.0 * (trig["c"] / lvl - 1)) if (lvl and lvl > 0) else 0.0
         if setup == "breakout_20d":
             trig_reason = "the %s bar closed above 20-day breakout level %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "breakout_intraday":
             trig_reason = "the %s bar closed above intraday resistance %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "breakdown_intraday":
+            trig_reason = "the %s bar closed below intraday support %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
+        elif setup == "orb_breakdown":
+            trig_reason = "the %s bar closed below opening range low %s%.2f at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "vwap_reclaim":
             trig_reason = "the %s bar reclaimed session VWAP (%s%.2f) closing at %s%.2f" % (short(trig["et"]), curr, lvl, curr, trig["c"])
         elif setup == "vwap_rejection":
@@ -3110,10 +3165,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         )
     if setup == "orb":
         what = "close above the range high %s%.2f" % (curr, lvl)
+    elif setup == "orb_breakdown":
+        what = "close below the range low %s%.2f" % (curr, lvl) if lvl is not None else "form opening-range breakdown"
     elif setup == "breakout_20d":
         what = "confirm breakout_20d with a completed close above %s%.2f" % (curr, lvl)
     elif setup == "breakout_intraday":
         what = "close above intraday resistance %s%.2f" % (curr, lvl) if lvl is not None else "form intraday resistance breakout"
+    elif setup == "breakdown_intraday":
+        what = "close below intraday support %s%.2f" % (curr, lvl) if lvl is not None else "form intraday support breakdown"
     elif setup == "vwap_reclaim":
         what = "reclaim session VWAP %s%.2f" % (curr, lvl) if lvl is not None else "reclaim session VWAP"
     elif setup == "vwap_rejection":
@@ -3176,10 +3235,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res["reason"] = "last close %s%.2f (%s bar), building intraday %s structure (%d closed bars)" % (
             curr, last["c"], short(last["et"]), setup, len(bars))
     else:
-        gap = lvl - last["c"]
+        gap = (last["c"] - lvl) if (setup in ("vwap_rejection", "breakdown_intraday", "orb_breakdown")) else (lvl - last["c"])
+        target_label = ("the range high %s%.2f" % (curr, lvl)) if setup == "orb" else (
+            ("the range low %s%.2f" % (curr, lvl)) if setup == "orb_breakdown" else ("the level %s%.2f" % (curr, lvl))
+        )
         res["reason"] = ("last close %s%.2f (%s bar), %s%.2f %s %s (%+.2f%%)" % (
-            curr, last["c"], short(last["et"]), curr, abs(gap), "under" if gap >= 0 else "over",
-            ("the range high %s%.2f" % (curr, lvl)) if setup == "orb" else ("the level %s%.2f" % (curr, lvl)),
+            curr, last["c"], short(last["et"]), curr, abs(gap),
+            ("over" if gap >= 0 else "under") if setup in ("vwap_rejection", "breakdown_intraday", "orb_breakdown") else ("under" if gap >= 0 else "over"),
+            target_label,
             100.0 * (last["c"] / lvl - 1)))
     if setup == "breakout_20d":
         res["signal_freshness"] = _breakout_signal_freshness(
@@ -3308,6 +3371,8 @@ def setup_name(res):
     curr = "\u20b9" if res.get("market") == "IN" else "$"
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
+    if res["setup"] == "orb_breakdown":
+        return "opening-range breakdown (%d-minute range)" % res["or_minutes"]
     if res["setup"] == "breakout_20d":
         if res.get("breakout_level") is not None:
             return "20-day breakout (close above %s%.2f)" % (curr, res["breakout_level"])
@@ -3316,6 +3381,10 @@ def setup_name(res):
         if res.get("level") is not None:
             return "intraday breakout (close above %s%.2f)" % (curr, res["level"])
         return "intraday breakout"
+    if res["setup"] == "breakdown_intraday":
+        if res.get("level") is not None:
+            return "intraday breakdown (close below %s%.2f)" % (curr, res["level"])
+        return "intraday breakdown"
     if res["setup"] == "vwap_reclaim":
         return "VWAP reclaim (%s%.2f)" % (curr, res["level"]) if res.get("level") is not None else "VWAP reclaim"
     if res["setup"] == "vwap_rejection":
@@ -3683,12 +3752,12 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 # ---------------------------------------------------------------- commands
 
 def _opts(a, cfg):
-    if a.side in ("sell", "short") and getattr(a, "setup", None) != "vwap_rejection":
+    if a.side in ("sell", "short") and getattr(a, "setup", None) not in ("vwap_rejection", "breakdown_intraday", "orb_breakdown"):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup in ("orb", "options_orb", "breakout_20d") and a.level is not None:
+    if a.setup in ("orb", "orb_breakdown", "options_orb", "breakout_20d") and a.level is not None:
         if a.setup == "breakout_20d":
             raise EntryError("--level is for --setup level (breakout_20d derives its level from 20-day daily closes)")
-        raise EntryError("--level is for --setup level (an orb's level is its range high)")
+        raise EntryError("--level is for --setup level (an orb's level is its range high/low)")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
@@ -3873,12 +3942,12 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", default="orb",
-                       help="entry setup: orb, level, breakout_20d, breakout_intraday, vwap_reclaim, ema_alignment, ma_crossover, trend, rsi_momentum, momentum, or options_orb")
+                       help="entry setup: orb, orb_breakdown, level, breakout_20d, breakout_intraday, breakdown_intraday, vwap_reclaim, vwap_rejection, ema_alignment, ma_crossover, trend, rsi_momentum, momentum, or options_orb")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["1m", "5m", "15m", "30m", "1h"], default="5m")
-        p.add_argument("--level", type=float, help="the price to close above (--setup level)")
+        p.add_argument("--level", type=float, help="the price to close above/below (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs baseline average")
-        p.add_argument("--lookback-bars", type=int, default=12, help="prior bars lookback for breakout_intraday (default 12)")
+        p.add_argument("--lookback-bars", type=int, default=12, help="prior bars lookback for breakout/breakdown_intraday (default 12)")
         p.add_argument("--max-chase-pct", type=float, help="max percent above anchor for valid entry zone (default 1.5)")
         p.add_argument("--max-chase-atr", type=float, help="max ATR multiple above anchor for valid entry zone (default 1.0)")
         p.add_argument("--state", metavar="PATH", help="signal deduplication state JSON (default trader/state/signals.json when --write is used)")

@@ -23,7 +23,8 @@ Every data payload carries authoritative metadata:
 | Capability | Yahoo Finance | Upstox (Read-Only) | Offline Fixture | Simulated Replay | Alpaca (US Mode) |
 |---|---|---|---|---|---|
 | **Market Scope** | IN (NSE/BSE) & US | IN (NSE/BSE/MCX) | Any (Snapshot) | Any (Synthetic) | US (NYSE/NASDAQ) |
-| **Auth Required** | No | Yes (OAuth2 Token) | No | No | Yes (API Keys) |
+| **Execution Route** | None (Data only) | **NONE (Read-Only GET)** | None | None | Paper & Live Ticket (US) |
+| **Auth Required** | No | Yes (`UPSTOX_ANALYTICS_TOKEN`) | No | No | Yes (API Keys) |
 | **Live / Current Quotes** | Delayed (~15m) | Real-time (LTP/Full) | Snapshot Fixture | Simulated Price | Real-time IEX/SIP |
 | **Historical OHLCV** | Supported (1m, 5m, 15m, 1d) | Supported (1m, 30m, 1d) | Supported | Supported | Supported |
 | **Multiple Timeframes** | 1m, 2m, 5m, 15m, 30m, 60m, 1d | 1m, 30m, 1d | Fixed by Fixture | Configurable | 1m, 5m, 15m, 1h, 1d |
@@ -51,12 +52,15 @@ Every data payload carries authoritative metadata:
    - `data_status`: `DELAYED` or `HISTORICAL`
    - Never represented as guaranteed real-time exchange data.
    - Used for broad watchlists, historical daily/intraday bars, and free delayed monitoring.
+   - Fallback behavior: When Upstox token is missing and `allow_yahoo_fallback` is enabled, explicitly labels data `provider: "yahoo"`, `tier: "DELAYED"`.
 
 2. **Upstox Provider**:
-   - Read-only data integration (zero live order execution route).
-   - `tier`: `REAL_TIME` when valid token provided and market open.
-   - Respects actual subscription tier (Basic / Developer / Pro). Does not assume higher tier features than licensed.
-   - When credentials expire or are absent, fails closed or gracefully degrades to explicit `DELAYED` Yahoo with logged warning.
+   - **Read-Only Data Integration**: Only GET requests are executed. Zero order routing or execution capabilities exist.
+   - `tier`: `REAL_TIME` when a valid token is provided and market is open.
+   - `data_status`: `CURRENT` during market hours; `HISTORICAL` post-close.
+   - Account tiers: `standard` (default: max 2 WebSocket connections, 100 instruments) or `plus` (opt-in).
+   - Missing/Expired Token Handling: If `UPSTOX_ANALYTICS_TOKEN` is unset or blank, `validate_config()` raises `AuthenticationConfigError` fail-closed.
+   - Credentials are systematically redacted in all error messages and logs via regular expressions.
 
 3. **Offline & Simulated Providers**:
    - `tier`: `FIXTURE` or `SIMULATED`
@@ -67,8 +71,13 @@ Every data payload carries authoritative metadata:
 
 ## 4. Volume and Order-Flow Quality Distinction
 
-Per Section 5 of the Master Directive:
-- **Actual Aggressor Volume**: Only labeled as `ACTUAL` when incoming broker WebSocket or trade-level feed carries explicit trade tick aggressor direction flags.
-- **Estimated Aggressor Volume**: When only standard OHLCV candles exist, volume pressure is labeled `ESTIMATED` with documented methodology (e.g. Close-relative-to-High/Low candle split).
+- **Actual Aggressor Volume**: Labeled `ACTUAL` only when the incoming feed provides explicit trade tick aggressor direction flags.
+- **Estimated Aggressor Volume**: When only standard OHLCV candles exist, volume delta is estimated using the Close Location Value (CLV) model ($CLV = \frac{(close - low) - (high - close)}{high - low}$) and labeled `ESTIMATED`.
 - **UNAVAILABLE**: Stamped when depth or trade ticks are missing and estimation is disabled.
 
+---
+
+## 5. Security & Token Handling Policies
+
+- **Zero Credential Exposure**: Tokens, passwords, and secrets are strictly excluded from order payloads, state files, and logs.
+- **Order Fingerprint Isolation**: `order_fingerprint.py` strips all credentials and dynamic `_provenance` timestamps prior to hashing.

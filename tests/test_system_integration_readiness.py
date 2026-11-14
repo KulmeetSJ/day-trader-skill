@@ -522,6 +522,101 @@ class TestSystemIntegrationReadiness(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("congress trade tracker", out.lower())
 
+    # -------------------------------------------------------------------------
+    # Scenario I: Open Position Management & Flattening Lifecycle
+    # -------------------------------------------------------------------------
+    def test_scenario_i_open_position_management_and_flatten_lifecycle(self):
+        pf_p = os.path.join(self.tmp, "portfolio_pos.json")
+        with open(pf_p, "w", encoding="utf-8") as fh:
+            json.dump({
+                "cash": 100000.0,
+                "currency": "INR",
+                "positions": [{
+                    "ticker": "RELIANCE",
+                    "shares": 10,
+                    "lots": [{"id": "RELIANCE-1", "shares": 10, "cost": 28490.0}],
+                }],
+            }, fh)
+
+        plan_p = os.path.join(self.tmp, "plan_pos.json")
+        with open(plan_p, "w", encoding="utf-8") as fh:
+            json.dump({
+                "created_by": "trader-exit",
+                "symbol": "RELIANCE",
+                "side": "buy",
+                "market": "IN",
+                "currency": "INR",
+                "entry": 2849.0,
+                "stop": 2840.0,
+                "target": 2870.0,
+                "tick_size": 0.05,
+                "flat_by": "15:20",
+            }, fh)
+
+        # 1. Evaluate open position via exit.py manage at flat-by time
+        rc, out, err = _run_cli(exit_mod, [
+            "manage", "--portfolio", pf_p, "--plan", plan_p,
+            "--offline", RELIANCE_5M, "--market", "IN",
+            "--now", "2026-10-19 15:21", "--json",
+        ])
+        self.assertEqual(rc, 0, err)
+        ev_doc = json.loads(out)
+        self.assertEqual(len(ev_doc["positions"]), 1)
+        self.assertEqual(ev_doc["positions"][0]["action"], "EXIT")
+        self.assertTrue(bool(ev_doc["positions"][0]["reasons"]))
+
+        # 2. Generate flatten order ticket via ticket.py flatten
+        orders_p = os.path.join(self.tmp, "flatten_orders.json")
+        rc, out, err = _run_cli(ticket_mod, [
+            "flatten", "--symbol", "RELIANCE", "--portfolio", pf_p, "--plan", plan_p,
+            "--config", self.cfg_in_path, "--market", "IN", "--orders", orders_p,
+            "--now", "2026-10-19 15:21",
+        ])
+        self.assertEqual(rc, 0, err)
+        with open(orders_p, "r", encoding="utf-8") as fh:
+            ord_doc = json.load(fh)
+        self.assertEqual(ord_doc["orders"][0]["side"], "sell")
+        self.assertEqual(int(ord_doc["orders"][0]["qty"]), 10)
+
+        # 3. Validate exit order through risk gate
+        risk_p = os.path.join(self.tmp, "flatten_risk.json")
+        rc, out, err = _run_cli(risk_mod, [
+            "--orders", orders_p, "--portfolio", pf_p,
+            "--config", self.cfg_in_path, "--market", "IN",
+            "--out", risk_p, "--now", "2026-10-19 15:21",
+        ])
+        self.assertEqual(rc, 0, err)
+        with open(risk_p, "r", encoding="utf-8") as fh:
+            risk_doc = json.load(fh)
+        self.assertEqual(risk_doc["results"][0]["verdict"], "PASS")
+
+        # 4. Approve exit order via ticket.py approve
+        state_p = os.path.join(self.tmp, "flatten_broker.json")
+        rc, out, err = _run_cli(ticket_mod, [
+            "approve", "--index", "1", "--reply", "yes sell 10 RELIANCE",
+            "--orders", orders_p, "--risk", risk_p,
+            "--config", self.cfg_in_path, "--state", state_p,
+            "--now", "2026-10-19 15:21",
+        ])
+        self.assertEqual(rc, 0, err)
+
+        # 5. Record exit fill via ticket.py result
+        rc, out, err = _run_cli(ticket_mod, [
+            "result", "--index", "1", "--status", "placed",
+            "--filled-qty", "10", "--filled-price", "2860.0",
+            "--orders", orders_p, "--risk", risk_p,
+            "--config", self.cfg_in_path, "--portfolio", pf_p,
+            "--state", state_p, "--now", "2026-10-19 15:21",
+        ])
+        self.assertEqual(rc, 0, err)
+
+        # 6. Verify reconciled portfolio state
+        with open(pf_p, "r", encoding="utf-8") as fh:
+            final_pf = json.load(fh)
+        self.assertEqual(len(final_pf["positions"]), 0)
+        self.assertEqual(final_pf["cash"], 128600.0)
+        self.assertEqual(final_pf["realized_pnl"], 110.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1735 @@
+#!/usr/bin/env python3
+"""
+trader-options: Dedicated Options Intelligence Specialist for Indian Markets.
+
+Identifies, evaluates, models, ranks, and communicates high-quality options opportunities
+(BUY CE, BUY PE, SELL CE, SELL PE, and Defined-Risk Spreads) for Indian indices
+(NIFTY, BANKNIFTY, FINNIFTY) and F&O equities.
+
+Strict Execution Boundary: Decision-support only; live broker execution disabled.
+"""
+
+import argparse
+import datetime
+import json
+import math
+import os
+import sys
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional, Tuple
+
+# Workspace path setup for modular reuse
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+for path in [
+    os.path.join(BASE_DIR, "trader-alerts"),
+    os.path.join(BASE_DIR, "trader-entry"),
+    os.path.join(BASE_DIR, "trader-scanner"),
+    os.path.join(BASE_DIR, "trader-budget"),
+]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+import data_in
+import instruments
+import calendar_in
+import entry
+import scan
+import size
+from config.loader import load_config
+
+# Signal Contract States
+STATE_WATCHLIST_CANDIDATE = "WATCHLIST CANDIDATE"
+STATE_SETUP_FORMING = "SETUP FORMING"
+STATE_TRIGGER_CONFIRMED = "TRIGGER CONFIRMED"
+STATE_SIGNAL_VALIDATED = "SIGNAL VALIDATED"
+STATE_HISTORICAL_ANALYSIS = "HISTORICAL ANALYSIS"
+STATE_SIGNAL_REJECTED = "SIGNAL REJECTED"
+STATE_INVALIDATED_EXPIRED = "INVALIDATED / EXPIRED"
+
+# Strategy Identifiers
+STRATEGY_BUY_CE = "BUY_CE"
+STRATEGY_BUY_PE = "BUY_PE"
+STRATEGY_SELL_CE = "SELL_CE"
+STRATEGY_SELL_PE = "SELL_PE"
+STRATEGY_BULL_CALL_SPREAD = "BULL_CALL_SPREAD"
+STRATEGY_BEAR_PUT_SPREAD = "BEAR_PUT_SPREAD"
+STRATEGY_BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"
+STRATEGY_BULL_PUT_SPREAD = "BULL_PUT_SPREAD"
+STRATEGY_IRON_CONDOR = "IRON_CONDOR"
+
+# Statutory Indian Charge Defaults & Risk Policy
+DEFAULT_MAX_LOSS_INR = 2000.0
+DEFAULT_MIN_REWARD_RISK = 2.0
+DEFAULT_SPREAD_TOLERANCE_PCT = 6.0  # max 6% bid-ask spread
+DEFAULT_MIN_VOLUME = 500
+TRADING_HOURS_PER_DAY = 6.25
+
+# DEF-01: Configurable Freshness Thresholds (seconds)
+DEFAULT_MAX_QUOTE_AGE_SECONDS = 120.0       # 2 minutes for option quote
+DEFAULT_MAX_CANDLE_AGE_SECONDS = 600.0      # 10 minutes for 5m underlying candle
+DEFAULT_MAX_RETRIEVAL_AGE_SECONDS = 120.0   # 2 minutes for API response retrieval
+
+
+def round_tick(price: float, tick: float = 0.05) -> float:
+    """Round price to the nearest tick step."""
+    if price is None or math.isnan(price):
+        return 0.0
+    d_p = Decimal(str(price))
+    d_t = Decimal(str(tick))
+    rounded = (d_p / d_t).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_t
+    return float(rounded)
+
+
+def get_current_ist_time() -> datetime.datetime:
+    """Current time in Indian Standard Time (IST)."""
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+
+
+def parse_timestamp(val: Any) -> Optional[datetime.datetime]:
+    """
+    Parse a timestamp (int/float UNIX, str ISO-8601, datetime) to timezone-aware UTC datetime.
+    Returns None if missing or unparsable (no silent default to current time).
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return datetime.datetime.fromtimestamp(val, tz=datetime.timezone.utc)
+        except Exception:
+            return None
+    if isinstance(val, datetime.datetime):
+        if val.tzinfo is None:
+            # Default naive datetimes to IST
+            return val.replace(tzinfo=calendar_in.IST).astimezone(datetime.timezone.utc)
+        return val.astimezone(datetime.timezone.utc)
+    try:
+        ist_dt = calendar_in.parse_ist(val)
+        return ist_dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+class OptionsIntelligenceSpecialist:
+    """The central engine for options intelligence and analytics."""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None, streamer: Optional[Any] = None):
+        self.config = config or load_config(market="IN")
+        self.streamer = streamer
+        self.market = "IN"
+        self.max_loss_budget = float(self.config.get("max_loss_per_trade_inr") or DEFAULT_MAX_LOSS_INR)
+        self.min_reward_risk = float(self.config.get("min_reward_risk") or DEFAULT_MIN_REWARD_RISK)
+        self.available_capital = float(self.config.get("budget") or self.config.get("capital_inr") or 100000.0)
+
+    def fetch_normalized_chain(
+        self,
+        symbol: str,
+        expiry: Optional[str] = None,
+        exchange: Optional[str] = None,
+        provider: Optional[str] = None,
+        spot_price: Optional[float] = None,
+        now: Optional[datetime.datetime] = None,
+    ) -> Optional[Any]:
+        """Fetch and normalize option chain using authoritative Upstox or fallback provider."""
+        canon = instruments.symbols_in.normalize_symbol(symbol) if hasattr(instruments, "symbols_in") else symbol
+        exch = exchange or ("BSE" if canon in ("SENSEX", "BANKEX") else "NSE")
+        try:
+            chain = data_in.fetch_option_chain(
+                canon,
+                expiry=expiry,
+                exchange=exch,
+                provider=provider,
+                spot_price=spot_price,
+                config=self.config,
+                now=now,
+            )
+            return chain
+        except Exception:
+            return None
+
+    def validate_metadata(
+        self,
+        symbol: str,
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
+        exchange: str = "NSE",
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """Validate underlying derivatives metadata against authoritative BOD master."""
+        try:
+            meta = instruments.resolve_underlying_derivatives_meta(symbol, exchange=exchange)
+        except Exception as e:
+            return False, None, f"Symbol metadata error: {e}"
+
+        if not meta or not meta.get("available") or not meta.get("is_fo_eligible"):
+            return False, None, "Symbol is not eligible for F&O or derivatives metadata unavailable"
+
+        lot_size = meta.get("lot_size")
+        if not lot_size or lot_size <= 0:
+            return False, None, "Authoritative lot size missing or zero"
+
+        expiries = meta.get("expiries") or []
+        if expiry is not None and expiry not in expiries:
+            return False, None, f"Expiry {expiry} not in authoritative expiries list: {expiries[:5]}"
+
+        strike_interval = meta.get("strike_interval")
+        if strike is not None and strike_interval and strike_interval > 0:
+            rem = (strike % strike_interval)
+            if not math.isclose(rem, 0.0, abs_tol=1e-3) and not math.isclose(rem, strike_interval, abs_tol=1e-3):
+                return False, None, f"Strike {strike} is not a valid interval of {strike_interval}"
+
+        return True, meta, None
+
+    def validate_liquidity(
+        self,
+        contract: Dict[str, Any],
+        max_spread_pct: float = DEFAULT_SPREAD_TOLERANCE_PCT,
+        min_volume: int = DEFAULT_MIN_VOLUME,
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Validate option liquidity, bid/ask presence, and spread tightness."""
+        if not contract:
+            return False, "Contract missing or null", {}
+
+        bid = float(contract.get("bid") or 0.0)
+        ask = float(contract.get("ask") or 0.0)
+        ltp = float(contract.get("last_price") or 0.0)
+        vol = int(contract.get("volume") or 0)
+        oi = int(contract.get("open_interest") or 0)
+
+        metrics = {
+            "bid": bid,
+            "ask": ask,
+            "ltp": ltp,
+            "volume": vol,
+            "open_interest": oi,
+            "spread": round(ask - bid, 2),
+            "spread_pct": 0.0,
+        }
+
+        # 1. Zero quote check
+        if bid <= 0.0:
+            return False, "Zero or missing bid price (no buyers in book)", metrics
+        if ask <= 0.0:
+            return False, "Zero or missing ask price (no sellers in book)", metrics
+        if ask < bid:
+            return False, f"Inverted market quotes: bid ({bid}) > ask ({ask})", metrics
+
+        # 2. Spread percentage check
+        mid = (bid + ask) / 2.0
+        spread_pct = round(((ask - bid) / mid) * 100.0, 2)
+        metrics["spread_pct"] = spread_pct
+
+        # For low premium options (< Rs 10), allow up to Rs 1.50 spread; otherwise check pct
+        if mid >= 10.0 and spread_pct > max_spread_pct:
+            return False, f"Bid/ask spread too wide ({spread_pct}% > allowed {max_spread_pct}%)", metrics
+        elif mid < 10.0 and (ask - bid) > 1.50:
+            return False, f"Bid/ask spread points too wide ({ask - bid:.2f} > 1.50 Rs)", metrics
+
+        # 3. Minimum volume check
+        if min_volume > 0 and vol < min_volume:
+            return False, f"Contract volume ({vol}) below liquidity threshold ({min_volume})", metrics
+
+        return True, None, metrics
+
+    def model_premium_levels(
+        self,
+        entry_premium: float,
+        spot_entry: float,
+        spot_stop: float,
+        spot_t1: float,
+        spot_t2: float,
+        delta: float,
+        gamma: float = 0.0,
+        theta: float = 0.0,
+        vega: float = 0.0,
+        iv: float = 15.0,
+        option_type: str = "CE",
+        is_seller: bool = False,
+        holding_hours: float = 2.0,
+        slippage_ticks: int = 1,
+    ) -> Optional[Dict[str, float]]:
+        """
+        Model option premium stops and targets dynamically derived from underlying technical levels.
+
+        Accounts for:
+        - Delta: First-order underlying sensitivity
+        - Gamma: Second-order convexity
+        - Theta: Time decay over holding period (default 2 intraday hours)
+        - Vega: Volatility shift sensitivity
+        - Slippage: 1 tick on entry and exit
+
+        Zero Fabrication Policy: If the Taylor expansion or inputs yield non-viable premium levels
+        (e.g. stop above entry for buyer or target below entry for buyer), this function returns None
+        (OPTION RISK UNAVAILABLE). It never silently falls back to arbitrary percentages.
+        """
+        if entry_premium <= 0.05 or spot_entry <= 0:
+            return None
+
+        ot = str(option_type).upper()
+        d_stop = spot_stop - spot_entry
+        d_t1 = spot_t1 - spot_entry
+        d_t2 = spot_t2 - spot_entry
+
+        # Theta decay over expected intraday holding window
+        time_fraction = holding_hours / TRADING_HOURS_PER_DAY
+        theta_decay = abs(theta) * time_fraction
+
+        # Modest IV shift assumption (intraday moves typically contract IV by 0.5% or expand by 0.5%)
+        # In a stop out against a buyer, IV might expand slightly (+0.5% IV); in target moves IV contracts
+        iv_impact_stop = vega * 0.5
+        iv_impact_target = -vega * 0.2
+
+        # Second-order Taylor expansion: dP = Delta * dS + 0.5 * Gamma * (dS ^ 2)
+        # Call: Delta > 0. When spot drops (d_stop < 0), Delta * d_stop < 0.
+        # Put: Delta < 0. When spot rises (d_stop > 0), Delta * d_stop < 0.
+        dp_stop_raw = (delta * d_stop) + (0.5 * gamma * (d_stop ** 2)) - theta_decay + iv_impact_stop
+        dp_t1_raw = (delta * d_t1) + (0.5 * gamma * (d_t1 ** 2)) - theta_decay + iv_impact_target
+        dp_t2_raw = (delta * d_t2) + (0.5 * gamma * (d_t2 ** 2)) - theta_decay + iv_impact_target
+
+        slippage = slippage_ticks * 0.05
+
+        if not is_seller:
+            # Option Buyer:
+            # Entry has buy slippage; exit has sell slippage
+            exec_entry = entry_premium + slippage
+            stop_prem = max(0.05, round_tick(entry_premium + dp_stop_raw - slippage, 0.05))
+            t1_prem = max(0.05, round_tick(entry_premium + dp_t1_raw - slippage, 0.05))
+            t2_prem = max(0.05, round_tick(entry_premium + dp_t2_raw - slippage, 0.05))
+
+            # Strict Validation: Stop must be strictly below entry, targets strictly above entry
+            if stop_prem >= exec_entry or t1_prem <= exec_entry or t2_prem <= t1_prem:
+                return None
+        else:
+            # Option Seller:
+            # Entry has sell slippage (lower credit); stop exit has buy slippage (higher debit)
+            exec_entry = max(0.05, entry_premium - slippage)
+            stop_prem = max(0.05, round_tick(entry_premium + abs(dp_stop_raw) + slippage, 0.05))
+            t1_prem = max(0.05, round_tick(entry_premium - abs(dp_t1_raw) + slippage, 0.05))
+            t2_prem = max(0.05, round_tick(entry_premium - abs(dp_t2_raw) + slippage, 0.05))
+
+            # Strict Validation: Stop must be strictly above entry, targets strictly below entry
+            if stop_prem <= exec_entry or t1_prem >= exec_entry or t2_prem >= t1_prem:
+                return None
+
+        return {
+            "entry_premium": round_tick(exec_entry, 0.05),
+            "stop_loss_premium": stop_prem,
+            "target_1_premium": t1_prem,
+            "target_2_premium": t2_prem,
+            "delta_used": delta,
+            "gamma_used": gamma,
+            "theta_decay_applied": round(theta_decay, 2),
+            "slippage_applied": slippage,
+        }
+
+    def calculate_charges_and_net_rr(
+        self,
+        strategy: str,
+        entry_prem: float,
+        stop_prem: float,
+        t1_prem: float,
+        qty: int,
+        lot_size: int,
+        strike: float,
+        option_type: str = "CE",
+        as_of_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compute full statutory Indian charges, net PnL, and true Net Risk-to-Reward ratio."""
+        is_seller = strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE)
+
+        charges_t1 = size.calculate_indian_transaction_charges(
+            asset_type="OPTIONS",
+            side="sell" if is_seller else "buy",
+            entry_price=entry_prem,
+            exit_price=t1_prem,
+            qty=qty,
+            trading_style="intraday",
+            as_of_date=as_of_date,
+            strike=strike,
+            option_type=option_type,
+        )
+
+        charges_stop = size.calculate_indian_transaction_charges(
+            asset_type="OPTIONS",
+            side="sell" if is_seller else "buy",
+            entry_price=entry_prem,
+            exit_price=stop_prem,
+            qty=qty,
+            trading_style="intraday",
+            as_of_date=as_of_date,
+            strike=strike,
+            option_type=option_type,
+        )
+
+        total_charges_t1 = charges_t1.get("total", 0.0)
+        total_charges_stop = charges_stop.get("total", 0.0)
+
+        if not is_seller:
+            gross_profit_t1 = (t1_prem - entry_prem) * qty
+            gross_loss_stop = (entry_prem - stop_prem) * qty
+        else:
+            gross_profit_t1 = (entry_prem - t1_prem) * qty
+            gross_loss_stop = (stop_prem - entry_prem) * qty
+
+        net_profit_t1 = max(0.0, gross_profit_t1 - total_charges_t1)
+        net_loss_stop = gross_loss_stop + total_charges_stop
+
+        net_rr = round(net_profit_t1 / net_loss_stop, 2) if net_loss_stop > 0 else 0.0
+
+        return {
+            "statutory_charges_target": round(total_charges_t1, 2),
+            "statutory_charges_stop": round(total_charges_stop, 2),
+            "charges_breakdown": {
+                "brokerage_roundtrip": charges_t1.get("brokerage", 40.0),
+                "stt": charges_t1.get("stt", 0.0),
+                "exchange_charges": charges_t1.get("exchange_charges", 0.0),
+                "sebi_charges": charges_t1.get("sebi_charges", 0.0),
+                "stamp_duty": charges_t1.get("stamp_duty", 0.0),
+                "gst": charges_t1.get("gst", 0.0),
+            },
+            "gross_profit_t1": round(gross_profit_t1, 2),
+            "net_profit_t1": round(net_profit_t1, 2),
+            "gross_loss_stop": round(gross_loss_stop, 2),
+            "net_loss_stop": round(net_loss_stop, 2),
+            "net_reward_risk": net_rr,
+        }
+
+    def evaluate_margin_and_capital(
+        self,
+        strategy: str,
+        strike: float,
+        lot_size: int,
+        entry_prem: float,
+        lots: int = 1,
+        spread_strike: Optional[float] = None,
+        spread_prem: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Calculate capital required, margin requirements, and tail risk.
+        Clearly labels static notional margin as an unverified heuristic estimate.
+        """
+        qty = lots * lot_size
+        notional_per_lot = strike * lot_size
+
+        if strategy in (STRATEGY_BUY_CE, STRATEGY_BUY_PE):
+            capital_required = round(entry_prem * qty, 2)
+            capital_per_lot = round(entry_prem * lot_size, 2)
+            # In option buying, max loss = 100% premium paid + statutory transaction costs (brokerage, STT, stamp duty, GST)
+            try:
+                chg_zero = size.calculate_indian_transaction_charges(
+                    asset_type="OPTIONS",
+                    side="buy",
+                    entry_price=entry_prem,
+                    exit_price=0.0,
+                    qty=qty,
+                    trading_style="intraday",
+                    strike=strike,
+                    option_type="CE" if strategy == STRATEGY_BUY_CE else "PE",
+                )
+                tot_chg = chg_zero.get("total", 0.0)
+            except Exception:
+                tot_chg = round(20.0 + (capital_required * 0.0006), 2)
+            max_loss_val = round(capital_required + tot_chg, 2)
+            max_loss_desc = f"Rs {max_loss_val:,.2f} (Premium Outlay Rs {capital_required:,.2f} + Transaction Charges Rs {tot_chg:,.2f})"
+            return {
+                "structure": "DEFINED_RISK",
+                "capital_required": capital_required,
+                "capital_per_lot": capital_per_lot,
+                "margin_required": 0.0,
+                "margin_per_lot": 0.0,
+                "max_loss": max_loss_desc,
+                "max_loss_value": max_loss_val,
+                "premium_outlay": capital_required,
+                "transaction_costs_at_zero": tot_chg,
+                "margin_type": "EXACT_DEBIT_PAID",
+                "margin_model": "EXACT_DEBIT_PAID (Premium × Quantity)",
+                "formula": "Entry Premium × Lots × Lot Size + Applicable Transaction Charges",
+                "assumptions": "Standard exchange option buying: 100% upfront premium payment plus round-trip statutory costs.",
+                "is_authoritative": True,
+                "broker_margin_disclaimer": "Exact capital outlay is determined by premium fill and statutory exchange charges.",
+                "tail_risk": f"Limited to total premium paid plus statutory charges (Rs {max_loss_val:,.2f}). No margin calls possible.",
+                "is_undefined_risk": False,
+            }
+        elif strategy == STRATEGY_SELL_CE:
+            # Naked Call Selling: Unlimited risk
+            margin_rate = 0.135
+            span_exposure_margin_per_lot = round(notional_per_lot * margin_rate, 2)
+            total_margin = round(span_exposure_margin_per_lot * lots, 2)
+            premium_received = round(entry_prem * qty, 2)
+            max_loss_desc = "THEORETICALLY UNLIMITED"
+            tail_risk = (
+                "CRITICAL: Naked Call selling carries THEORETICALLY UNLIMITED MAXIMUM LOSS. "
+                "Extreme upside moves will trigger rapid margin calls and severe capital liquidation."
+            )
+            return {
+                "structure": "UNDEFINED_RISK_NAKED",
+                "capital_required": total_margin,
+                "capital_per_lot": span_exposure_margin_per_lot,
+                "margin_required": total_margin,
+                "margin_per_lot": span_exposure_margin_per_lot,
+                "premium_received": premium_received,
+                "max_profit": premium_received,
+                "max_loss": max_loss_desc,
+                "margin_type": "HEURISTIC_MARGIN_ESTIMATE",
+                "margin_model": "HEURISTIC_ESTIMATE (HEURISTIC_MARGIN_ESTIMATE: 13.5% of contract notional proxy)",
+                "formula": "Strike × Lot Size × 13.5%",
+                "assumptions": "Heuristic proxy (13.5% of contract notional). Unverified exchange SPAN clearing array. Does not include broker-specific margin multipliers.",
+                "is_authoritative": False,
+                "broker_margin_disclaimer": "Actual broker margin requirements may differ significantly based on clearing member risk rules, live exchange SPAN parameters, and market volatility.",
+                "tail_risk": tail_risk,
+                "is_undefined_risk": True,
+            }
+        elif strategy == STRATEGY_SELL_PE:
+            # Naked Put Selling (DEF-02): Capped maximum loss at (Strike - Premium) * Qty
+            margin_rate = 0.135
+            span_exposure_margin_per_lot = round(notional_per_lot * margin_rate, 2)
+            total_margin = round(span_exposure_margin_per_lot * lots, 2)
+            premium_received = round(entry_prem * qty, 2)
+            max_loss_val = round((strike - entry_prem) * qty, 2)
+            max_loss_desc = f"Rs {max_loss_val:,.2f} (Capped at (strike - premium) if underlying collapses to 0)"
+            tail_risk = (
+                "SEVERE TAIL RISK: Naked Put selling carries SUBSTANTIAL MAXIMUM LOSS capped only by underlying "
+                f"falling to 0 (Max loss: Rs {max_loss_val:,.2f}). Sharp market gaps will cause heavy capital drawdown."
+            )
+            return {
+                "structure": "CAPPED_MAX_LOSS_NAKED",
+                "capital_required": total_margin,
+                "capital_per_lot": span_exposure_margin_per_lot,
+                "margin_required": total_margin,
+                "margin_per_lot": span_exposure_margin_per_lot,
+                "premium_received": premium_received,
+                "max_profit": premium_received,
+                "max_loss": max_loss_desc,
+                "max_loss_value": max_loss_val,
+                "margin_type": "HEURISTIC_MARGIN_ESTIMATE",
+                "margin_model": "HEURISTIC_ESTIMATE (HEURISTIC_MARGIN_ESTIMATE: 13.5% of contract notional proxy)",
+                "formula": "Strike × Lot Size × 13.5%",
+                "assumptions": "Heuristic proxy (13.5% of contract notional). Unverified exchange SPAN clearing array. Does not include broker-specific margin multipliers.",
+                "is_authoritative": False,
+                "broker_margin_disclaimer": "Actual broker margin requirements may differ significantly based on clearing member risk rules, live exchange SPAN parameters, and market volatility.",
+                "tail_risk": tail_risk,
+                "is_undefined_risk": False,
+            }
+        elif strategy in (
+            STRATEGY_BULL_CALL_SPREAD,
+            STRATEGY_BEAR_PUT_SPREAD,
+            STRATEGY_BEAR_CALL_SPREAD,
+            STRATEGY_BULL_PUT_SPREAD,
+        ):
+            if spread_strike is None or spread_prem is None:
+                return {
+                    "structure": "DEFINED_RISK_SPREAD",
+                    "capital_required": 0.0,
+                    "capital_per_lot": 0.0,
+                    "margin_required": 0.0,
+                    "margin_per_lot": 0.0,
+                    "max_loss": "CALCULATION_UNAVAILABLE",
+                    "tail_risk": "Missing spread leg",
+                    "is_undefined_risk": False,
+                }
+
+            width = abs(spread_strike - strike)
+            if strategy in (STRATEGY_BULL_CALL_SPREAD, STRATEGY_BEAR_PUT_SPREAD):
+                # Debit Spread
+                net_debit = max(0.0, entry_prem - spread_prem)
+                max_loss = round(net_debit * qty, 2)
+                max_profit = round((width - net_debit) * qty, 2)
+                capital = max_loss
+                margin = 0.0
+            else:
+                # Credit Spread (Hedged Option Selling)
+                net_credit = max(0.0, entry_prem - spread_prem)
+                max_profit = round(net_credit * qty, 2)
+                max_loss = round((width - net_credit) * qty, 2)
+                capital = max_loss
+                margin = round(max_loss * 1.10, 2)
+
+            return {
+                "structure": "DEFINED_RISK_SPREAD",
+                "capital_required": capital,
+                "capital_per_lot": round(capital / max(1, lots), 2),
+                "margin_required": margin,
+                "margin_per_lot": round(margin / max(1, lots), 2),
+                "max_loss": f"Rs {max_loss:,.2f}",
+                "max_profit": f"Rs {max_profit:,.2f}",
+                "strike_width": width,
+                "margin_type": "SPREAD_CAPPED_MAX_LOSS",
+                "margin_model": "SPREAD_CAPPED_MAX_LOSS (Hedged exchange margin benefit estimate)",
+                "formula": "Net Debit × Quantity (Debit) or Strike Width × Quantity (Credit)",
+                "assumptions": "Defined-risk structure with hedged exchange margin benefit estimate.",
+                "is_authoritative": False,
+                "broker_margin_disclaimer": "Actual broker margin may vary depending on execution sequence of individual legs and broker margin relief rules.",
+                "tail_risk": f"Strictly defined and hedged. Max loss capped at Rs {max_loss:,.2f}.",
+                "is_undefined_risk": False,
+            }
+
+        return {
+            "structure": "CUSTOM",
+            "capital_required": 0.0,
+            "margin_required": 0.0,
+            "max_loss": "UNKNOWN",
+            "tail_risk": "Unspecified structure",
+            "is_undefined_risk": False,
+        }
+
+    def validate_live_data_freshness(
+        self,
+        contract_data: Dict[str, Any],
+        underlying_setup: Dict[str, Any],
+        now_utc: datetime.datetime,
+        max_quote_age_sec: float = DEFAULT_MAX_QUOTE_AGE_SECONDS,
+        max_candle_age_sec: float = DEFAULT_MAX_CANDLE_AGE_SECONDS,
+        max_retrieval_age_sec: float = DEFAULT_MAX_RETRIEVAL_AGE_SECONDS,
+    ) -> Tuple[bool, List[str], Dict[str, Any]]:
+        """
+        DEF-01: Genuine live-data freshness validation.
+        A signal may become SIGNAL VALIDATED ONLY when ALL conditions hold:
+        1. Indian market session is currently open (calendar_in.is_market_hours_in).
+        2. Underlying candle timestamp is valid and within max_candle_age_sec.
+        3. Option quote timestamp is valid and within max_quote_age_sec.
+        4. Data retrieval timestamp is valid and within max_retrieval_age_sec.
+        5. Data provenance is consistent with genuine real-time provider response.
+        6. No missing or unparsable timestamps are silently replaced.
+        """
+        freshness_errors = []
+        details = {}
+
+        # 1. Market session check
+        is_market_open = calendar_in.is_market_hours_in(now_utc, exchange="NSE")
+        details["is_market_open"] = is_market_open
+        if not is_market_open:
+            freshness_errors.append("MARKET_SESSION_CLOSED: Indian market session (NSE) is currently closed")
+
+        # 2. Underlying candle timestamp check
+        candle_ctx = underlying_setup.get("candle_context") or {}
+        comp_candle = candle_ctx.get("completed_candle") or {}
+        raw_candle_ts = (
+            underlying_setup.get("candle_timestamp")
+            or underlying_setup.get("candle_time")
+            or comp_candle.get("bar_end")
+            or comp_candle.get("time")
+            or underlying_setup.get("last_data_timestamp")
+            or underlying_setup.get("data_time")
+        )
+        details["candle_timestamp_raw"] = raw_candle_ts
+        if raw_candle_ts is None or raw_candle_ts == "":
+            freshness_errors.append("MISSING_CANDLE_TIMESTAMP: Underlying candle timestamp is missing")
+        else:
+            candle_dt = parse_timestamp(raw_candle_ts)
+            if candle_dt is None:
+                freshness_errors.append(f"UNPARSABLE_CANDLE_TIMESTAMP: Could not parse candle timestamp '{raw_candle_ts}'")
+            else:
+                candle_age = (now_utc - candle_dt).total_seconds()
+                details["candle_age_seconds"] = round(candle_age, 1)
+                if candle_age > max_candle_age_sec:
+                    freshness_errors.append(
+                        f"STALE_UNDERLYING_CANDLE: Candle age {candle_age:.1f}s exceeds threshold {max_candle_age_sec}s (timestamp: {raw_candle_ts})"
+                    )
+
+        # 3. Option quote timestamp check
+        raw_quote_ts = contract_data.get("quote_timestamp") or contract_data.get("timestamp")
+        details["quote_timestamp_raw"] = raw_quote_ts
+        if raw_quote_ts is None or raw_quote_ts == "":
+            freshness_errors.append("MISSING_QUOTE_TIMESTAMP: Option quote timestamp is missing")
+        else:
+            quote_dt = parse_timestamp(raw_quote_ts)
+            if quote_dt is None:
+                freshness_errors.append(f"UNPARSABLE_QUOTE_TIMESTAMP: Could not parse quote timestamp '{raw_quote_ts}'")
+            else:
+                quote_age = (now_utc - quote_dt).total_seconds()
+                details["quote_age_seconds"] = round(quote_age, 1)
+                if quote_age > max_quote_age_sec:
+                    freshness_errors.append(
+                        f"STALE_OPTION_QUOTE: Quote age {quote_age:.1f}s exceeds threshold {max_quote_age_sec}s (timestamp: {raw_quote_ts})"
+                    )
+
+        # 4. Data retrieval timestamp check
+        raw_retrieval_ts = contract_data.get("retrieval_timestamp") or contract_data.get("fetched_at")
+        details["retrieval_timestamp_raw"] = raw_retrieval_ts
+        if raw_retrieval_ts is None or raw_retrieval_ts == "":
+            freshness_errors.append("MISSING_RETRIEVAL_TIMESTAMP: Option retrieval timestamp is missing")
+        else:
+            retrieval_dt = parse_timestamp(raw_retrieval_ts)
+            if retrieval_dt is None:
+                freshness_errors.append(f"UNPARSABLE_RETRIEVAL_TIMESTAMP: Could not parse retrieval timestamp '{raw_retrieval_ts}'")
+            else:
+                retrieval_age = (now_utc - retrieval_dt).total_seconds()
+                details["retrieval_age_seconds"] = round(retrieval_age, 1)
+                if retrieval_age > max_retrieval_age_sec:
+                    freshness_errors.append(
+                        f"STALE_RETRIEVAL_DATA: Retrieval age {retrieval_age:.1f}s exceeds threshold {max_retrieval_age_sec}s (timestamp: {raw_retrieval_ts})"
+                    )
+
+        # 5. Data provenance check
+        provider = str(contract_data.get("provider", "")).lower()
+        tier = str(contract_data.get("tier", "")).upper()
+        is_live = bool(contract_data.get("is_live", False))
+        is_sim = bool(contract_data.get("is_simulated", False))
+        details["tier"] = tier
+        details["is_live"] = is_live
+        details["provider"] = provider
+
+        if not is_live:
+            freshness_errors.append("NOT_LIVE_FEED: contract is_live flag is False")
+        if tier != "REAL_TIME":
+            freshness_errors.append(f"INVALID_DATA_TIER: Data tier '{tier}' is not REAL_TIME")
+        if is_sim:
+            freshness_errors.append("SIMULATED_DATA: contract is flagged as simulated")
+
+        is_fresh = len(freshness_errors) == 0
+        return is_fresh, freshness_errors, details
+
+    def generate_signal_contract(
+        self,
+        underlying: str,
+        direction: str,
+        strategy: str,
+        option_type: str,
+        strike: float,
+        contract_data: Dict[str, Any],
+        underlying_setup: Dict[str, Any],
+        meta: Dict[str, Any],
+        spread_contract: Optional[Dict[str, Any]] = None,
+        max_loss_budget: Optional[float] = None,
+        min_reward_risk: Optional[float] = None,
+        available_capital: Optional[float] = None,
+        now_utc: Optional[datetime.datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build and rigorously validate the 20-field signal contract.
+
+        Enforces Phase 1 Risk Gating:
+        - If risk per lot > max_loss_budget: REJECT (lots = 0)
+        - If net R:R < min_reward_risk: REJECT
+        - If capital/margin > available_capital: REJECT
+        - If data is historical or closed: assign HISTORICAL ANALYSIS (never SIGNAL VALIDATED)
+        """
+        budget = max_loss_budget if max_loss_budget is not None else self.max_loss_budget
+        min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
+        capital_limit = available_capital if available_capital is not None else self.available_capital
+
+        is_seller = strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE, STRATEGY_BEAR_CALL_SPREAD, STRATEGY_BULL_PUT_SPREAD)
+        is_spread = spread_contract is not None
+        lot_size = meta["lot_size"]
+        expiry = contract_data.get("expiry") or meta["expiry"]
+        contract_sym = contract_data.get("symbol", f"{underlying}_{strike}_{option_type}")
+
+        bid = float(contract_data.get("bid") or 0.0)
+        ask = float(contract_data.get("ask") or 0.0)
+        ltp = float(contract_data.get("last_price") or 0.0)
+
+        # Execution price reconciliation:
+        # BUY CE/PE: use ask as conservative baseline
+        # SELL CE/PE: use bid as conservative baseline
+        if is_seller:
+            baseline_quote = bid if bid > 0.0 else ltp
+            baseline_type = "BID" if bid > 0.0 else "LTP_FALLBACK"
+            slippage = -0.05
+            reconciled_entry = max(0.05, round_tick(baseline_quote + slippage, 0.05))
+        else:
+            baseline_quote = ask if ask > 0.0 else ltp
+            baseline_type = "ASK" if ask > 0.0 else "LTP_FALLBACK"
+            slippage = 0.05
+            reconciled_entry = round_tick(baseline_quote + slippage, 0.05)
+
+        spread_points = round(ask - bid, 2)
+        spread_mid = (bid + ask) / 2.0
+        spread_pct = round((spread_points / spread_mid) * 100.0, 2) if spread_mid > 0 else 0.0
+
+        execution_recon = {
+            "order_side": "SELL" if is_seller else "BUY",
+            "baseline_quote_price": baseline_quote,
+            "baseline_quote_type": baseline_type,
+            "slippage_applied": slippage,
+            "execution_price": reconciled_entry,
+            "bid": bid,
+            "ask": ask,
+            "spread_points": spread_points,
+            "spread_pct": spread_pct,
+            "quote_provenance": contract_data.get("quote_provenance", "UPSTOX_REST_SNAPSHOT"),
+        }
+
+        rejection_reasons = []
+
+        if bid <= 0.0:
+            rejection_reasons.append("INVALID_QUOTE: Zero or missing bid quote in order book")
+        if ask <= 0.0:
+            rejection_reasons.append("INVALID_QUOTE: Zero or missing ask quote in order book")
+        if bid > 0.0 and ask > 0.0 and ask <= bid:
+            rejection_reasons.append(f"INVALID_QUOTE: Crossed or locked market quotes: bid ({bid}) >= ask ({ask})")
+
+        u_dec = underlying_setup.get("decision") or {}
+        u_trig = underlying_setup.get("trigger") or {}
+        u_or = underlying_setup.get("opening_range") or {}
+        u_last = underlying_setup.get("last") or {}
+
+        spot_entry = float(
+            u_dec.get("entry_reference")
+            or underlying_setup.get("price")
+            or u_trig.get("price")
+            or u_last.get("close")
+            or 0.0
+        )
+        spot_stop = float(
+            u_dec.get("stop_loss")
+            or u_dec.get("invalidation_level")
+            or underlying_setup.get("invalidation_level")
+            or (u_or.get("low") if direction in ("BULLISH", "BULLISH_OR_SIDEWAYS") else u_or.get("high"))
+            or spot_entry
+        )
+        targets = u_dec.get("targets") or underlying_setup.get("targets") or {}
+        risk_dist = abs(spot_entry - spot_stop)
+        spot_t1 = float(
+            targets.get("target_1_1r")
+            or targets.get("t1_1r")
+            or (spot_entry + 1.5 * risk_dist if direction in ("BULLISH", "BULLISH_OR_SIDEWAYS") else spot_entry - 1.5 * risk_dist)
+            if risk_dist > 0 else 0.0
+        )
+        spot_t2 = float(
+            targets.get("target_2_2r")
+            or targets.get("t2_2r")
+            or (spot_entry + 2.5 * risk_dist if direction in ("BULLISH", "BULLISH_OR_SIDEWAYS") else spot_entry - 2.5 * risk_dist)
+            if risk_dist > 0 else 0.0
+        )
+
+        # Check invalidation level breach: Underlying spot breaching invalidation rejects active signal
+        if spot_entry > 0 and spot_stop > 0:
+            if ("BULL" in direction or direction == "LONG") and spot_entry < spot_stop:
+                rejection_reasons.append(
+                    f"INVALIDATED_SETUP: Underlying spot (Rs {spot_entry:.2f}) has breached invalidation level (Rs {spot_stop:.2f})"
+                )
+            elif ("BEAR" in direction or direction == "SHORT") and spot_entry > spot_stop:
+                rejection_reasons.append(
+                    f"INVALIDATED_SETUP: Underlying spot (Rs {spot_entry:.2f}) has breached invalidation level (Rs {spot_stop:.2f})"
+                )
+
+        greeks = contract_data.get("greeks") or {}
+        delta = float(greeks.get("delta") or (0.50 if option_type == "CE" else -0.50))
+        gamma = float(greeks.get("gamma") or 0.001)
+        theta = float(greeks.get("theta") or 0.0)
+        vega = float(greeks.get("vega") or 0.0)
+        iv = float(contract_data.get("iv") or 15.0)
+
+        # Model premium levels with zero fabrication using reconciled execution price
+        prem_levels = self.model_premium_levels(
+            entry_premium=reconciled_entry,
+            spot_entry=spot_entry,
+            spot_stop=spot_stop,
+            spot_t1=spot_t1,
+            spot_t2=spot_t2,
+            delta=delta,
+            gamma=gamma,
+            theta=theta,
+            vega=vega,
+            iv=iv,
+            option_type=option_type,
+            is_seller=is_seller,
+            slippage_ticks=0,
+        )
+
+        if not prem_levels:
+            rejection_reasons.append("OPTION_RISK_UNAVAILABLE: Delta/Gamma model produced non-viable stop or target premiums")
+            # Create dummy container for structure consistency
+            prem_levels = {
+                "entry_premium": round_tick(reconciled_entry, 0.05),
+                "stop_loss_premium": 0.0,
+                "target_1_premium": 0.0,
+                "target_2_premium": 0.0,
+            }
+
+        execution_recon["execution_price"] = prem_levels["entry_premium"]
+
+        # Calculate per-lot risk
+        if not is_spread:
+            prem_risk_per_share = abs(prem_levels["entry_premium"] - prem_levels["stop_loss_premium"])
+            risk_per_lot = round(prem_risk_per_share * lot_size, 2)
+        else:
+            spread_strike = float(spread_contract.get("strike") or 0.0)
+            spread_prem = float(spread_contract.get("last_price") or 0.0)
+            width = abs(spread_strike - strike)
+            net_debit = max(0.0, prem_levels["entry_premium"] - spread_prem)
+            risk_per_lot = round(net_debit * lot_size, 2)
+
+        # Position Sizing Logic (Phase 1 Fix: 4-Tier Position Sizing)
+        charges_1_lot = self.calculate_charges_and_net_rr(
+            strategy=strategy,
+            entry_prem=prem_levels["entry_premium"],
+            stop_prem=prem_levels["stop_loss_premium"],
+            t1_prem=prem_levels["target_1_premium"],
+            qty=lot_size,
+            lot_size=lot_size,
+            strike=strike,
+            option_type=option_type,
+        )
+        net_risk_1_lot = charges_1_lot["net_loss_stop"]
+
+        # 1-Lot Margin & Capital Requirement
+        spread_k = spread_contract.get("strike") if spread_contract else None
+        spread_p = spread_contract.get("last_price") if spread_contract else None
+        margin_info_1_lot = self.evaluate_margin_and_capital(
+            strategy=strategy,
+            strike=strike,
+            lot_size=lot_size,
+            entry_prem=prem_levels["entry_premium"],
+            lots=1,
+            spread_strike=spread_k,
+            spread_prem=spread_p,
+        )
+        capital_req_1_lot = margin_info_1_lot["capital_required"]
+        margin_req_1_lot = margin_info_1_lot["margin_required"]
+
+        # Tier 1: Theoretical Lots (unconstrained division of risk budget by net risk per lot)
+        theoretical_lots = int(budget // net_risk_1_lot) if net_risk_1_lot > 0 else 0
+
+        # Tier 2: Risk Budget Permitted Lots
+        if risk_per_lot <= 0.0 or net_risk_1_lot <= 0.0:
+            risk_budget_permitted_lots = 0
+            rejection_reasons.append("ZERO_OR_NEGATIVE_RISK: Trade risk per lot is zero or negative")
+        elif net_risk_1_lot > budget:
+            risk_budget_permitted_lots = 0
+            rejection_reasons.append(
+                f"RISK_EXCEEDS_BUDGET: Net risk per lot after charges (Rs {net_risk_1_lot:.2f}) exceeds configured max loss budget (Rs {budget:.2f})"
+            )
+        else:
+            risk_budget_permitted_lots = max(1, theoretical_lots)
+            while risk_budget_permitted_lots > 1:
+                chk = self.calculate_charges_and_net_rr(
+                    strategy=strategy,
+                    entry_prem=prem_levels["entry_premium"],
+                    stop_prem=prem_levels["stop_loss_premium"],
+                    t1_prem=prem_levels["target_1_premium"],
+                    qty=risk_budget_permitted_lots * lot_size,
+                    lot_size=lot_size,
+                    strike=strike,
+                    option_type=option_type,
+                )
+                if chk["net_loss_stop"] <= budget:
+                    break
+                risk_budget_permitted_lots -= 1
+
+        # Tier 3: Capital Permitted Lots (unconstrained division of available capital by margin/capital per lot)
+        if capital_req_1_lot > 0:
+            capital_permitted_lots = int(capital_limit // capital_req_1_lot)
+        else:
+            capital_permitted_lots = 0
+
+        if capital_permitted_lots == 0:
+            rejection_reasons.append(
+                f"INSUFFICIENT_CAPITAL: Capital/margin required per lot (Rs {capital_req_1_lot:,.2f}) exceeds available capital (Rs {capital_limit:,.2f})"
+            )
+
+        # Tier 4: Final Permitted Lots
+        final_permitted_lots = min(risk_budget_permitted_lots, capital_permitted_lots)
+        lots = final_permitted_lots
+        qty = lots * lot_size if lots > 0 else lot_size  # reference size for quote/charge calculations
+
+        # Charges & Net R:R (computed on active quantity if lots > 0, else 1 lot reference)
+        charges_info = self.calculate_charges_and_net_rr(
+            strategy=strategy,
+            entry_prem=prem_levels["entry_premium"],
+            stop_prem=prem_levels["stop_loss_premium"],
+            t1_prem=prem_levels["target_1_premium"],
+            qty=qty,
+            lot_size=lot_size,
+            strike=strike,
+            option_type=option_type,
+        )
+
+        net_rr = charges_info["net_reward_risk"]
+        if net_rr < min_rr:
+            rejection_reasons.append(
+                f"RR_BELOW_MINIMUM: Net R:R ({net_rr}:1) below configured minimum ({min_rr}:1)"
+            )
+
+        # Margin & Capital Check evaluated for final lots (or 1 lot if 0 for reference)
+        margin_info = self.evaluate_margin_and_capital(
+            strategy=strategy,
+            strike=strike,
+            lot_size=lot_size,
+            entry_prem=prem_levels["entry_premium"],
+            lots=max(1, lots),
+            spread_strike=spread_k,
+            spread_prem=spread_p,
+        )
+
+        if lots > 0 and margin_info["capital_required"] > capital_limit:
+            rejection_reasons.append(
+                f"INSUFFICIENT_CAPITAL: Capital/margin required (Rs {margin_info['capital_required']:,.2f}) exceeds available capital (Rs {capital_limit:,.2f})"
+            )
+
+        # DEF-01: Genuine Live Data Freshness & Provenance Gating
+        now_dt = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
+
+        is_live_provenance, freshness_rejections, freshness_meta = self.validate_live_data_freshness(
+            contract_data=contract_data,
+            underlying_setup=underlying_setup,
+            now_utc=now_dt,
+        )
+
+        # Preserve original raw timestamps for auditability without silent replacement
+        raw_quote_ts = contract_data.get("quote_timestamp") or contract_data.get("timestamp")
+        raw_retrieval_ts = contract_data.get("retrieval_timestamp") or contract_data.get("fetched_at")
+        raw_candle_ts = freshness_meta.get("candle_timestamp_raw") or underlying_setup.get("candle_timestamp") or underlying_setup.get("last_data_timestamp")
+        tier = contract_data.get("tier") or underlying_setup.get("data_tier") or "HISTORICAL"
+        data_status = contract_data.get("data_status") or underlying_setup.get("data_status") or "HISTORICAL"
+        is_live = bool(contract_data.get("is_live", False))
+
+        is_risk_valid = len(rejection_reasons) == 0
+
+        # Signal State Assignment
+        if not is_risk_valid:
+            signal_state = STATE_SIGNAL_REJECTED
+            rejection_reasons.extend(freshness_rejections)
+        elif not is_live_provenance:
+            # Stale, off-hours, unparsable, or historical data cannot be validated for live execution
+            signal_state = STATE_HISTORICAL_ANALYSIS
+            rejection_reasons.extend(freshness_rejections)
+        else:
+            signal_state = STATE_SIGNAL_VALIDATED
+
+        is_actionable = bool(is_risk_valid and is_live_provenance)
+        is_approved = bool(signal_state in (STATE_SIGNAL_VALIDATED, STATE_HISTORICAL_ANALYSIS))
+
+        # Quote verifiability & executable status
+        has_verifiable_quotes = bool(
+            raw_quote_ts is not None and raw_quote_ts != "" and
+            freshness_meta.get("is_market_open", False) and
+            is_live_provenance
+        )
+        quote_classification = (
+            "REAL_TIME_VERIFIED"
+            if has_verifiable_quotes
+            else "HISTORICAL_INDICATIVE"
+        )
+        execution_recon["is_executable"] = has_verifiable_quotes
+        execution_recon["quote_classification"] = quote_classification
+        execution_recon["quote_timestamp"] = raw_quote_ts
+        execution_recon["retrieval_timestamp"] = raw_retrieval_ts
+        execution_recon["executable_note"] = (
+            "Verified live real-time market quote."
+            if has_verifiable_quotes
+            else "HISTORICAL INDICATIVE: Quote lacks verifiable live exchange quote timestamp or market session is closed. NOT executable."
+        )
+
+        # Construct spread legs structure if applicable (Phase 5 Fix)
+        legs_data = [
+            {
+                "leg_index": 1,
+                "role": "PRIMARY",
+                "side": "SELL" if is_seller else "BUY",
+                "symbol": contract_sym,
+                "strike": strike,
+                "option_type": option_type,
+                "expiry": expiry,
+                "entry_price": prem_levels["entry_premium"],
+                "bid": bid,
+                "ask": ask,
+                "quantity": qty,
+                "lot_size": lot_size,
+                "delta": delta,
+                "iv": iv,
+            }
+        ]
+        if spread_contract:
+            legs_data.append({
+                "leg_index": 2,
+                "role": "HEDGE",
+                "side": "BUY" if is_seller else "SELL",
+                "symbol": spread_contract.get("symbol", f"{underlying}_{spread_k}_{option_type}"),
+                "strike": spread_k,
+                "option_type": option_type,
+                "expiry": expiry,
+                "entry_price": spread_p,
+                "bid": spread_contract.get("bid"),
+                "ask": spread_contract.get("ask"),
+                "quantity": qty,
+                "lot_size": lot_size,
+                "delta": spread_contract.get("delta"),
+                "iv": spread_contract.get("iv"),
+            })
+
+        # 3. Auditable Data Provenance
+        data_prov = {
+            "data_provider": str(contract_data.get("provider") or "upstox"),
+            "quote_provenance": contract_data.get("quote_provenance", "UPSTOX_REST_SNAPSHOT"),
+            "exchange_quote_timestamp": raw_quote_ts,
+            "underlying_candle_timestamp": raw_candle_ts,
+            "retrieval_timestamp": raw_retrieval_ts,
+            "quote_age_seconds": freshness_meta.get("quote_age_seconds"),
+            "candle_age_seconds": freshness_meta.get("candle_age_seconds"),
+            "retrieval_age_seconds": freshness_meta.get("retrieval_age_seconds"),
+            "data_tier": tier,
+            "market_session_status": "OPEN" if freshness_meta.get("is_market_open") else "CLOSED",
+            "freshness_validation_result": "PASSED" if is_live_provenance else "FAILED",
+            "freshness_errors": freshness_rejections,
+        }
+
+        # 4. Underlying Setup Evidence
+        strike_intv = meta.get("strike_interval") or 50.0
+        atm_k = meta.get("atm_strike") or (round(spot_entry / strike_intv) * strike_intv)
+
+        u_trig_dict = underlying_setup.get("trigger") or {}
+        trig_price = float(
+            u_trig_dict.get("price")
+            or underlying_setup.get("trigger_price")
+            or spot_entry
+        )
+        trig_time = str(u_trig_dict.get("time") or u_trig_dict.get("close_time") or "Current Bar")
+        trig_reason = str(underlying_setup.get("reason") or u_trig_dict.get("reason") or "Underlying technical trigger")
+
+        comp_candle = (underlying_setup.get("candle_context") or {}).get("completed_candle") or {}
+        latest_candle_time = str(comp_candle.get("bar_end") or raw_candle_ts or "15:30")
+        latest_candle_close = float(u_last.get("close") or underlying_setup.get("spot_price") or spot_entry)
+
+        # Distinguish historical trigger activation from current setup validity
+        candle_date = (
+            underlying_setup.get("candle_session")
+            or underlying_setup.get("date")
+            or (comp_candle.get("bar_end", "").split("T")[0] if "T" in str(comp_candle.get("bar_end", "")) else None)
+        )
+        now_ist_date = now_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
+
+        is_stale_session = bool(candle_date and candle_date != now_ist_date)
+        is_breached = bool(
+            (spot_entry < spot_stop if "BULL" in direction else spot_entry > spot_stop)
+            if (spot_entry > 0 and spot_stop > 0) else False
+        )
+
+        if is_breached:
+            setup_validity = "INVALIDATED"
+        elif is_stale_session or not freshness_meta.get("is_market_open", False):
+            setup_validity = "HISTORICAL_TRIGGER_INACTIVE"
+        else:
+            setup_validity = "CURRENT_SESSION_ACTIVE"
+
+        setup_evidence = {
+            "setup_name": underlying_setup.get("setup") or "intraday_level",
+            "directional_bias": direction,
+            "trigger_price": trig_price,
+            "trigger_time": trig_time,
+            "trigger_reason": trig_reason,
+            "current_spot": latest_candle_close,
+            "latest_candle_time": latest_candle_time,
+            "setup_validity_state": setup_validity,
+            "entry_trigger": {
+                "price": trig_price,
+                "current_spot": latest_candle_close,
+                "time": trig_time,
+                "latest_candle_time": latest_candle_time,
+                "reason": trig_reason,
+            },
+            "invalidation_level": spot_stop,
+            "support_resistance_level": (
+                underlying_setup.get("level")
+                or (underlying_setup.get("opening_range") or {}).get("high" if "BULL" in direction else "low")
+                or spot_stop
+            ),
+            "scanner_result": underlying_setup.get("status") or (underlying_setup.get("decision") or {}).get("state") or "TRIGGERED",
+            "setup_timestamp": (
+                raw_candle_ts
+                or underlying_setup.get("candle_timestamp")
+                or underlying_setup.get("last_data_timestamp")
+                or trig_time
+            ),
+            "strike_selection_rationale": (
+                f"Selected {strike:.1f} ({'ATM' if math.isclose(strike, atm_k, abs_tol=10.0) else 'OTM'}) {option_type} "
+                f"with Delta {delta:+.2f} and IV {iv:.1f}% for optimal directional gearing in expiry {expiry}."
+            ),
+        }
+
+        rationale = (
+            f"Evaluated {strategy} on {underlying} ({strike} {option_type}, Delta: {delta:+.2f}, IV: {iv:.1f}%). "
+            f"Net R:R: {net_rr}:1. "
+            + (f"Approved ({signal_state})." if is_approved else f"REJECTED: {'; '.join(rejection_reasons)}.")
+        )
+
+        contract = {
+            "underlying_instrument": underlying,
+            "direction": direction,
+            "strategy": strategy,
+            "option_type": option_type,
+            "contract": contract_sym,
+            "expiry": expiry,
+            "strike": strike,
+            "current_premium": prem_levels["entry_premium"],
+            "quote_timestamp": raw_quote_ts,
+            "retrieval_timestamp": raw_retrieval_ts,
+            "bid": bid,
+            "ask": ask,
+            "execution_reconciliation": execution_recon,
+            "underlying_setup_evidence": setup_evidence,
+            "data_provenance": data_prov,
+            "underlying_trigger": {
+                "price": trig_price,
+                "current_spot": latest_candle_close,
+                "setup": underlying_setup.get("setup"),
+                "interval": underlying_setup.get("interval", "5m"),
+                "time": trig_time,
+                "latest_candle_time": latest_candle_time,
+                "invalidation_level": spot_stop,
+                "setup_validity_state": setup_validity,
+            },
+            "option_entry_range": {
+                "min": round_tick(prem_levels["entry_premium"] * 0.98, 0.05),
+                "max": round_tick(prem_levels["entry_premium"] * 1.02, 0.05),
+                "ideal": prem_levels["entry_premium"],
+            },
+            "stop_loss": prem_levels["stop_loss_premium"],
+            "target_1": prem_levels["target_1_premium"],
+            "target_2": prem_levels["target_2_premium"],
+            "expected_risk_reward_after_charges": net_rr,
+            "charges_summary": charges_info,
+            "maximum_loss": margin_info["max_loss"],
+            "capital_margin_requirement": margin_info["capital_required"],
+            "margin_details": margin_info,
+            "position_sizing": {
+                "lots": lots,
+                "lot_size": lot_size,
+                "total_quantity": lots * lot_size,
+                "theoretical_lots": theoretical_lots,
+                "risk_budget_permitted_lots": risk_budget_permitted_lots,
+                "capital_permitted_lots": capital_permitted_lots,
+                "final_permitted_lots": final_permitted_lots,
+                "capital_required_per_lot": capital_req_1_lot,
+                "margin_required_per_lot": margin_req_1_lot,
+                "risk_per_lot_inr": risk_per_lot,
+                "net_risk_per_lot_inr": net_risk_1_lot,
+                "budget_max_loss_inr": budget,
+                "actual_net_risk_inr": charges_info["net_loss_stop"] if lots > 0 else 0.0,
+                "stop_loss_risk_per_lot_inr": net_risk_1_lot,
+                "total_stop_loss_risk_inr": charges_info["net_loss_stop"] if lots > 0 else 0.0,
+                "maximum_possible_loss": margin_info["max_loss"],
+                "maximum_possible_loss_value": margin_info.get("max_loss_value"),
+                "risk_budget_policy_explanation": (
+                    f"Position sized for stop-loss risk (Rs {charges_info['net_loss_stop'] if lots > 0 else 0.0:,.2f} fits within Rs {budget:,.0f} budget). "
+                    f"Note: Maximum possible loss ({margin_info['max_loss']}) is substantially higher in adverse gap/worthless expiry scenarios."
+                ),
+            },
+            "legs": legs_data,
+            "confirmation_conditions": (
+                f"Requires completed candle confirmation on {underlying_setup.get('interval', '5m')} bar "
+                f"with minimum volume participation and option bid/ask spread <= {DEFAULT_SPREAD_TOLERANCE_PCT}%."
+            ),
+            "invalidation_conditions": (
+                f"Underlying crosses invalidation level {spot_stop} or option premium drops below {prem_levels['stop_loss_premium']}."
+            ),
+            "data_provider": contract_data.get("provider", "upstox"),
+            "data_quality": {
+                "tier": tier,
+                "data_status": data_status,
+                "is_live": is_live,
+                "is_simulated": contract_data.get("is_simulated", False),
+            },
+            "freshness_details": freshness_meta,
+            "signal_expiry": "15:15 IST (End of Intraday Session)",
+            "selection_rationale": rationale,
+            "signal_state": signal_state,
+            "is_actionable": is_actionable,
+            "rejection_reasons": rejection_reasons,
+        }
+
+        return contract
+
+    def is_valid_session_setup(self, setup_res: Optional[Dict[str, Any]], now_utc: datetime.datetime) -> bool:
+        """
+        DEF-04: Reject stale session triggers.
+        - decision_state=NO TRADE cannot be overridden by status=triggered.
+        - Previous-session triggers cannot become active current-session setups.
+        """
+        if not setup_res:
+            return False
+
+        dec_state = setup_res.get("decision_state")
+        sub_state = setup_res.get("sub_state")
+        status = setup_res.get("status")
+
+        # Non-index equity with decision_state=NO TRADE is an absolute refusal
+        if dec_state == "NO TRADE":
+            if sub_state != "ANALYTICAL_ONLY_INDEX":
+                return False
+            # For spot index, must have active triggered/waiting status
+            if status not in ("triggered", "waiting"):
+                return False
+        elif dec_state not in ("ENTRY CONFIRMED", "ENTRY CANDIDATE", "SETUP"):
+            return False
+
+        # Current-session check: Trigger / candle must belong to current session if market is open
+        now_dt = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=datetime.timezone.utc)
+        now_ist_dt = now_dt.astimezone(calendar_in.IST)
+        current_session_date = now_ist_dt.strftime("%Y-%m-%d")
+
+        candle_ctx = setup_res.get("candle_context") or {}
+        comp_candle = candle_ctx.get("completed_candle") or {}
+        raw_date = (
+            setup_res.get("candle_session")
+            or setup_res.get("date")
+            or (comp_candle.get("bar_end", "").split("T")[0] if "T" in str(comp_candle.get("bar_end", "")) else None)
+        )
+
+        is_market_open = calendar_in.is_market_hours_in(now_utc, exchange="NSE")
+        if is_market_open and raw_date and raw_date != current_session_date:
+            return False  # Previous session trigger rejected in open market
+
+        return True
+
+    def analyze_symbol_for_options(
+        self,
+        symbol: str,
+        underlying_chart: Optional[Dict[str, Any]] = None,
+        underlying_setup: Optional[Dict[str, Any]] = None,
+        strategy_preference: Optional[str] = None,
+        now_utc: Optional[datetime.datetime] = None,
+        max_loss_budget: Optional[float] = None,
+        min_reward_risk: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive dual-directional options analysis for a given symbol.
+
+        Phase 2 Fix: Removed synthetic setup fabrication.
+        If underlying_chart is None, fetches the real chart using entry.get_chart().
+        If no real chart or no technical setup exists, returns NO TRADE.
+        """
+        now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        budget = max_loss_budget if max_loss_budget is not None else self.max_loss_budget
+        min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
+
+        meta_valid, meta, meta_err = self.validate_metadata(symbol)
+        if not meta_valid:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": f"INVALID_CONTRACT_METADATA: {meta_err}",
+                "signals": [],
+            }
+
+        # 1. Obtain Real Underlying Chart (Phase 2 Fix: No synthetic fabrication)
+        chart = underlying_chart
+        if chart is None:
+            try:
+                chart = entry.get_chart(symbol, interval="5m", market="IN")
+            except Exception as e:
+                return {
+                    "symbol": symbol,
+                    "status": "NO_TRADE",
+                    "reason": f"MISSING_UNDERLYING_CHART: Failed to load real OHLCV chart data ({e})",
+                    "signals": [],
+                }
+
+        if not chart or not chart.get("bars") or len(chart["bars"]) < 5:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": "MISSING_UNDERLYING_CHART: Insufficient real bars in chart",
+                "signals": [],
+            }
+
+        # 2. Fetch Option Chain
+        chain = self.fetch_normalized_chain(symbol, expiry=meta.get("expiry"), now=now)
+        if not chain or not chain.strikes_data:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": "STALE_OR_MISSING_DATA: Option chain unavailable from authorized provider",
+                "signals": [],
+            }
+
+        spot_price = chain.underlying_price
+        atm_strike = chain.atm_strike
+        if atm_strike is None or spot_price <= 0:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": "INVALID_PRICE_DATA: Missing spot price or ATM strike in chain",
+                "signals": [],
+            }
+
+        # 2b. Integrate verified live WebSocket quotes if streamer is active
+        ws_live_summary = None
+        if self.streamer is not None:
+            if getattr(self.streamer, "is_connected", False):
+                try:
+                    opt_keys = []
+                    for s_k, legs in (chain.strikes_data or {}).items():
+                        if isinstance(legs, dict):
+                            for l_side in ("ce", "pe"):
+                                c_info = legs.get(l_side)
+                                if isinstance(c_info, dict) and c_info.get("instrument_key"):
+                                    opt_keys.append(c_info["instrument_key"])
+                    if opt_keys:
+                        unsub = [k for k in opt_keys if k not in self.streamer.active_keys()]
+                        if unsub:
+                            self.streamer.subscribe(unsub, mode="full")
+                        ws_live_summary = self.streamer.apply_live_quotes(chain, max_age_seconds=30.0, now_dt=now)
+                except Exception as ws_err:
+                    ws_live_summary = {"error": str(ws_err)}
+
+        # 3. Evaluate Real Technical Setups on Chart Bars
+        bull_setups = ["vwap_reclaim", "breakout_intraday", "orb"]
+        bear_setups = ["vwap_rejection", "breakdown_intraday", "orb_breakdown"]
+
+        found_bull_setup = None
+        found_bear_setup = None
+
+        if underlying_setup is not None:
+            if self.is_valid_session_setup(underlying_setup, now):
+                s_side = underlying_setup.get("side", "").lower()
+                s_name = underlying_setup.get("setup", "")
+                if s_side == "buy" or s_name in bull_setups:
+                    found_bull_setup = underlying_setup
+                elif s_side == "sell" or s_name in bear_setups:
+                    found_bear_setup = underlying_setup
+
+        if not found_bull_setup and not found_bear_setup:
+            for s_name in bull_setups:
+                try:
+                    res_b = entry.evaluate(chart, now, setup=s_name, market="IN")
+                    if self.is_valid_session_setup(res_b, now):
+                        found_bull_setup = res_b
+                        break
+                except Exception:
+                    continue
+
+            for s_name in bear_setups:
+                try:
+                    res_bear = entry.evaluate(chart, now, setup=s_name, market="IN")
+                    if self.is_valid_session_setup(res_bear, now):
+                        found_bear_setup = res_bear
+                        break
+                except Exception:
+                    continue
+
+        # If neither bullish nor bearish setups qualify on real chart
+        if not found_bull_setup and not found_bear_setup:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": "NO_QUALIFIED_INTRADAY_SETUP: Real chart price action does not meet strategy rules",
+                "signals": [],
+            }
+
+        signals = []
+
+        chain_retrieval_ts = None
+        raw_ts = getattr(chain, "timestamp", None)
+        if raw_ts is not None:
+            if isinstance(raw_ts, (int, float)):
+                chain_retrieval_ts = datetime.datetime.fromtimestamp(raw_ts, tz=datetime.timezone.utc).isoformat()
+            elif isinstance(raw_ts, str):
+                chain_retrieval_ts = raw_ts
+            elif isinstance(raw_ts, datetime.datetime):
+                chain_retrieval_ts = raw_ts.isoformat()
+
+        def _enrich_contract(c_dict):
+            if not isinstance(c_dict, dict):
+                return c_dict
+            c = dict(c_dict)
+            if c.get("retrieval_timestamp") is None and chain_retrieval_ts:
+                c["retrieval_timestamp"] = chain_retrieval_ts
+            if c.get("provider") is None and getattr(chain, "provider", None):
+                c["provider"] = chain.provider
+            return c
+
+        # --- A. Bullish Opportunities (BUY CE, SELL PE, BULL CALL SPREAD) ---
+        if found_bull_setup:
+            ce_strike = chain.select_strike("ATM", "CE") or atm_strike
+            ce_contract = _enrich_contract(chain.get_contract(ce_strike, "CE"))
+            if ce_contract:
+                liq_ok, _, _ = self.validate_liquidity(ce_contract)
+                if liq_ok:
+                    sig_ce = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BULLISH",
+                        strategy=STRATEGY_BUY_CE,
+                        option_type="CE",
+                        strike=ce_strike,
+                        contract_data=ce_contract,
+                        underlying_setup=found_bull_setup,
+                        meta=meta,
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                    )
+                    signals.append(sig_ce)
+
+            # SELL PE
+            otm_pe_strike = chain.select_strike("OTM1", "PE") or (atm_strike - meta.get("strike_interval", 50.0))
+            otm_pe_contract = _enrich_contract(chain.get_contract(otm_pe_strike, "PE"))
+            if otm_pe_contract:
+                liq_ok, _, _ = self.validate_liquidity(otm_pe_contract)
+                if liq_ok:
+                    sig_sell_pe = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BULLISH_OR_SIDEWAYS",
+                        strategy=STRATEGY_SELL_PE,
+                        option_type="PE",
+                        strike=otm_pe_strike,
+                        contract_data=otm_pe_contract,
+                        underlying_setup=found_bull_setup,
+                        meta=meta,
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                    )
+                    signals.append(sig_sell_pe)
+
+            # BULL CALL SPREAD
+            otm2_ce_strike = chain.select_strike("OTM2", "CE")
+            otm2_ce_contract = _enrich_contract(chain.get_contract(otm2_ce_strike, "CE")) if otm2_ce_strike else None
+            if ce_contract and otm2_ce_contract:
+                l1, _, _ = self.validate_liquidity(ce_contract)
+                l2, _, _ = self.validate_liquidity(otm2_ce_contract)
+                if l1 and l2:
+                    sig_bcs = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BULLISH",
+                        strategy=STRATEGY_BULL_CALL_SPREAD,
+                        option_type="SPREAD",
+                        strike=ce_strike,
+                        contract_data=ce_contract,
+                        underlying_setup=found_bull_setup,
+                        meta=meta,
+                        spread_contract={
+                            "strike": otm2_ce_strike,
+                            "symbol": otm2_ce_contract.get("symbol"),
+                            "last_price": otm2_ce_contract.get("last_price"),
+                            "bid": otm2_ce_contract.get("bid"),
+                            "ask": otm2_ce_contract.get("ask"),
+                            "delta": (otm2_ce_contract.get("greeks") or {}).get("delta"),
+                            "iv": otm2_ce_contract.get("iv"),
+                        },
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                    )
+                    signals.append(sig_bcs)
+
+        # --- B. Bearish Opportunities (BUY PE, SELL CE, BEAR PUT SPREAD) ---
+        if found_bear_setup:
+            pe_strike = chain.select_strike("ATM", "PE") or atm_strike
+            pe_contract = _enrich_contract(chain.get_contract(pe_strike, "PE"))
+            if pe_contract:
+                liq_ok, _, _ = self.validate_liquidity(pe_contract)
+                if liq_ok:
+                    sig_pe = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BEARISH",
+                        strategy=STRATEGY_BUY_PE,
+                        option_type="PE",
+                        strike=pe_strike,
+                        contract_data=pe_contract,
+                        underlying_setup=found_bear_setup,
+                        meta=meta,
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                    )
+                    signals.append(sig_pe)
+
+            # SELL CE
+            otm_ce_strike = chain.select_strike("OTM1", "CE") or (atm_strike + meta.get("strike_interval", 50.0))
+            otm_ce_contract = _enrich_contract(chain.get_contract(otm_ce_strike, "CE"))
+            if otm_ce_contract:
+                liq_ok, _, _ = self.validate_liquidity(otm_ce_contract)
+                if liq_ok:
+                    sig_sell_ce = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BEARISH_OR_SIDEWAYS",
+                        strategy=STRATEGY_SELL_CE,
+                        option_type="CE",
+                        strike=otm_ce_strike,
+                        contract_data=otm_ce_contract,
+                        underlying_setup=found_bear_setup,
+                        meta=meta,
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                    )
+                    signals.append(sig_sell_ce)
+
+        if not signals:
+            return {
+                "symbol": symbol,
+                "status": "NO_TRADE",
+                "reason": "INSUFFICIENT_LIQUIDITY_OR_HIGH_SPREAD: Evaluated option strikes failed liquidity criteria",
+                "signals": [],
+            }
+
+        is_market_open = calendar_in.is_market_hours_in(now, exchange="NSE")
+        session_status = "MARKET_OPEN (LIVE SESSION)" if is_market_open else "MARKET_CLOSED (POST-MARKET REVIEW)"
+
+        return {
+            "symbol": symbol,
+            "status": "OPPORTUNITIES_IDENTIFIED",
+            "pcr": chain.pcr,
+            "atm_strike": atm_strike,
+            "underlying_price": spot_price,
+            "expiry": meta.get("expiry"),
+            "session_status": session_status,
+            "signals": signals,
+        }
+
+    def rank_opportunities(self, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Rank evaluated options opportunities by composite quality:
+        Score = (Setup & R:R * 0.45) + (Risk Structure * 0.30) + (Data Tier * 0.25)
+        De-duplicates overlapping or correlated contracts.
+        """
+        ranked = []
+        seen_contracts = set()
+
+        for sig in signals:
+            c_key = f"{sig['underlying_instrument']}_{sig['strategy']}_{sig['strike']}"
+            if c_key in seen_contracts:
+                continue
+            seen_contracts.add(c_key)
+
+            rr = float(sig.get("expected_risk_reward_after_charges") or 0.0)
+            margin_details = sig.get("margin_details") or {}
+            is_valid = sig.get("is_actionable", False) or sig.get("signal_state") == STATE_HISTORICAL_ANALYSIS
+
+            # Score components
+            score_rr = min(5.0, max(0.0, rr)) / 5.0
+            score_struct = 1.0 if not margin_details.get("is_undefined_risk") else 0.4
+
+            dq = sig.get("data_quality") or {}
+            score_tier = 1.0 if dq.get("is_live") else (0.7 if dq.get("tier") == "HISTORICAL" else 0.4)
+
+            # Penalize rejected trades heavily
+            penalty = 1.0 if is_valid else 0.1
+
+            composite_score = round(((score_rr * 0.45) + (score_struct * 0.30) + (score_tier * 0.25)) * penalty, 3)
+            sig["ranking_score"] = composite_score
+            ranked.append(sig)
+
+        ranked.sort(key=lambda s: s["ranking_score"], reverse=True)
+        return ranked
+
+
+# ---------------------------------------------------------------- CLI
+
+def cmd_chain(args, specialist: OptionsIntelligenceSpecialist):
+    """Fetch and display option chain."""
+    sym = args.symbol.upper()
+    chain = specialist.fetch_normalized_chain(sym, expiry=args.expiry)
+    if not chain:
+        print(f"Error: Unable to fetch option chain for {sym}.")
+        return 1
+
+    print(f"\n=================== OPTION CHAIN: {chain.underlying} ===================")
+    print(f"Underlying Price: {chain.underlying_price} | Expiry: {chain.expiry}")
+    print(f"ATM Strike: {chain.atm_strike} | PCR: {chain.pcr} | Tier: {chain.data_tier}")
+    print("-" * 75)
+    print(f"{'CE Bid':>8} {'CE Ask':>8} {'CE LTP':>8} {'Strike':^10} {'PE LTP':>8} {'PE Bid':>8} {'PE Ask':>8}")
+    print("-" * 75)
+
+    strikes = chain.get_strikes()
+    atm = chain.atm_strike
+    if atm in strikes:
+        idx = strikes.index(atm)
+        display_strikes = strikes[max(0, idx - 5): min(len(strikes), idx + 6)]
+    else:
+        display_strikes = strikes[:10]
+
+    for k in display_strikes:
+        ce = chain.get_contract(k, "CE") or {}
+        pe = chain.get_contract(k, "PE") or {}
+        star = "*" if k == atm else " "
+        print(
+            f"{ce.get('bid', 0):8.2f} {ce.get('ask', 0):8.2f} {ce.get('last_price', 0):8.2f} "
+            f"{star}{k:^8.1f}{star} "
+            f"{pe.get('last_price', 0):8.2f} {pe.get('bid', 0):8.2f} {pe.get('ask', 0):8.2f}"
+        )
+    print("-" * 75)
+    print("Execution Boundary: Decision-support only. Live broker execution disabled.\n")
+    return 0
+
+
+def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
+    """Analyze underlying symbol and generate all valid options signals."""
+    sym = args.symbol.upper()
+    res = specialist.analyze_symbol_for_options(sym, max_loss_budget=args.budget)
+    if res.get("status") == "NO_TRADE":
+        print(f"\n[NO TRADE] {sym}: {res.get('reason')}\n")
+        return 1
+
+    session_tag = res.get("session_status", "POST-MARKET REVIEW")
+    print(f"\n================ OPTIONS INTELLIGENCE: {sym} ================")
+    print(f"Underlying Spot: {res['underlying_price']} | ATM Strike: {res['atm_strike']} | PCR: {res['pcr']}")
+    print(f"Expiry: {res['expiry']} | Session Status: {session_tag}\n")
+
+    ranked = specialist.rank_opportunities(res["signals"])
+    for i, sig in enumerate(ranked[: args.limit], 1):
+        status_tag = f"[{sig['signal_state']}]"
+        recon = sig.get("execution_reconciliation") or {}
+        prov = sig.get("data_provenance") or {}
+        margin = sig.get("margin_details") or {}
+        evidence = sig.get("underlying_setup_evidence") or {}
+
+        print(f"--- Option Setup #{i}: {sig['strategy']} (Score: {sig['ranking_score']}) {status_tag} ---")
+        print(f"Contract: {sig['contract']} (Strike: {sig['strike']}, Expiry: {sig['expiry']}, Lot Size: {sig['position_sizing']['lot_size']})")
+        print(f"Direction: {sig['direction']} | Lots: {sig['position_sizing']['lots']} ({sig['position_sizing']['total_quantity']} qty)")
+
+        # 1. Underlying setup evidence
+        trig = evidence.get("entry_trigger") or {}
+        print(f"Underlying Setup: {evidence.get('setup_name')} | Bias: {evidence.get('directional_bias')} | Scanner: {evidence.get('scanner_result')}")
+        print(f"Trigger: Spot {trig.get('price')} @ {trig.get('time')} ({trig.get('reason')})")
+        print(f"Invalidation: Spot {evidence.get('invalidation_level')} | Key S/R: Spot {evidence.get('support_resistance_level')}")
+        print(f"Strike Rationale: {evidence.get('strike_selection_rationale')}")
+
+        # 2. Execution price reconciliation
+        print(f"Execution Entry: Rs {sig['current_premium']:.2f} (Conservative {recon.get('baseline_quote_type')}: Rs {recon.get('baseline_quote_price'):.2f}, Slippage: {recon.get('slippage_applied', 0):+.2f} | Bid: Rs {recon.get('bid', 0):.2f}, Ask: Rs {recon.get('ask', 0):.2f}, Spread: {recon.get('spread_pct', 0)}%)")
+
+        # 3. Dynamic exits & net R:R
+        print(f"Stop Loss: Rs {sig['stop_loss']:.2f} | Target 1: Rs {sig['target_1']:.2f} | Target 2: Rs {sig['target_2']:.2f}")
+        print(f"Net R:R: {sig['expected_risk_reward_after_charges']}:1 (Net of STT, NSE txn, SEBI, Stamp Duty, GST, Brokerage)")
+
+        # 4. Margin transparency
+        print(f"Capital / Margin Required: Rs {sig['capital_margin_requirement']:,.2f} [{margin.get('margin_type', 'HEURISTIC_MARGIN_ESTIMATE')}]")
+        print(f"Margin Model: {margin.get('formula')} -> {margin.get('assumptions')}")
+        print(f"Broker Margin Disclaimer: {margin.get('broker_margin_disclaimer')}")
+        print(f"Max Loss: {sig['maximum_loss']}")
+        print(f"Tail Risk: {margin.get('tail_risk')}")
+
+        # 5. Data provenance
+        print(f"Data Provenance: Provider: {prov.get('data_provider')}, Tier: {prov.get('data_tier')}, Session: {prov.get('market_session_status')}, Freshness: {prov.get('freshness_validation_result')}")
+        print(f"Timestamps: Quote: {prov.get('exchange_quote_timestamp')} (Age: {prov.get('quote_age_seconds')}s), Candle: {prov.get('underlying_candle_timestamp')} (Age: {prov.get('candle_age_seconds')}s), Retrieval: {prov.get('retrieval_timestamp')} (Age: {prov.get('retrieval_age_seconds')}s)")
+
+        if sig.get("rejection_reasons"):
+            print(f"Rejections: {'; '.join(sig['rejection_reasons'])}")
+        print(f"Rationale: {sig['selection_rationale']}\n")
+
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="trader-options: Dedicated Options Intelligence Specialist")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_chain = sub.add_parser("chain", help="Fetch and inspect normalized option chain")
+    p_chain.add_argument("--symbol", "-s", default="NIFTY", help="Underlying symbol (default NIFTY)")
+    p_chain.add_argument("--expiry", default=None, help="Option contract expiry date (YYYY-MM-DD)")
+
+    p_analyze = sub.add_parser("analyze", help="Analyze symbol for options buying and selling opportunities")
+    p_analyze.add_argument("--symbol", "-s", default="NIFTY", help="Underlying symbol (default NIFTY)")
+    p_analyze.add_argument("--budget", type=float, default=DEFAULT_MAX_LOSS_INR, help="Max loss risk budget in INR")
+    p_analyze.add_argument("--limit", type=int, default=5, help="Max opportunities to display")
+
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        return 0
+
+    specialist = OptionsIntelligenceSpecialist()
+    if args.cmd == "chain":
+        return cmd_chain(args, specialist)
+    elif args.cmd == "analyze":
+        return cmd_analyze(args, specialist)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

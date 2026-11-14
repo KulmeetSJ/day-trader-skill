@@ -1,0 +1,17 @@
+{
+  "typeCheckingMode": "off",
+  "extraPaths": [
+    "trader-alerts",
+    "trader-analyst",
+    "trader-broker",
+    "trader-budget",
+    "trader-entry",
+    "trader-exit",
+    "trader-news",
+    "trader-options",
+    "trader-pelosi",
+    "trader-risk",
+    "trader-scanner",
+    "trader-timemachine"
+  ]
+}
