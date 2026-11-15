@@ -15,7 +15,8 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -62,6 +63,7 @@ class ScanLock:
         self.max_lock_age_seconds = max_lock_age_seconds
         self.is_acquired = False
         self.fd = None
+        self.lock_token = None
 
     def acquire(self) -> bool:
         """Atomically acquire the scan lock. Returns True on success, raises ScanLockError on failure."""
@@ -72,14 +74,17 @@ class ScanLock:
             except Exception:
                 pass
 
+        token = f"{os.getpid()}_{time.time()}_{uuid.uuid4().hex[:8]}"
         try:
             self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
             payload = json.dumps({
                 "pid": os.getpid(),
+                "token": token,
                 "timestamp": time.time(),
                 "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
             os.write(self.fd, payload.encode("utf-8"))
+            self.lock_token = token
             self.is_acquired = True
             return True
         except FileExistsError:
@@ -90,10 +95,12 @@ class ScanLock:
                     self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
                     payload = json.dumps({
                         "pid": os.getpid(),
+                        "token": token,
                         "timestamp": time.time(),
                         "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     })
                     os.write(self.fd, payload.encode("utf-8"))
+                    self.lock_token = token
                     self.is_acquired = True
                     return True
                 except FileExistsError:
@@ -109,33 +116,39 @@ class ScanLock:
             raise ScanLockError(f"SCAN_LOCK_FAILED: Could not establish atomic scan lock: {str(e)}")
 
     def _is_lock_stale(self) -> bool:
-        """Check if lock file is stale due to dead PID or expired age."""
+        """Check if lock file is stale due to dead PID or ancient abandoned lock."""
         try:
             with open(self.lock_path, "r", encoding="utf-8") as f:
                 data = json.loads(f.read())
             ts = float(data.get("timestamp") or 0.0)
             pid = int(data.get("pid") or 0)
-            if (time.time() - ts) > self.max_lock_age_seconds:
-                return True
+            now_ts = time.time()
+            # If PID belongs to a different process, check process liveness
             if pid > 0 and pid != os.getpid():
                 try:
                     os.kill(pid, 0)
+                    # Process is alive; valid active scan must not lose its lock
+                    return False
                 except OSError:
+                    # Dead process PID; lock is safely stale
                     return True
+            # Abandoned or ancient lock without live PID (> 1 hour)
+            if (now_ts - ts) > 3600.0:
+                return True
             return False
         except Exception:
             return True
 
     def _break_stale_lock(self) -> None:
-        """Remove stale lock file safely."""
+        """Remove stale lock file safely if verified stale."""
         try:
-            if os.path.exists(self.lock_path):
+            if os.path.exists(self.lock_path) and self._is_lock_stale():
                 os.remove(self.lock_path)
         except Exception:
             pass
 
     def release(self) -> None:
-        """Release lock and remove lockfile."""
+        """Release lock and remove lockfile only if owned by this instance."""
         if self.fd is not None:
             try:
                 os.close(self.fd)
@@ -145,7 +158,18 @@ class ScanLock:
         if self.is_acquired:
             try:
                 if os.path.exists(self.lock_path):
-                    os.remove(self.lock_path)
+                    # Verify lock ownership before removing to prevent deleting another process's lock
+                    try:
+                        with open(self.lock_path, "r", encoding="utf-8") as f:
+                            data = json.loads(f.read())
+                        is_owner = (
+                            (self.lock_token and data.get("token") == self.lock_token)
+                            or data.get("pid") == os.getpid()
+                        )
+                        if is_owner:
+                            os.remove(self.lock_path)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             self.is_acquired = False
@@ -429,34 +453,15 @@ class MarketIntelligenceOrchestrator:
         ranked_signals = self.specialist.rank_opportunities(all_signals)
         actionable_signals = [s for s in ranked_signals if s.get("is_actionable")]
         rejected_signals = [s for s in ranked_signals if not s.get("is_actionable")]
-        shortlist = actionable_signals[:top_n]
+        initial_shortlist = actionable_signals[:top_n]
 
-        # Allocate portfolio risk budget and capital across shortlist sequentially
-        remaining_budget = budget
-        remaining_capital = self.specialist.available_capital
-        for sig in shortlist:
-            ps = sig.get("position_sizing", {})
-            net_risk_1_lot = ps.get("net_risk_per_lot_inr", 0.0)
-            cap_req_1_lot = ps.get("capital_required_per_lot", 0.0)
-            if net_risk_1_lot > 0:
-                port_lots_by_risk = int(remaining_budget // net_risk_1_lot)
-            else:
-                port_lots_by_risk = 0
-            if cap_req_1_lot > 0:
-                port_lots_by_cap = int(remaining_capital // cap_req_1_lot)
-            else:
-                port_lots_by_cap = 0
-            port_permitted_lots = max(0, min(port_lots_by_risk, port_lots_by_cap))
-            initial_lots = ps.get("final_permitted_lots", 0)
-            allocated_lots = min(initial_lots, port_permitted_lots)
-            ps["portfolio_permitted_lots"] = port_permitted_lots
-            ps["final_permitted_lots"] = allocated_lots
-            ps["lots"] = allocated_lots
-            ps["total_quantity"] = allocated_lots * ps.get("lot_size", 1)
-            allocated_risk = allocated_lots * net_risk_1_lot
-            allocated_cap = allocated_lots * cap_req_1_lot
-            remaining_budget = max(0.0, remaining_budget - allocated_risk)
-            remaining_capital = max(0.0, remaining_capital - allocated_cap)
+        # Allocate portfolio risk budget and capital across shortlist sequentially (N-4: Recalculate actionable state)
+        shortlist, newly_rejected = self.allocate_portfolio_across_shortlist(
+            shortlist=initial_shortlist,
+            budget=budget,
+            available_capital=self.specialist.available_capital,
+        )
+        rejected_signals.extend(newly_rejected)
 
         # Dynamic Universe Reporting Stats
         all_fo_symbols = get_fo_scan_universe(include_stocks=True)
@@ -501,6 +506,66 @@ class MarketIntelligenceOrchestrator:
             "scan_errors": scan_errors,
             "report_markdown": report_text,
         }
+
+    def allocate_portfolio_across_shortlist(
+        self,
+        shortlist: List[Dict[str, Any]],
+        budget: float,
+        available_capital: Optional[float] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Allocate portfolio risk budget and capital across shortlisted candidates sequentially (N-4).
+        If a candidate receives 0 lots, marks is_actionable=False, signal_state='SIGNAL REJECTED',
+        and moves candidate from shortlist to rejected_signals.
+        """
+        remaining_budget = budget
+        remaining_capital = available_capital if available_capital is not None else self.specialist.available_capital
+        final_shortlist = []
+        newly_rejected = []
+        for sig in shortlist:
+            ps = sig.get("position_sizing", {})
+            net_risk_1_lot = ps.get("net_risk_per_lot_inr", 0.0)
+            cap_req_1_lot = ps.get("capital_required_per_lot", 0.0)
+            if net_risk_1_lot > 0:
+                port_lots_by_risk = int(remaining_budget // net_risk_1_lot)
+            else:
+                port_lots_by_risk = 0
+            if cap_req_1_lot > 0:
+                port_lots_by_cap = int(remaining_capital // cap_req_1_lot)
+            else:
+                port_lots_by_cap = 0
+            port_permitted_lots = max(0, min(port_lots_by_risk, port_lots_by_cap))
+            initial_lots = ps.get("final_permitted_lots", 0)
+            allocated_lots = min(initial_lots, port_permitted_lots)
+            ps["portfolio_permitted_lots"] = port_permitted_lots
+            ps["final_permitted_lots"] = allocated_lots
+            ps["lots"] = allocated_lots
+            ps["total_quantity"] = allocated_lots * ps.get("lot_size", 1)
+
+            if allocated_lots <= 0:
+                sig["is_actionable"] = False
+                sig["signal_state"] = "SIGNAL REJECTED"
+                reasons = list(sig.get("rejection_reasons") or [])
+                if port_lots_by_risk <= 0:
+                    reasons.append(
+                        f"ZERO_LOT_ALLOCATION: Remaining portfolio risk budget (Rs {remaining_budget:,.2f}) insufficient for 1 lot (Rs {net_risk_1_lot:,.2f})"
+                    )
+                elif port_lots_by_cap <= 0:
+                    reasons.append(
+                        f"INSUFFICIENT_REMAINING_CAPITAL: Remaining capital (Rs {remaining_capital:,.2f}) insufficient for 1 lot (Rs {cap_req_1_lot:,.2f})"
+                    )
+                else:
+                    reasons.append("ZERO_LOT_ALLOCATION: Zero lots permitted after sequential portfolio allocation")
+                sig["rejection_reasons"] = reasons
+                newly_rejected.append(sig)
+            else:
+                allocated_risk = allocated_lots * net_risk_1_lot
+                allocated_cap = allocated_lots * cap_req_1_lot
+                remaining_budget = max(0.0, remaining_budget - allocated_risk)
+                remaining_capital = max(0.0, remaining_capital - allocated_cap)
+                final_shortlist.append(sig)
+
+        return final_shortlist, newly_rejected
 
     def _format_report(
         self,
