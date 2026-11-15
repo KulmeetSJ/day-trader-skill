@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +41,123 @@ from options import OptionsIntelligenceSpecialist, DEFAULT_MAX_LOSS_INR
 DEFAULT_SCAN_UNIVERSE = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS"]
 
 
+class ScanLockError(RuntimeError):
+    """Raised when concurrent scan lock cannot be acquired or contention occurs."""
+    pass
+
+
+class ScanLock:
+    """Atomic process-level file lock to prevent concurrent options scans from over-allocating portfolio risk.
+
+    Acquisition uses atomic file creation with O_CREAT | O_EXCL.
+    Stale lock recovery is supported if the owning PID is dead or lock age exceeds max_lock_age_seconds.
+    """
+
+    def __init__(
+        self,
+        lock_path: Optional[str] = None,
+        max_lock_age_seconds: float = 120.0,
+    ):
+        self.lock_path = lock_path or os.path.join(BASE_DIR, "trader", "state", "options_scan.lock")
+        self.max_lock_age_seconds = max_lock_age_seconds
+        self.is_acquired = False
+        self.fd = None
+
+    def acquire(self) -> bool:
+        """Atomically acquire the scan lock. Returns True on success, raises ScanLockError on failure."""
+        lock_dir = os.path.dirname(self.lock_path)
+        if lock_dir and not os.path.exists(lock_dir):
+            try:
+                os.makedirs(lock_dir, exist_ok=True)
+            except Exception:
+                pass
+
+        try:
+            self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            payload = json.dumps({
+                "pid": os.getpid(),
+                "timestamp": time.time(),
+                "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            })
+            os.write(self.fd, payload.encode("utf-8"))
+            self.is_acquired = True
+            return True
+        except FileExistsError:
+            # Check if existing lock is stale
+            if self._is_lock_stale():
+                self._break_stale_lock()
+                try:
+                    self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                    payload = json.dumps({
+                        "pid": os.getpid(),
+                        "timestamp": time.time(),
+                        "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    })
+                    os.write(self.fd, payload.encode("utf-8"))
+                    self.is_acquired = True
+                    return True
+                except FileExistsError:
+                    pass
+
+            raise ScanLockError(
+                f"CONCURRENT_SCAN_BLOCKED: Another market intelligence scan is currently active "
+                f"(lock held at {self.lock_path}). Concurrent risk allocation blocked."
+            )
+        except Exception as e:
+            if isinstance(e, ScanLockError):
+                raise
+            raise ScanLockError(f"SCAN_LOCK_FAILED: Could not establish atomic scan lock: {str(e)}")
+
+    def _is_lock_stale(self) -> bool:
+        """Check if lock file is stale due to dead PID or expired age."""
+        try:
+            with open(self.lock_path, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            ts = float(data.get("timestamp") or 0.0)
+            pid = int(data.get("pid") or 0)
+            if (time.time() - ts) > self.max_lock_age_seconds:
+                return True
+            if pid > 0 and pid != os.getpid():
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return True
+            return False
+        except Exception:
+            return True
+
+    def _break_stale_lock(self) -> None:
+        """Remove stale lock file safely."""
+        try:
+            if os.path.exists(self.lock_path):
+                os.remove(self.lock_path)
+        except Exception:
+            pass
+
+    def release(self) -> None:
+        """Release lock and remove lockfile."""
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
+        if self.is_acquired:
+            try:
+                if os.path.exists(self.lock_path):
+                    os.remove(self.lock_path)
+            except Exception:
+                pass
+            self.is_acquired = False
+
+    def __enter__(self) -> "ScanLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
+
 def get_fo_scan_universe(include_stocks: bool = True) -> List[str]:
     """Dynamically load eligible Indian F&O universe (indices + liquid F&O stocks)."""
     core_indices = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
@@ -63,8 +181,53 @@ def get_fo_scan_universe(include_stocks: bool = True) -> List[str]:
 class MarketIntelligenceOrchestrator:
     """Coordinates specialists to deliver human-readable market intelligence."""
 
-    def __init__(self):
-        self.specialist = OptionsIntelligenceSpecialist()
+    def __init__(
+        self,
+        specialist: Optional[OptionsIntelligenceSpecialist] = None,
+        streamer: Optional[Any] = None,
+        portfolio_path: Optional[str] = None,
+        broker_state_path: Optional[str] = None,
+        lock_path: Optional[str] = None,
+    ):
+        self.portfolio_path = portfolio_path or os.path.join(BASE_DIR, "trader", "portfolio.json")
+        self.broker_state_path = broker_state_path or os.path.join(BASE_DIR, "trader", "state", "broker.json")
+        self.lock_path = lock_path or os.path.join(BASE_DIR, "trader", "state", "options_scan.lock")
+        if specialist is not None:
+            self.specialist = specialist
+            if streamer is not None and getattr(self.specialist, "streamer", None) is None:
+                self.specialist.streamer = streamer
+        else:
+            if streamer is None:
+                try:
+                    prov = data_in.get_market_data_provider("upstox")
+                    if prov and hasattr(prov, "create_streamer") and getattr(prov, "has_credentials", False):
+                        streamer = prov.create_streamer()
+                except Exception:
+                    streamer = None
+            self.specialist = OptionsIntelligenceSpecialist(streamer=streamer)
+
+        self.streamer = streamer or getattr(self.specialist, "streamer", None)
+
+    def close(self) -> None:
+        """Cleanly shutdown active streamer connection if open."""
+        if self.streamer is not None and getattr(self.streamer, "is_connected", False):
+            try:
+                self.streamer.close()
+            except Exception:
+                pass
+        if hasattr(self, "specialist") and hasattr(self.specialist, "streamer"):
+            spec_streamer = getattr(self.specialist, "streamer", None)
+            if spec_streamer is not None and spec_streamer is not self.streamer and getattr(spec_streamer, "is_connected", False):
+                try:
+                    spec_streamer.close()
+                except Exception:
+                    pass
+
+    def __enter__(self) -> "MarketIntelligenceOrchestrator":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def detect_intent(self, query: str) -> Dict[str, Any]:
         """Detect trader intent and parameters from natural language query."""
@@ -81,11 +244,11 @@ class MarketIntelligenceOrchestrator:
                 break
 
         # Strategy / direction extraction
-        if "selling" in q or "sell" in q or "credit" in q:
+        if re.search(r"\b(selling|sell|credit)\b", q):
             filter_strategy = "SELLING"
-        elif "bearish" in q or "down" in q or "short" in q or "pe" in q:
+        elif re.search(r"\b(bearish|put|pe|short)\b", q):
             direction_bias = "BEARISH"
-        elif "bullish" in q or "up" in q or "long" in q or "ce" in q:
+        elif re.search(r"\b(bullish|call|ce|long)\b", q):
             direction_bias = "BULLISH"
 
         if target_symbol:
@@ -114,6 +277,44 @@ class MarketIntelligenceOrchestrator:
     ) -> Dict[str, Any]:
         """
         Execute full multi-specialist workflow based on natural language query or scan mode.
+        Protected by atomic ScanLock to prevent concurrent risk allocation and scan contention.
+        """
+        try:
+            with ScanLock(lock_path=self.lock_path):
+                return self._run_market_intelligence_locked(
+                    query=query, universe=universe, top_n=top_n, budget=budget
+                )
+        except ScanLockError as sle:
+            err_msg = str(sle)
+            return {
+                "status": "SCAN_BLOCKED",
+                "reason": err_msg,
+                "query": query,
+                "session_status": "BLOCKED",
+                "total_eligible": 0,
+                "passed_to_scanner": 0,
+                "successfully_scanned": 0,
+                "failed_count": 0,
+                "skipped_count": 0,
+                "coverage_pct": 0.0,
+                "total_evaluated": 0,
+                "total_signals_identified": 0,
+                "underlying_summaries": {},
+                "shortlist": [],
+                "rejected_signals": [],
+                "scan_errors": [err_msg],
+                "report_markdown": f"### Scan Blocked\n\n{err_msg}",
+            }
+
+    def _run_market_intelligence_locked(
+        self,
+        query: str = "Scan the market for the best intraday opportunities.",
+        universe: Optional[List[str]] = None,
+        top_n: int = 3,
+        budget: float = DEFAULT_MAX_LOSS_INR,
+    ) -> Dict[str, Any]:
+        """
+        Internal implementation of market intelligence scan executed while holding ScanLock.
         """
         parsed = self.detect_intent(query)
         intent = parsed["intent"]
@@ -125,6 +326,15 @@ class MarketIntelligenceOrchestrator:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         is_open = calendar_in.is_market_hours_in(now_utc)
         session_label = "LIVE TRADING SESSION" if is_open else "MARKET CLOSED (PRE/POST-MARKET REVIEW)"
+
+        # Ensure streamer is connected if available during market hours
+        if self.streamer is not None and not getattr(self.streamer, "is_connected", False):
+            try:
+                self.streamer.connect()
+                if getattr(self.specialist, "streamer", None) is None:
+                    self.specialist.streamer = self.streamer
+            except Exception:
+                pass
 
         # 2. Determine target universe dynamically (DEF-03)
         if sym:
@@ -151,6 +361,7 @@ class MarketIntelligenceOrchestrator:
         elif bias == "BULLISH":
             scan_strategies = ["breakout_intraday", "vwap_reclaim", "orb"]
 
+        scan_errors = []
         try:
             scan_res = scan.scan_intraday(
                 symbols=eval_symbols,
@@ -160,8 +371,11 @@ class MarketIntelligenceOrchestrator:
                 interval="5m",
             )
             scanner_hits = scan_res.get("hits", [])
-        except Exception:
+            for s_err in (scan_res.get("errors") or []):
+                scan_errors.append(str(s_err))
+        except Exception as e:
             scanner_hits = []
+            scan_errors.append(f"Scanner exception: {str(e)}")
 
         hits_by_symbol = {}
         for h in scanner_hits:
@@ -180,6 +394,8 @@ class MarketIntelligenceOrchestrator:
                     underlying_setup=hits_by_symbol.get(s),
                     max_loss_budget=budget,
                     now_utc=now_utc,
+                    portfolio_path=self.portfolio_path,
+                    broker_state_path=self.broker_state_path,
                 )
                 if res.get("status") == "OPPORTUNITIES_IDENTIFIED":
                     sigs = res.get("signals", [])
@@ -211,7 +427,45 @@ class MarketIntelligenceOrchestrator:
 
         # 5. Rank and Deduplicate
         ranked_signals = self.specialist.rank_opportunities(all_signals)
-        shortlist = ranked_signals[:top_n]
+        actionable_signals = [s for s in ranked_signals if s.get("is_actionable")]
+        rejected_signals = [s for s in ranked_signals if not s.get("is_actionable")]
+        shortlist = actionable_signals[:top_n]
+
+        # Allocate portfolio risk budget and capital across shortlist sequentially
+        remaining_budget = budget
+        remaining_capital = self.specialist.available_capital
+        for sig in shortlist:
+            ps = sig.get("position_sizing", {})
+            net_risk_1_lot = ps.get("net_risk_per_lot_inr", 0.0)
+            cap_req_1_lot = ps.get("capital_required_per_lot", 0.0)
+            if net_risk_1_lot > 0:
+                port_lots_by_risk = int(remaining_budget // net_risk_1_lot)
+            else:
+                port_lots_by_risk = 0
+            if cap_req_1_lot > 0:
+                port_lots_by_cap = int(remaining_capital // cap_req_1_lot)
+            else:
+                port_lots_by_cap = 0
+            port_permitted_lots = max(0, min(port_lots_by_risk, port_lots_by_cap))
+            initial_lots = ps.get("final_permitted_lots", 0)
+            allocated_lots = min(initial_lots, port_permitted_lots)
+            ps["portfolio_permitted_lots"] = port_permitted_lots
+            ps["final_permitted_lots"] = allocated_lots
+            ps["lots"] = allocated_lots
+            ps["total_quantity"] = allocated_lots * ps.get("lot_size", 1)
+            allocated_risk = allocated_lots * net_risk_1_lot
+            allocated_cap = allocated_lots * cap_req_1_lot
+            remaining_budget = max(0.0, remaining_budget - allocated_risk)
+            remaining_capital = max(0.0, remaining_capital - allocated_cap)
+
+        # Dynamic Universe Reporting Stats
+        all_fo_symbols = get_fo_scan_universe(include_stocks=True)
+        total_eligible = len(all_fo_symbols)
+        passed_to_scanner = len(eval_symbols)
+        successfully_scanned = len([s for s in eval_symbols if s in underlying_summaries and "error" not in underlying_summaries[s]])
+        failed_count = len([s for s in eval_symbols if "error" in underlying_summaries.get(s, {})])
+        skipped_count = max(0, total_eligible - passed_to_scanner)
+        coverage_pct = round((passed_to_scanner / total_eligible) * 100.0, 1) if total_eligible > 0 else 0.0
 
         # 6. Format Executive Response
         report_text = self._format_report(
@@ -219,17 +473,32 @@ class MarketIntelligenceOrchestrator:
             session_label=session_label,
             underlying_summaries=underlying_summaries,
             shortlist=shortlist,
-            total_evaluated=len(eval_symbols),
-            total_signals=len(ranked_signals),
+            rejected_signals=rejected_signals,
+            total_eligible=total_eligible,
+            passed_to_scanner=passed_to_scanner,
+            successfully_scanned=successfully_scanned,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+            coverage_pct=coverage_pct,
+            total_signals=len(actionable_signals),
+            scan_errors=scan_errors,
         )
 
         return {
             "query": query,
             "session_status": session_label,
+            "total_eligible": total_eligible,
+            "passed_to_scanner": passed_to_scanner,
+            "successfully_scanned": successfully_scanned,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "coverage_pct": coverage_pct,
             "total_evaluated": len(eval_symbols),
-            "total_signals_identified": len(ranked_signals),
+            "total_signals_identified": len(actionable_signals),
             "underlying_summaries": underlying_summaries,
             "shortlist": shortlist,
+            "rejected_signals": rejected_signals,
+            "scan_errors": scan_errors,
             "report_markdown": report_text,
         }
 
@@ -239,15 +508,31 @@ class MarketIntelligenceOrchestrator:
         session_label: str,
         underlying_summaries: Dict[str, Any],
         shortlist: List[Dict[str, Any]],
-        total_evaluated: int,
-        total_signals: int,
+        rejected_signals: Optional[List[Dict[str, Any]]] = None,
+        total_eligible: int = 230,
+        passed_to_scanner: int = 12,
+        successfully_scanned: int = 12,
+        failed_count: int = 0,
+        skipped_count: int = 218,
+        coverage_pct: float = 5.2,
+        total_signals: int = 0,
+        total_evaluated: Optional[int] = None,
+        scan_errors: Optional[List[str]] = None,
     ) -> str:
+        eval_count = total_evaluated if total_evaluated is not None else passed_to_scanner
         lines = [
             f"# INTRADAY TRADING INTELLIGENCE REPORT",
             f"**Session**: {session_label} | **Query**: *\"{query}\"*",
             f"**Execution Boundary**: Analytical decision-support only. Live broker order placement remains disabled.\n",
             f"## 1. Market Overview & Universe Scanned",
-            f"Evaluated **{total_evaluated}** key instruments (core scan universe out of 230 eligible F&O instruments, {(total_evaluated / 230) * 100:.1f}% coverage). Discovered **{total_signals}** actionable options candidates.\n",
+            f"Evaluated **{eval_count}** key instruments (core scan universe out of {total_eligible} eligible F&O instruments, {(eval_count / total_eligible) * 100:.1f}% coverage). Discovered **{total_signals}** actionable options candidates.\n",
+            f"- **Total Eligible F&O Universe**: {total_eligible} instruments",
+            f"- **Passed to Scanner**: {passed_to_scanner} instruments",
+            f"- **Successfully Scanned**: {successfully_scanned} instruments",
+            f"- **Failed Scans**: {failed_count} instruments",
+            f"- **Skipped (Beyond Evaluated Window)**: {skipped_count} instruments",
+            f"- **Universe Coverage**: {coverage_pct}%\n",
+            f"Discovered **{total_signals}** actionable options candidates across **{eval_count}** evaluated instruments.\n",
             f"| Underlying | Spot Price (₹) | ATM Strike | PCR (OI) | Available Setups |",
             f"| :--- | :--- | :--- | :--- | :--- |",
         ]
@@ -335,8 +620,20 @@ class MarketIntelligenceOrchestrator:
                     f"- **Selection Rationale & Rejections**: {sig['selection_rationale']}\n",
                 ])
 
+        if rejected_signals:
+            lines.append("## 3. Filtered & Rejected Candidates (Diagnostic Audit)\n")
+            lines.append("| Underlying | Strategy | Strike | State | Reasons |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- |")
+            for r_sig in rejected_signals[:10]:
+                r_reasons = "; ".join(r_sig.get("rejection_reasons", [])) or "Risk or liquidity criteria not met"
+                lines.append(f"| **{r_sig.get('underlying_instrument')}** | `{r_sig.get('strategy')}` | {r_sig.get('strike')} | `{r_sig.get('signal_state')}` | {r_reasons} |")
+            lines.append("")
+            checklist_section_num = 4
+        else:
+            checklist_section_num = 3
+
         lines.extend([
-            f"## 3. Human Trader Execution Checklist",
+            f"## {checklist_section_num}. Human Trader Execution Checklist",
             f"1. **Confirm Trend & Breadth**: Verify index momentum and PCR bias prior to entry.",
             f"2. **Check Spread Freshness**: Ensure real-time bid-ask spread is within 5% before sending order.",
             f"3. **Position Size Enforcement**: Never exceed your configured max loss per trade.",
@@ -356,9 +653,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     query_str = " ".join(args.query) if isinstance(args.query, list) else str(args.query)
 
-    orchestrator = MarketIntelligenceOrchestrator()
-    res = orchestrator.run_market_intelligence(query=query_str, top_n=args.top, budget=args.budget)
-    print(res["report_markdown"])
+    with MarketIntelligenceOrchestrator() as orchestrator:
+        res = orchestrator.run_market_intelligence(query=query_str, top_n=args.top, budget=args.budget)
+        print(res["report_markdown"])
     return 0
 
 

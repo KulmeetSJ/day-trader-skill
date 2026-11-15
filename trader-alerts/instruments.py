@@ -863,7 +863,7 @@ def get_strike_interval(underlying, spot_price=None, cache_payload=None, exchang
     return 20.0  # Safe default for mid/large-cap equities
 
 
-def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None):
+def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None, require_authoritative=False):
     """Authoritatively resolve derivative contract lot size, checking BOD/cache first."""
     raw = str(symbol or "").strip().upper()
     exp_norm = _normalize_expiry_date(expiry) if expiry else None
@@ -898,7 +898,7 @@ def get_fo_lot_size(symbol, cache_payload=None, expiry=None, exchange=None):
         if inst.get("fo_lot_size"):
             return int(inst["fo_lot_size"])
 
-    if sym in INDEX_INSTRUMENTS:
+    if sym in INDEX_INSTRUMENTS and not require_authoritative:
         return INDEX_INSTRUMENTS[sym]["fo_lot_size"]
 
     return None
@@ -920,6 +920,7 @@ def _unavailable_derivatives_meta(sym, exch, reason, source="unavailable_no_list
         "strike_interval": None,
         "effective_date": effective_date,
         "source": source,
+        "is_authoritative": False,
         "unavailable_reason": reason,
     }
 
@@ -1106,6 +1107,11 @@ def resolve_underlying_derivatives_meta(underlying, cache_payload=None, exchange
         "strike_interval": strike_step,
         "effective_date": eff_iso or None,
         "source": source,
+        "is_authoritative": bool(
+            source not in ("calendar_fallback", "hardcoded_fallback", "unavailable")
+            and isinstance(cached, dict)
+            and bool(cached.get("fo_lot_size"))
+        ),
     }
 
 

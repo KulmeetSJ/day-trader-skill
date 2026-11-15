@@ -71,6 +71,7 @@ TRADING_HOURS_PER_DAY = 6.25
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 120.0       # 2 minutes for option quote
 DEFAULT_MAX_CANDLE_AGE_SECONDS = 600.0      # 10 minutes for 5m underlying candle
 DEFAULT_MAX_RETRIEVAL_AGE_SECONDS = 120.0   # 2 minutes for API response retrieval
+DEFAULT_MAX_UNDERLYING_SPOT_AGE_SECONDS = 60.0  # 1 minute for live underlying spot quote
 
 
 def round_tick(price: float, tick: float = 0.05) -> float:
@@ -243,11 +244,12 @@ class OptionsIntelligenceSpecialist:
         gamma: float = 0.0,
         theta: float = 0.0,
         vega: float = 0.0,
-        iv: float = 15.0,
+        iv: float = 0.0,
         option_type: str = "CE",
         is_seller: bool = False,
         holding_hours: float = 2.0,
         slippage_ticks: int = 1,
+        evaluation_time: Optional[datetime.datetime] = None,
     ) -> Optional[Dict[str, float]]:
         """
         Model option premium stops and targets dynamically derived from underlying technical levels.
@@ -255,8 +257,8 @@ class OptionsIntelligenceSpecialist:
         Accounts for:
         - Delta: First-order underlying sensitivity
         - Gamma: Second-order convexity
-        - Theta: Time decay over holding period (default 2 intraday hours)
-        - Vega: Volatility shift sensitivity
+        - Theta: Time decay over holding period (derived from remaining session time or configured window)
+        - Vega: Volatility shift sensitivity (conservative zero-benefit assumption at stop)
         - Slippage: 1 tick on entry and exit
 
         Zero Fabrication Policy: If the Taylor expansion or inputs yield non-viable premium levels
@@ -271,14 +273,24 @@ class OptionsIntelligenceSpecialist:
         d_t1 = spot_t1 - spot_entry
         d_t2 = spot_t2 - spot_entry
 
+        eff_holding_hours = holding_hours
+        if evaluation_time is not None:
+            try:
+                now_ist = evaluation_time.astimezone(calendar_in.IST)
+                session_end = now_ist.replace(hour=15, minute=15, second=0, microsecond=0)
+                if now_ist < session_end:
+                    mins_remaining = max(5.0, (session_end - now_ist).total_seconds() / 60.0)
+                    eff_holding_hours = min(holding_hours, max(0.1, mins_remaining / 60.0))
+            except Exception:
+                pass
+
         # Theta decay over expected intraday holding window
-        time_fraction = holding_hours / TRADING_HOURS_PER_DAY
+        time_fraction = eff_holding_hours / TRADING_HOURS_PER_DAY
         theta_decay = abs(theta) * time_fraction
 
-        # Modest IV shift assumption (intraday moves typically contract IV by 0.5% or expand by 0.5%)
-        # In a stop out against a buyer, IV might expand slightly (+0.5% IV); in target moves IV contracts
-        iv_impact_stop = vega * 0.5
-        iv_impact_target = -vega * 0.2
+        # Conservative IV impact: No assumed IV expansion to cushion buyer's stop
+        iv_impact_stop = 0.0
+        iv_impact_target = 0.0
 
         # Second-order Taylor expansion: dP = Delta * dS + 0.5 * Gamma * (dS ^ 2)
         # Call: Delta > 0. When spot drops (d_stop < 0), Delta * d_stop < 0.
@@ -304,9 +316,9 @@ class OptionsIntelligenceSpecialist:
             # Option Seller:
             # Entry has sell slippage (lower credit); stop exit has buy slippage (higher debit)
             exec_entry = max(0.05, entry_premium - slippage)
-            stop_prem = max(0.05, round_tick(entry_premium + abs(dp_stop_raw) + slippage, 0.05))
-            t1_prem = max(0.05, round_tick(entry_premium - abs(dp_t1_raw) + slippage, 0.05))
-            t2_prem = max(0.05, round_tick(entry_premium - abs(dp_t2_raw) + slippage, 0.05))
+            stop_prem = max(0.05, round_tick(entry_premium + dp_stop_raw + slippage, 0.05))
+            t1_prem = max(0.05, round_tick(entry_premium + dp_t1_raw + slippage, 0.05))
+            t2_prem = max(0.05, round_tick(entry_premium + dp_t2_raw + slippage, 0.05))
 
             # Strict Validation: Stop must be strictly above entry, targets strictly below entry
             if stop_prem <= exec_entry or t1_prem >= exec_entry or t2_prem >= t1_prem:
@@ -680,6 +692,182 @@ class OptionsIntelligenceSpecialist:
         is_fresh = len(freshness_errors) == 0
         return is_fresh, freshness_errors, details
 
+    def validate_underlying_spot(
+        self,
+        spot_quote: Any,
+        now_utc: datetime.datetime,
+        max_age_seconds: float = DEFAULT_MAX_UNDERLYING_SPOT_AGE_SECONDS,
+    ) -> Tuple[bool, Optional[float], Optional[str], Dict[str, Any]]:
+        """Validate live underlying spot price, quote timestamp, retrieval age, and provenance."""
+        details = {}
+        if not spot_quote:
+            return False, None, "MISSING_UNDERLYING_SPOT: Underlying spot quote payload is missing or empty", details
+
+        if isinstance(spot_quote, (int, float)):
+            price = float(spot_quote)
+            if price <= 0.0:
+                return False, None, f"INVALID_UNDERLYING_SPOT_PRICE: Non-positive underlying spot price ({price})", details
+            return False, None, "UNVERIFIED_UNDERLYING_SPOT: Bare price provided without verifiable quote timestamp", details
+
+        if not isinstance(spot_quote, dict):
+            return False, None, "INVALID_UNDERLYING_SPOT_FORMAT: Spot quote must be a dictionary or numerical price", details
+
+        raw_price = (
+            spot_quote.get("price")
+            or spot_quote.get("last_price")
+            or spot_quote.get("spot")
+            or spot_quote.get("underlying_price")
+        )
+        if raw_price is None:
+            return False, None, "MISSING_UNDERLYING_SPOT_PRICE: Underlying spot quote does not contain a price", details
+
+        try:
+            price = float(raw_price)
+            if price <= 0.0:
+                return False, None, f"INVALID_UNDERLYING_SPOT_PRICE: Non-positive underlying spot price ({price})", details
+        except (ValueError, TypeError):
+            return False, None, f"INVALID_UNDERLYING_SPOT_PRICE: Unparseable price value '{raw_price}'", details
+
+        details["price"] = price
+
+        raw_ts = spot_quote.get("quote_timestamp") or spot_quote.get("timestamp") or spot_quote.get("exchange_timestamp")
+        details["quote_timestamp_raw"] = raw_ts
+        if raw_ts is None or raw_ts == "":
+            return False, None, "MISSING_UNDERLYING_SPOT_TIMESTAMP: Underlying spot quote timestamp is missing", details
+
+        ts_dt = parse_timestamp(raw_ts)
+        if ts_dt is None:
+            return False, None, f"UNPARSABLE_UNDERLYING_SPOT_TIMESTAMP: Could not parse spot timestamp '{raw_ts}'", details
+
+        age = (now_utc - ts_dt).total_seconds()
+        details["spot_age_seconds"] = round(age, 1)
+
+        if age < -5.0:
+            return False, None, f"FUTURE_UNDERLYING_SPOT_TIMESTAMP: Spot timestamp '{raw_ts}' is in the future ({age:.1f}s)", details
+
+        if age > max_age_seconds:
+            return False, None, f"STALE_UNDERLYING_SPOT: Spot age {age:.1f}s exceeds threshold {max_age_seconds}s (timestamp: {raw_ts})", details
+
+        raw_retrieval = spot_quote.get("retrieval_timestamp") or spot_quote.get("fetched_at")
+        if raw_retrieval:
+            retrieval_dt = parse_timestamp(raw_retrieval)
+            if retrieval_dt:
+                ret_age = (now_utc - retrieval_dt).total_seconds()
+                details["retrieval_age_seconds"] = round(ret_age, 1)
+                if ret_age > max_age_seconds:
+                    return False, None, f"STALE_UNDERLYING_SPOT_RETRIEVAL: Retrieval age {ret_age:.1f}s exceeds threshold {max_age_seconds}s", details
+
+        return True, price, None, details
+
+    def check_portfolio_risk(
+        self,
+        candidate_risk: float,
+        capital_required: float,
+        portfolio_path: Optional[str] = None,
+        broker_state_path: Optional[str] = None,
+        config_path: Optional[str] = None,
+        now_utc: Optional[datetime.datetime] = None,
+        is_live_check: bool = False,
+        candidate_risk_budget: Optional[float] = None,
+    ) -> Tuple[bool, List[str]]:
+        """Validate candidate against central trader-risk rules, portfolio state, and daily limits."""
+        rejections = []
+        try:
+            import check as risk_check
+        except ImportError:
+            risk_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-risk")
+            if risk_dir not in sys.path:
+                sys.path.insert(0, risk_dir)
+            try:
+                import check as risk_check
+            except Exception:
+                risk_check = None
+
+        if risk_check is None:
+            if is_live_check:
+                return False, ["PORTFOLIO_RISK_UNAVAILABLE: Central trader-risk module could not be imported"]
+            return True, []
+
+        now_dt = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        today_iso = now_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
+
+        cfg = risk_check.load_config(path=config_path, market="IN")
+        p_path = portfolio_path or os.path.join(BASE_DIR, "trader", "portfolio.json")
+        b_path = broker_state_path or os.path.join(BASE_DIR, "trader", "state", "broker.json")
+
+        allow_unverified = os.environ.get("ALLOW_UNVERIFIED_PORTFOLIO") == "1"
+
+        try:
+            portfolio = risk_check.read_json(p_path, "portfolio", required=False)
+        except Exception as e:
+            if is_live_check and not allow_unverified:
+                return False, [f"PORTFOLIO_STATE_UNAVAILABLE: Central portfolio state file unreadable or corrupt: {e}"]
+            portfolio = None
+
+        try:
+            broker_state = risk_check.read_json(b_path, "broker state", required=False)
+        except Exception as e:
+            if is_live_check and not allow_unverified:
+                return False, [f"BROKER_STATE_UNAVAILABLE: Central broker state file unreadable or corrupt: {e}"]
+            broker_state = None
+
+        if is_live_check:
+            if portfolio is None:
+                if not allow_unverified:
+                    rejections.append(
+                        "PORTFOLIO_STATE_UNAVAILABLE: Central portfolio state file missing or unreadable; live execution rejected fail-closed by default"
+                    )
+                    return False, rejections
+                else:
+                    rejections.append(
+                        "UNVERIFIED_PORTFOLIO_OVERRIDE: Central portfolio state missing; permitted only via explicit test override"
+                    )
+
+            if broker_state is None:
+                if not allow_unverified:
+                    rejections.append(
+                        "BROKER_STATE_UNAVAILABLE: Central broker state file missing or unreadable; live execution rejected fail-closed by default"
+                    )
+                    return False, rejections
+                else:
+                    rejections.append(
+                        "UNVERIFIED_BROKER_STATE_OVERRIDE: Central broker state missing; permitted only via explicit test override"
+                    )
+
+        # Daily loss limit check
+        max_daily_loss = cfg.get("max_daily_loss_inr") or cfg.get("max_daily_loss")
+        if max_daily_loss and broker_state:
+            placed = risk_check.placed_today(broker_state, today_iso)
+            used_loss_today = sum(float(r.get("max_loss") or 0.0) for r in placed)
+            allowed_daily = max(float(max_daily_loss), float(candidate_risk_budget or 0.0))
+            if (used_loss_today + candidate_risk) > allowed_daily + 0.01:
+                rejections.append(
+                    f"DAILY_LOSS_LIMIT_EXCEEDED: Daily risk used (Rs {used_loss_today:,.2f}) + candidate risk (Rs {candidate_risk:,.2f}) "
+                    f"exceeds max daily loss limit (Rs {allowed_daily:,.2f})"
+                )
+
+        # Max open positions check
+        max_positions = int(cfg.get("max_open_positions") or 5)
+        if portfolio:
+            positions = portfolio.get("positions", [])
+            open_count = len([p for p in positions if float(p.get("shares") or p.get("qty") or 0.0) > 0])
+            if open_count >= max_positions:
+                rejections.append(
+                    f"MAX_OPEN_POSITIONS_REACHED: Currently {open_count} open positions, which meets or exceeds limit of {max_positions}"
+                )
+
+        # Available cash check with buffer
+        if portfolio and portfolio.get("cash") is not None:
+            cash = float(portfolio.get("cash"))
+            buffer_pct = float(cfg.get("cash_buffer_pct") or 10.0)
+            avail_cash = max(0.0, cash * (1.0 - buffer_pct / 100.0))
+            if capital_required > avail_cash + 0.01:
+                rejections.append(
+                    f"INSUFFICIENT_PORTFOLIO_CASH: Capital required (Rs {capital_required:,.2f}) exceeds available portfolio cash (Rs {avail_cash:,.2f}) after {buffer_pct}% buffer"
+                )
+
+        return len(rejections) == 0, rejections
+
     def generate_signal_contract(
         self,
         underlying: str,
@@ -695,6 +883,9 @@ class OptionsIntelligenceSpecialist:
         min_reward_risk: Optional[float] = None,
         available_capital: Optional[float] = None,
         now_utc: Optional[datetime.datetime] = None,
+        portfolio_path: Optional[str] = None,
+        broker_state_path: Optional[str] = None,
+        underlying_spot_quote: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Build and rigorously validate the 20-field signal contract.
@@ -708,6 +899,10 @@ class OptionsIntelligenceSpecialist:
         budget = max_loss_budget if max_loss_budget is not None else self.max_loss_budget
         min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
         capital_limit = available_capital if available_capital is not None else self.available_capital
+
+        now_dt = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
 
         is_seller = strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE, STRATEGY_BEAR_CALL_SPREAD, STRATEGY_BULL_PUT_SPREAD)
         is_spread = spread_contract is not None
@@ -757,7 +952,46 @@ class OptionsIntelligenceSpecialist:
         if ask <= 0.0:
             rejection_reasons.append("INVALID_QUOTE: Zero or missing ask quote in order book")
         if bid > 0.0 and ask > 0.0 and ask <= bid:
-            rejection_reasons.append(f"INVALID_QUOTE: Crossed or locked market quotes: bid ({bid}) >= ask ({ask})")
+            rejection_reasons.append(f"INVALID_QUOTE: Crossed market quotes: bid ({bid}) >= ask ({ask})")
+
+        # Execution-Price Conservatism: Spread & Depth Gating
+        opt_spread_tolerance = float(self.config.get("max_option_bid_ask_spread_pct") or DEFAULT_SPREAD_TOLERANCE_PCT)
+        if spread_mid >= 10.0 and spread_pct > opt_spread_tolerance:
+            rejection_reasons.append(
+                f"EXCESSIVE_SPREAD: Bid/ask spread ({spread_pct}%) exceeds maximum tolerance ({opt_spread_tolerance}%)"
+            )
+        elif spread_mid < 10.0 and spread_points > 1.50:
+            rejection_reasons.append(
+                f"EXCESSIVE_SPREAD: Bid/ask spread points (Rs {spread_points:.2f}) exceeds maximum tolerance (Rs 1.50)"
+            )
+
+        bid_qty = contract_data.get("bid_qty")
+        ask_qty = contract_data.get("ask_qty")
+        if bid_qty is not None and float(bid_qty) <= 0:
+            rejection_reasons.append("INSUFFICIENT_DEPTH: Zero bid quantity available in order book")
+        if ask_qty is not None and float(ask_qty) <= 0:
+            rejection_reasons.append("INSUFFICIENT_DEPTH: Zero ask quantity available in order book")
+
+        if spread_contract:
+            s_bid = float(spread_contract.get("bid") or 0.0)
+            s_ask = float(spread_contract.get("ask") or 0.0)
+            s_points = round(s_ask - s_bid, 2)
+            s_mid = (s_bid + s_ask) / 2.0 if (s_bid + s_ask) > 0 else 1.0
+            s_pct = round((s_points / s_mid) * 100.0, 2)
+            if s_mid >= 10.0 and s_pct > opt_spread_tolerance:
+                rejection_reasons.append(
+                    f"EXCESSIVE_SPREAD: Hedge leg bid/ask spread ({s_pct}%) exceeds maximum tolerance ({opt_spread_tolerance}%)"
+                )
+            elif s_mid < 10.0 and s_points > 1.50:
+                rejection_reasons.append(
+                    f"EXCESSIVE_SPREAD: Hedge leg bid/ask spread points (Rs {s_points:.2f}) exceeds maximum tolerance (Rs 1.50)"
+                )
+            s_bid_qty = spread_contract.get("bid_qty")
+            s_ask_qty = spread_contract.get("ask_qty")
+            if s_bid_qty is not None and float(s_bid_qty) <= 0:
+                rejection_reasons.append("INSUFFICIENT_DEPTH: Zero bid quantity available in hedge leg order book")
+            if s_ask_qty is not None and float(s_ask_qty) <= 0:
+                rejection_reasons.append("INSUFFICIENT_DEPTH: Zero ask quantity available in hedge leg order book")
 
         u_dec = underlying_setup.get("decision") or {}
         u_trig = underlying_setup.get("trigger") or {}
@@ -766,6 +1000,7 @@ class OptionsIntelligenceSpecialist:
 
         spot_entry = float(
             u_dec.get("entry_reference")
+            or underlying_setup.get("entry_reference")
             or underlying_setup.get("price")
             or u_trig.get("price")
             or u_last.get("close")
@@ -773,12 +1008,49 @@ class OptionsIntelligenceSpecialist:
         )
         spot_stop = float(
             u_dec.get("stop_loss")
+            or u_dec.get("stop_preview")
+            or underlying_setup.get("stop_loss")
+            or underlying_setup.get("stop_preview")
             or u_dec.get("invalidation_level")
             or underlying_setup.get("invalidation_level")
             or (u_or.get("low") if direction in ("BULLISH", "BULLISH_OR_SIDEWAYS") else u_or.get("high"))
             or spot_entry
         )
-        targets = u_dec.get("targets") or underlying_setup.get("targets") or {}
+        inv_level = float(
+            u_dec.get("invalidation_level")
+            or underlying_setup.get("invalidation_level")
+            or spot_stop
+        )
+        spot_quote_candidate = (
+            underlying_spot_quote
+            or underlying_setup.get("underlying_spot_quote")
+            or contract_data.get("underlying_spot_quote")
+            or underlying_setup.get("live_spot_quote")
+        )
+        underlying_spot_details = {}
+        if spot_quote_candidate is not None:
+            v_ok, v_px, v_err, v_meta = self.validate_underlying_spot(spot_quote_candidate, now_utc=now_dt)
+            underlying_spot_details = v_meta
+            if v_ok and v_px is not None:
+                current_spot = v_px
+            else:
+                rejection_reasons.append(f"UNDERLYING_SPOT_UNAVAILABLE: {v_err}")
+                current_spot = float(v_meta.get("price") or spot_entry)
+        else:
+            current_spot = float(
+                underlying_setup.get("current_spot")
+                or underlying_setup.get("current_price")
+                or u_dec.get("current_price")
+                or u_last.get("close")
+                or spot_entry
+            )
+        targets = (
+            u_dec.get("targets")
+            or u_dec.get("targets_preview")
+            or underlying_setup.get("targets")
+            or underlying_setup.get("targets_preview")
+            or {}
+        )
         risk_dist = abs(spot_entry - spot_stop)
         spot_t1 = float(
             targets.get("target_1_1r")
@@ -793,27 +1065,112 @@ class OptionsIntelligenceSpecialist:
             if risk_dist > 0 else 0.0
         )
 
-        # Check invalidation level breach: Underlying spot breaching invalidation rejects active signal
-        if spot_entry > 0 and spot_stop > 0:
-            if ("BULL" in direction or direction == "LONG") and spot_entry < spot_stop:
+        # Check invalidation level breach: Current spot breaching invalidation rejects active signal
+        is_bullish = ("BULL" in direction or direction == "LONG")
+        is_bearish = ("BEAR" in direction or direction == "SHORT")
+
+        if is_bullish:
+            if current_spot <= inv_level:
                 rejection_reasons.append(
-                    f"INVALIDATED_SETUP: Underlying spot (Rs {spot_entry:.2f}) has breached invalidation level (Rs {spot_stop:.2f})"
+                    f"INVALIDATED_SETUP: Current underlying spot (Rs {current_spot:.2f}) has breached invalidation level (Rs {inv_level:.2f})"
                 )
-            elif ("BEAR" in direction or direction == "SHORT") and spot_entry > spot_stop:
+            elif spot_stop >= spot_entry and spot_entry > 0:
                 rejection_reasons.append(
-                    f"INVALIDATED_SETUP: Underlying spot (Rs {spot_entry:.2f}) has breached invalidation level (Rs {spot_stop:.2f})"
+                    f"INVALID_RISK_PLAN: Inverted stop level (entry {spot_entry:.2f}, stop {spot_stop:.2f})"
                 )
+        elif is_bearish:
+            if current_spot >= inv_level:
+                rejection_reasons.append(
+                    f"INVALIDATED_SETUP: Current underlying spot (Rs {current_spot:.2f}) has breached invalidation level (Rs {inv_level:.2f})"
+                )
+            elif spot_stop <= spot_entry and spot_entry > 0:
+                rejection_reasons.append(
+                    f"INVALID_RISK_PLAN: Inverted stop level (entry {spot_entry:.2f}, stop {spot_stop:.2f})"
+                )
+
+        # Check chase / extension limits
+        if (
+            u_dec.get("chase_blocked")
+            or underlying_setup.get("anti_chasing", {}).get("chase_blocked")
+            or underlying_setup.get("sub_state") == "EXTENDED"
+            or u_dec.get("sub_state") == "EXTENDED"
+        ):
+            rejection_reasons.append("EXTENDED_SETUP: Underlying setup is extended past actionable entry zone (chase blocked)")
+
+        entry_zone = u_dec.get("entry_zone") or underlying_setup.get("entry_zone")
+        if isinstance(entry_zone, dict):
+            z_high = float(entry_zone.get("high") or 0.0)
+            z_low = float(entry_zone.get("low") or 0.0)
+            if is_bullish and z_high > 0 and current_spot > z_high:
+                if not any("EXTENDED_SETUP" in r for r in rejection_reasons):
+                    rejection_reasons.append(
+                        f"EXTENDED_SETUP: Current spot (Rs {current_spot:.2f}) is above entry zone upper bound (Rs {z_high:.2f})"
+                    )
+            elif is_bearish and z_low > 0 and current_spot < z_low:
+                if not any("EXTENDED_SETUP" in r for r in rejection_reasons):
+                    rejection_reasons.append(
+                        f"EXTENDED_SETUP: Current spot (Rs {current_spot:.2f}) is below entry zone lower bound (Rs {z_low:.2f})"
+                    )
 
         greeks = contract_data.get("greeks") or {}
-        delta = float(greeks.get("delta") or (0.50 if option_type == "CE" else -0.50))
-        gamma = float(greeks.get("gamma") or 0.001)
-        theta = float(greeks.get("theta") or 0.0)
-        vega = float(greeks.get("vega") or 0.0)
-        iv = float(contract_data.get("iv") or 15.0)
+        raw_delta = greeks.get("delta")
+        raw_gamma = greeks.get("gamma")
+        raw_theta = greeks.get("theta")
+        raw_vega = greeks.get("vega")
+        raw_iv = contract_data.get("iv") if contract_data.get("iv") is not None else greeks.get("iv")
 
-        # Model premium levels with zero fabrication using reconciled execution price
+        missing_greeks = []
+        # Delta is mandatory across all option strategies
+        if raw_delta is None:
+            missing_greeks.append("Delta")
+
+        # Gamma is mandatory by default for all strategies (second-order convexity).
+        # Missing Gamma must reject with GREEKS_UNAVAILABLE and not silently default to synthetic 0.001.
+        if raw_gamma is None:
+            missing_greeks.append("Gamma")
+
+        # Theta is mandatory for option sellers (STRATEGY_SELL_CE, STRATEGY_SELL_PE)
+        # as time decay is the primary economic engine of short premium.
+        # Strategy Exception: For directional option buyers (STRATEGY_BUY_CE, STRATEGY_BUY_PE),
+        # positions are evaluated on rapid intraday momentum with instantaneous stop modeling;
+        # Theta decay is not required by default (defaults to 0.0 assuming zero decay on stop).
+        if is_seller and raw_theta is None:
+            missing_greeks.append("Theta")
+
+        # When require_all_greeks is configured True, all provider Greeks are strictly mandatory
+        if self.config.get("require_all_greeks"):
+            if raw_theta is None and "Theta" not in missing_greeks:
+                missing_greeks.append("Theta")
+            if raw_vega is None:
+                missing_greeks.append("Vega")
+            if raw_iv is None:
+                missing_greeks.append("IV")
+
+        # Vega & IV Strategy Exception:
+        # Intraday directional breakout setups model stop and target levels from underlying
+        # technical levels with zero IV expansion assumed (iv_impact_stop = 0.0, iv_impact_target = 0.0).
+        # Thus, Vega and IV are not required by default for directional setups.
+
+        if missing_greeks:
+            rejection_reasons.append(
+                f"GREEKS_UNAVAILABLE: Required Greek(s) missing or None from provider: {', '.join(missing_greeks)}"
+            )
+            delta = float(raw_delta) if raw_delta is not None else (0.50 if option_type == "CE" else -0.50)
+            gamma = float(raw_gamma) if raw_gamma is not None else 0.0
+            theta = float(raw_theta) if raw_theta is not None else 0.0
+            vega = float(raw_vega) if raw_vega is not None else 0.0
+            iv = float(raw_iv) if raw_iv is not None else 0.0
+        else:
+            # Preserve legitimate numerical zero values without truthiness coercion
+            delta = float(raw_delta)
+            gamma = float(raw_gamma)
+            theta = float(raw_theta) if raw_theta is not None else 0.0
+            vega = float(raw_vega) if raw_vega is not None else 0.0
+            iv = float(raw_iv) if raw_iv is not None else 0.0
+
+        # Model premium levels with zero fabrication using baseline quote and slippage
         prem_levels = self.model_premium_levels(
-            entry_premium=reconciled_entry,
+            entry_premium=baseline_quote,
             spot_entry=spot_entry,
             spot_stop=spot_stop,
             spot_t1=spot_t1,
@@ -825,7 +1182,8 @@ class OptionsIntelligenceSpecialist:
             iv=iv,
             option_type=option_type,
             is_seller=is_seller,
-            slippage_ticks=0,
+            slippage_ticks=1,
+            evaluation_time=now_dt,
         )
 
         if not prem_levels:
@@ -840,16 +1198,48 @@ class OptionsIntelligenceSpecialist:
 
         execution_recon["execution_price"] = prem_levels["entry_premium"]
 
-        # Calculate per-lot risk
-        if not is_spread:
+        # Calculate per-lot risk & hedge leg reconciliation
+        hedge_entry = 0.0
+        spread_k = None
+        spread_bid = 0.0
+        spread_ask = 0.0
+        if is_spread and spread_contract:
+            spread_k = float(spread_contract.get("strike") or 0.0)
+            spread_bid = float(spread_contract.get("bid") or 0.0)
+            spread_ask = float(spread_contract.get("ask") or 0.0)
+            spread_ltp = float(spread_contract.get("last_price") or 0.0)
+
+            if spread_bid <= 0.0:
+                rejection_reasons.append("INVALID_QUOTE: Zero or missing bid quote in spread hedge leg")
+            if spread_ask <= 0.0:
+                rejection_reasons.append("INVALID_QUOTE: Zero or missing ask quote in spread hedge leg")
+            if spread_bid > 0.0 and spread_ask > 0.0 and spread_ask <= spread_bid:
+                rejection_reasons.append(f"INVALID_QUOTE: Crossed market quotes in spread hedge leg: bid ({spread_bid}) >= ask ({spread_ask})")
+
+            # Hedge leg execution price reconciliation:
+            # If primary leg is BUY (is_seller=False), hedge leg is SELL -> baseline is bid
+            # If primary leg is SELL (is_seller=True), hedge leg is BUY -> baseline is ask
+            if not is_seller:
+                hedge_base = spread_bid if spread_bid > 0.0 else spread_ltp
+                hedge_entry = max(0.05, round_tick(hedge_base - 0.05, 0.05))
+            else:
+                hedge_base = spread_ask if spread_ask > 0.0 else spread_ltp
+                hedge_entry = round_tick(hedge_base + 0.05, 0.05)
+
+            width = abs(spread_k - strike) if spread_k is not None else 0.0
+            if strategy in (STRATEGY_BULL_CALL_SPREAD, STRATEGY_BEAR_PUT_SPREAD):
+                # Debit spread
+                net_debit = max(0.05, round_tick(reconciled_entry - hedge_entry, 0.05))
+                risk_per_share = net_debit
+                risk_per_lot = round(net_debit * lot_size, 2)
+            else:
+                # Credit spread
+                net_credit = max(0.05, round_tick(reconciled_entry - hedge_entry, 0.05))
+                risk_per_share = max(0.0, width - net_credit)
+                risk_per_lot = round(risk_per_share * lot_size, 2)
+        else:
             prem_risk_per_share = abs(prem_levels["entry_premium"] - prem_levels["stop_loss_premium"])
             risk_per_lot = round(prem_risk_per_share * lot_size, 2)
-        else:
-            spread_strike = float(spread_contract.get("strike") or 0.0)
-            spread_prem = float(spread_contract.get("last_price") or 0.0)
-            width = abs(spread_strike - strike)
-            net_debit = max(0.0, prem_levels["entry_premium"] - spread_prem)
-            risk_per_lot = round(net_debit * lot_size, 2)
 
         # Position Sizing Logic (Phase 1 Fix: 4-Tier Position Sizing)
         charges_1_lot = self.calculate_charges_and_net_rr(
@@ -919,8 +1309,51 @@ class OptionsIntelligenceSpecialist:
                 f"INSUFFICIENT_CAPITAL: Capital/margin required per lot (Rs {capital_req_1_lot:,.2f}) exceeds available capital (Rs {capital_limit:,.2f})"
             )
 
+        # Available Order Book Depth Check
+        # For BUY orders: capacity is constrained by ask_qty (sellers in book)
+        # For SELL orders: capacity is constrained by bid_qty (buyers in book)
+        if not is_seller:
+            primary_depth = contract_data.get("ask_qty")
+        else:
+            primary_depth = contract_data.get("bid_qty")
+
+        hedge_depth = None
+        if is_spread and spread_contract:
+            # In spreads, the hedge leg is opposite side of primary leg
+            if not is_seller:
+                hedge_depth = spread_contract.get("bid_qty")
+            else:
+                hedge_depth = spread_contract.get("ask_qty")
+
+        avail_depth = None
+        if primary_depth is not None and hedge_depth is not None:
+            avail_depth = min(int(primary_depth), int(hedge_depth))
+        elif primary_depth is not None:
+            avail_depth = int(primary_depth)
+        elif hedge_depth is not None:
+            avail_depth = int(hedge_depth)
+
+        depth_permitted_lots = None
+        if avail_depth is not None:
+            if avail_depth <= 0:
+                depth_permitted_lots = 0
+                rejection_reasons.append(
+                    f"INSUFFICIENT_DEPTH: Order book depth ({avail_depth} shares) is zero or negative"
+                )
+            elif avail_depth < lot_size:
+                depth_permitted_lots = 0
+                rejection_reasons.append(
+                    f"INSUFFICIENT_DEPTH: Available order book depth ({avail_depth} shares) is less than minimum 1 lot ({lot_size} shares)"
+                )
+            else:
+                depth_permitted_lots = int(avail_depth // lot_size)
+
         # Tier 4: Final Permitted Lots
-        final_permitted_lots = min(risk_budget_permitted_lots, capital_permitted_lots)
+        # Sizing is constrained by the most restrictive tier: Risk Budget, Capital Limit, and Order Book Depth
+        limits = [risk_budget_permitted_lots, capital_permitted_lots]
+        if depth_permitted_lots is not None:
+            limits.append(depth_permitted_lots)
+        final_permitted_lots = min(limits)
         lots = final_permitted_lots
         qty = lots * lot_size if lots > 0 else lot_size  # reference size for quote/charge calculations
 
@@ -958,6 +1391,19 @@ class OptionsIntelligenceSpecialist:
                 f"INSUFFICIENT_CAPITAL: Capital/margin required (Rs {margin_info['capital_required']:,.2f}) exceeds available capital (Rs {capital_limit:,.2f})"
             )
 
+        if strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE):
+            if not margin_info_1_lot.get("is_authoritative"):
+                rejection_reasons.append(
+                    "AUTHORITATIVE_MARGIN_UNAVAILABLE: Exchange SPAN + Exposure margin data unavailable; "
+                    "heuristic estimate cannot authorize live execution"
+                )
+
+        # Phase 3: Require authoritative, current instrument metadata
+        if meta and meta.get("is_authoritative") is False:
+            rejection_reasons.append(
+                "AUTHORITATIVE_METADATA_UNAVAILABLE: Instrument metadata and lot size not authoritative from exchange BOD cache; live execution rejected"
+            )
+
         # DEF-01: Genuine Live Data Freshness & Provenance Gating
         now_dt = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
         if now_dt.tzinfo is None:
@@ -968,6 +1414,20 @@ class OptionsIntelligenceSpecialist:
             underlying_setup=underlying_setup,
             now_utc=now_dt,
         )
+
+        # Phase 4: Central portfolio risk check
+        port_ok, port_rejections = self.check_portfolio_risk(
+            candidate_risk=charges_info.get("net_loss_stop", 0.0),
+            capital_required=margin_info.get("capital_required", 0.0),
+            portfolio_path=portfolio_path,
+            broker_state_path=broker_state_path,
+            now_utc=now_dt,
+            is_live_check=bool(freshness_meta.get("is_market_open", False)),
+            candidate_risk_budget=budget,
+        )
+        if freshness_meta.get("is_market_open", False):
+            if not port_ok:
+                rejection_reasons.extend(port_rejections)
 
         # Preserve original raw timestamps for auditability without silent replacement
         raw_quote_ts = contract_data.get("quote_timestamp") or contract_data.get("timestamp")
@@ -991,7 +1451,7 @@ class OptionsIntelligenceSpecialist:
             signal_state = STATE_SIGNAL_VALIDATED
 
         is_actionable = bool(is_risk_valid and is_live_provenance)
-        is_approved = bool(signal_state in (STATE_SIGNAL_VALIDATED, STATE_HISTORICAL_ANALYSIS))
+        is_approved = bool(signal_state == STATE_SIGNAL_VALIDATED and is_actionable)
 
         # Quote verifiability & executable status
         has_verifiable_quotes = bool(
@@ -1015,6 +1475,10 @@ class OptionsIntelligenceSpecialist:
         )
 
         # Construct spread legs structure if applicable (Phase 5 Fix)
+        primary_option_type = (
+            contract_data.get("option_type")
+            or ("CE" if "CALL" in strategy or strategy in (STRATEGY_BUY_CE, STRATEGY_SELL_CE) else "PE")
+        )
         legs_data = [
             {
                 "leg_index": 1,
@@ -1022,7 +1486,7 @@ class OptionsIntelligenceSpecialist:
                 "side": "SELL" if is_seller else "BUY",
                 "symbol": contract_sym,
                 "strike": strike,
-                "option_type": option_type,
+                "option_type": primary_option_type,
                 "expiry": expiry,
                 "entry_price": prem_levels["entry_premium"],
                 "bid": bid,
@@ -1031,6 +1495,7 @@ class OptionsIntelligenceSpecialist:
                 "lot_size": lot_size,
                 "delta": delta,
                 "iv": iv,
+                "quote_provenance": contract_data.get("quote_provenance", "UPSTOX_REST_SNAPSHOT"),
             }
         ]
         if spread_contract:
@@ -1038,17 +1503,18 @@ class OptionsIntelligenceSpecialist:
                 "leg_index": 2,
                 "role": "HEDGE",
                 "side": "BUY" if is_seller else "SELL",
-                "symbol": spread_contract.get("symbol", f"{underlying}_{spread_k}_{option_type}"),
+                "symbol": spread_contract.get("symbol", f"{underlying}_{spread_k}_{spread_contract.get('option_type', option_type)}"),
                 "strike": spread_k,
-                "option_type": option_type,
-                "expiry": expiry,
-                "entry_price": spread_p,
-                "bid": spread_contract.get("bid"),
-                "ask": spread_contract.get("ask"),
+                "option_type": spread_contract.get("option_type", option_type),
+                "expiry": spread_contract.get("expiry") or expiry,
+                "entry_price": hedge_entry,
+                "bid": spread_bid,
+                "ask": spread_ask,
                 "quantity": qty,
                 "lot_size": lot_size,
                 "delta": spread_contract.get("delta"),
                 "iv": spread_contract.get("iv"),
+                "quote_provenance": spread_contract.get("quote_provenance", contract_data.get("quote_provenance", "UPSTOX_REST_SNAPSHOT")),
             })
 
         # 3. Auditable Data Provenance
@@ -1082,7 +1548,14 @@ class OptionsIntelligenceSpecialist:
 
         comp_candle = (underlying_setup.get("candle_context") or {}).get("completed_candle") or {}
         latest_candle_time = str(comp_candle.get("bar_end") or raw_candle_ts or "15:30")
-        latest_candle_close = float(u_last.get("close") or underlying_setup.get("spot_price") or spot_entry)
+        latest_candle_close = float(
+            underlying_setup.get("current_spot")
+            or underlying_setup.get("current_price")
+            or u_dec.get("current_price")
+            or u_last.get("close")
+            or underlying_setup.get("spot_price")
+            or spot_entry
+        )
 
         # Distinguish historical trigger activation from current setup validity
         candle_date = (
@@ -1094,11 +1567,14 @@ class OptionsIntelligenceSpecialist:
 
         is_stale_session = bool(candle_date and candle_date != now_ist_date)
         is_breached = bool(
-            (spot_entry < spot_stop if "BULL" in direction else spot_entry > spot_stop)
-            if (spot_entry > 0 and spot_stop > 0) else False
+            (latest_candle_close <= inv_level if is_bullish else latest_candle_close >= inv_level)
+            if (latest_candle_close > 0 and inv_level > 0) else False
+        ) or bool(
+            (latest_candle_close <= spot_stop if is_bullish else latest_candle_close >= spot_stop)
+            if (latest_candle_close > 0 and spot_stop > 0) else False
         )
 
-        if is_breached:
+        if is_breached or underlying_setup.get("is_invalidated") or u_dec.get("is_invalidated"):
             setup_validity = "INVALIDATED"
         elif is_stale_session or not freshness_meta.get("is_market_open", False):
             setup_validity = "HISTORICAL_TRIGGER_INACTIVE"
@@ -1111,17 +1587,20 @@ class OptionsIntelligenceSpecialist:
             "trigger_price": trig_price,
             "trigger_time": trig_time,
             "trigger_reason": trig_reason,
-            "current_spot": latest_candle_close,
+            "candle_close": latest_candle_close,
+            "current_spot": current_spot,
+            "underlying_spot_details": underlying_spot_details,
             "latest_candle_time": latest_candle_time,
             "setup_validity_state": setup_validity,
             "entry_trigger": {
                 "price": trig_price,
-                "current_spot": latest_candle_close,
+                "candle_close": latest_candle_close,
+                "current_spot": current_spot,
                 "time": trig_time,
                 "latest_candle_time": latest_candle_time,
                 "reason": trig_reason,
             },
-            "invalidation_level": spot_stop,
+            "invalidation_level": inv_level,
             "support_resistance_level": (
                 underlying_setup.get("level")
                 or (underlying_setup.get("opening_range") or {}).get("high" if "BULL" in direction else "low")
@@ -1192,6 +1671,8 @@ class OptionsIntelligenceSpecialist:
                 "theoretical_lots": theoretical_lots,
                 "risk_budget_permitted_lots": risk_budget_permitted_lots,
                 "capital_permitted_lots": capital_permitted_lots,
+                "depth_permitted_lots": depth_permitted_lots if depth_permitted_lots is not None else "UNCONSTRAINED",
+                "available_depth_shares": avail_depth,
                 "final_permitted_lots": final_permitted_lots,
                 "capital_required_per_lot": capital_req_1_lot,
                 "margin_required_per_lot": margin_req_1_lot,
@@ -1269,9 +1750,16 @@ class OptionsIntelligenceSpecialist:
             or (comp_candle.get("bar_end", "").split("T")[0] if "T" in str(comp_candle.get("bar_end", "")) else None)
         )
 
-        is_market_open = calendar_in.is_market_hours_in(now_utc, exchange="NSE")
-        if is_market_open and raw_date and raw_date != current_session_date:
-            return False  # Previous session trigger rejected in open market
+        is_market_open = calendar_in.is_market_hours_in(now_dt, exchange="NSE")
+        if is_market_open:
+            if setup_res.get("is_invalidated") or (setup_res.get("decision") or {}).get("is_invalidated"):
+                return False
+            if setup_res.get("anti_chasing", {}).get("chase_blocked") or (setup_res.get("decision") or {}).get("chase_blocked"):
+                return False
+            if sub_state in ("INVALIDATED", "EXTENDED", "EXPIRED", "STALE_DATA", "MARKET_CLOSED", "NO_DATA"):
+                return False
+            if raw_date and raw_date != current_session_date:
+                return False  # Previous session trigger rejected in open market
 
         return True
 
@@ -1284,6 +1772,8 @@ class OptionsIntelligenceSpecialist:
         now_utc: Optional[datetime.datetime] = None,
         max_loss_budget: Optional[float] = None,
         min_reward_risk: Optional[float] = None,
+        portfolio_path: Optional[str] = None,
+        broker_state_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive dual-directional options analysis for a given symbol.
@@ -1362,6 +1852,8 @@ class OptionsIntelligenceSpecialist:
                         unsub = [k for k in opt_keys if k not in self.streamer.active_keys()]
                         if unsub:
                             self.streamer.subscribe(unsub, mode="full")
+                        if hasattr(self.streamer, "wait_for_quotes"):
+                            self.streamer.wait_for_quotes(opt_keys, timeout=2.0, now_dt=now)
                         ws_live_summary = self.streamer.apply_live_quotes(chain, max_age_seconds=30.0, now_dt=now)
                 except Exception as ws_err:
                     ws_live_summary = {"error": str(ws_err)}
@@ -1432,6 +1924,35 @@ class OptionsIntelligenceSpecialist:
                 c["provider"] = chain.provider
             return c
 
+        # Construct verified underlying spot quote from streamer tick or chain
+        underlying_spot_quote = None
+        u_key = getattr(chain, "underlying_key", None)
+        if not u_key and symbol:
+            try:
+                meta_info = instruments.INDEX_INSTRUMENTS.get(symbol.upper(), {})
+                u_key = meta_info.get("upstox_key")
+            except Exception:
+                u_key = None
+
+        if self.streamer is not None and u_key:
+            live_u_tick, _ = self.streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now)
+            if live_u_tick and live_u_tick.get("last_price"):
+                underlying_spot_quote = dict(live_u_tick)
+                underlying_spot_quote["price"] = float(live_u_tick["last_price"])
+                underlying_spot_quote["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
+                underlying_spot_quote["is_live"] = True
+                underlying_spot_quote["tier"] = "REAL_TIME"
+
+        if underlying_spot_quote is None and getattr(chain, "underlying_price", None) is not None:
+            underlying_spot_quote = {
+                "price": float(chain.underlying_price),
+                "quote_timestamp": getattr(chain, "timestamp", None) or chain_retrieval_ts,
+                "retrieval_timestamp": chain_retrieval_ts,
+                "tier": getattr(chain, "data_tier", "REAL_TIME"),
+                "is_live": getattr(chain, "is_live", True),
+                "provider": getattr(chain, "provider", "upstox"),
+            }
+
         # --- A. Bullish Opportunities (BUY CE, SELL PE, BULL CALL SPREAD) ---
         if found_bull_setup:
             ce_strike = chain.select_strike("ATM", "CE") or atm_strike
@@ -1451,6 +1972,9 @@ class OptionsIntelligenceSpecialist:
                         max_loss_budget=budget,
                         min_reward_risk=min_rr,
                         now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
                     )
                     signals.append(sig_ce)
 
@@ -1472,6 +1996,9 @@ class OptionsIntelligenceSpecialist:
                         max_loss_budget=budget,
                         min_reward_risk=min_rr,
                         now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
                     )
                     signals.append(sig_sell_pe)
 
@@ -1503,6 +2030,9 @@ class OptionsIntelligenceSpecialist:
                         max_loss_budget=budget,
                         min_reward_risk=min_rr,
                         now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
                     )
                     signals.append(sig_bcs)
 
@@ -1525,6 +2055,9 @@ class OptionsIntelligenceSpecialist:
                         max_loss_budget=budget,
                         min_reward_risk=min_rr,
                         now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
                     )
                     signals.append(sig_pe)
 
@@ -1546,8 +2079,47 @@ class OptionsIntelligenceSpecialist:
                         max_loss_budget=budget,
                         min_reward_risk=min_rr,
                         now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
                     )
                     signals.append(sig_sell_ce)
+
+            # BEAR PUT SPREAD
+            otm2_pe_strike = chain.select_strike("OTM2", "PE")
+            otm2_pe_contract = _enrich_contract(chain.get_contract(otm2_pe_strike, "PE")) if otm2_pe_strike else None
+            if pe_contract and otm2_pe_contract:
+                l1, _, _ = self.validate_liquidity(pe_contract)
+                l2, _, _ = self.validate_liquidity(otm2_pe_contract)
+                if l1 and l2:
+                    sig_bps = self.generate_signal_contract(
+                        underlying=symbol,
+                        direction="BEARISH",
+                        strategy=STRATEGY_BEAR_PUT_SPREAD,
+                        option_type="SPREAD",
+                        strike=pe_strike,
+                        contract_data=pe_contract,
+                        underlying_setup=found_bear_setup,
+                        meta=meta,
+                        spread_contract={
+                            "strike": otm2_pe_strike,
+                            "symbol": otm2_pe_contract.get("symbol"),
+                            "last_price": otm2_pe_contract.get("last_price"),
+                            "bid": otm2_pe_contract.get("bid"),
+                            "ask": otm2_pe_contract.get("ask"),
+                            "delta": (otm2_pe_contract.get("greeks") or {}).get("delta"),
+                            "iv": otm2_pe_contract.get("iv"),
+                            "option_type": "PE",
+                            "quote_provenance": otm2_pe_contract.get("quote_provenance"),
+                        },
+                        max_loss_budget=budget,
+                        min_reward_risk=min_rr,
+                        now_utc=now,
+                        portfolio_path=portfolio_path,
+                        broker_state_path=broker_state_path,
+                        underlying_spot_quote=underlying_spot_quote,
+                    )
+                    signals.append(sig_bps)
 
         if not signals:
             return {

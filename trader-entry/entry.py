@@ -2066,6 +2066,7 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         "sub_state": sub_state,
         "actionable": (d_state == "ENTRY CONFIRMED"),
         "chase_blocked": bool(is_extended),
+        "is_invalidated": bool(invalidated_bar is not None),
         "no_trade_reason": no_trade_reason,
         "evaluation_mode": "on_invocation",
         "current_price": _tick_fmt(curr_px, market, eff_tick, explicit_tick),
@@ -2075,11 +2076,17 @@ def _assess_intraday_decision(res, chart, bars, all_bars, lvl, trig, pending, in
         "invalidation_level": res.get("invalidation_level"),
         "invalidation_rule": inv_rule,
         "stop_preview": stop_preview,
+        "stop_loss": stop_preview,
         "stop_preview_source": stop_source,
         "risk_per_unit": risk_per_unit,
         "targets_preview": targets_preview,
+        "targets": targets_preview,
+        "target_1_1r": targets_preview.get("target_1_1r") or targets_preview.get("t1_1r") if isinstance(targets_preview, dict) else None,
+        "target_2_2r": targets_preview.get("target_2_2r") or targets_preview.get("t2_2r") if isinstance(targets_preview, dict) else None,
         "reward_risk": rr_preview,
     }
+    res["stop_loss"] = stop_preview
+    res["targets"] = targets_preview
     if setup == "options_orb":
         res["underlying_technical_preview"] = {
             "instrument": res.get("symbol"),

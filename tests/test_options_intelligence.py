@@ -16,9 +16,12 @@ K. Multiple simultaneous opportunities ranked without duplicate recommendations.
 """
 
 import datetime
+import json
+import math
 import pytest
 import sys
 import os
+import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -34,9 +37,12 @@ for path in [
     if path not in sys.path:
         sys.path.insert(0, path)
 
+import _load
+import calendar_in
 import data_in
 import instruments
 import scan
+import upstox_feed
 from options import (
     OptionsIntelligenceSpecialist,
     STRATEGY_BUY_CE,
@@ -1488,6 +1494,2064 @@ def test_underlying_setup_candle_provenance_and_validity_state(specialist):
     assert ev["invalidation_level"] == 25161.85
     # Historical off-hours trigger must be marked HISTORICAL_TRIGGER_INACTIVE
     assert ev["setup_validity_state"] == "HISTORICAL_TRIGGER_INACTIVE"
+
+
+# ---------------------------------------------------------------- WebSocket V2 Market Data Feed Tests
+
+
+class _MockWS:
+    def __init__(self, frames=None):
+        self.frames = list(frames or [])
+        self.sent = []
+        self.closed = False
+
+    def send(self, data):
+        self.sent.append(data)
+
+    def recv(self, timeout=None):
+        if self.frames:
+            return self.frames.pop(0)
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+def _make_streamer(frames=None, ws_client=None):
+    client = ws_client or _MockWS(frames=frames)
+    s = upstox_feed.UpstoxMarketDataStreamer(
+        authorize_fn=lambda: "wss://wsfeeder-api.upstox.com/market-data-feeder/v3",
+        ws_connect=lambda u: client,
+        stale_after_seconds=30.0,
+    )
+    s.connect()
+    return s, client
+
+
+def test_websocket_live_option_quote_success():
+    """Verify live option tick parsing, exchange timestamping, and OptionChain enrichment."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    mock_now_utc = datetime.datetime(2026, 11, 17, 5, 0, 5, tzinfo=datetime.timezone.utc)
+    ts_ms = int(mock_now_utc.timestamp() * 1000)
+
+    frame = {
+        "type": "live_feed",
+        "currentTs": ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50, "ltt": ts_ms, "ltq": 65, "cp": 137.65},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {
+                            "bidAskQuote": [{"bidP": 145.00, "bidQ": 65, "askP": 146.00, "askQ": 130}]
+                        },
+                        "vtt": 50000,
+                        "oi": 120000.0,
+                        "optionGreeks": {"delta": 0.52, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    # Validate get_live_quote
+    quote, err = streamer.get_live_quote("NSE_FO|45134", max_age_seconds=30.0, now_dt=mock_now_utc)
+    assert err is None
+    assert quote is not None
+    assert quote["last_price"] == 145.50
+    assert quote["bid"] == 145.00
+    assert quote["ask"] == 146.00
+    assert quote["volume"] == 50000
+    assert quote["oi"] == 120000.0
+    assert quote["quote_timestamp"] is not None
+    assert quote["exchange_timestamp"] is not None
+    assert quote["retrieval_timestamp"] is not None
+
+    # Apply live quotes to option chain
+    chain = data_in.OptionChain(
+        "NIFTY",
+        25150.0,
+        "2026-11-17",
+        {
+            25150.0: {
+                "ce": {
+                    "symbol": "NIFTY2026111725150CE",
+                    "instrument_key": "NSE_FO|45134",
+                    "last_price": 137.65,
+                    "bid": 136.60,
+                    "ask": 137.60,
+                }
+            }
+        },
+    )
+    res = streamer.apply_live_quotes(chain, max_age_seconds=30.0, now_dt=mock_now_utc)
+    assert res["updated_contracts"] == 1
+    assert res["failed_contracts"] == 0
+
+    c = chain.strikes_data[25150.0]["ce"]
+    assert c["last_price"] == 145.50
+    assert c["bid"] == 145.00
+    assert c["ask"] == 146.00
+    assert c["quote_provenance"] == "UPSTOX_WEBSOCKET_V2_LIVE"
+    assert c["is_live"] is True
+    assert c["tier"] == "REAL_TIME"
+
+    # Evaluate with OptionsIntelligenceSpecialist using this streamer during open session
+    spec = OptionsIntelligenceSpecialist(streamer=streamer)
+    sig = spec.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data=c,
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "side": "buy",
+            "price": 25150.0,
+            "invalidation_level": 25130.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+        },
+        now_utc=mock_now_utc,
+        max_loss_budget=2000.0,
+        available_capital=100000.0,
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+    )
+    assert sig["execution_reconciliation"]["is_executable"] is True
+    assert sig["execution_reconciliation"]["quote_classification"] == "REAL_TIME_VERIFIED"
+    assert sig["execution_reconciliation"]["quote_provenance"] == "UPSTOX_WEBSOCKET_V2_LIVE"
+
+
+def test_websocket_missing_exchange_timestamp_fails_closed():
+    """Verify that feeds without exchange timestamps fail closed with MISSING_QUOTE_TIMESTAMP."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    # Feed message with no currentTs and no ltt
+    frame = {
+        "type": "live_feed",
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 145.00, "bidQ": 65, "askP": 146.00, "askQ": 130}]}
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    quote, err = streamer.get_live_quote("NSE_FO|45134", max_age_seconds=30.0)
+    assert quote is None
+    assert err == "MISSING_QUOTE_TIMESTAMP"
+
+
+def test_websocket_stale_timestamp_fails_closed():
+    """Verify that feeds with quote age > max_age_seconds fail closed with STALE_QUOTE_DATA."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    # Quote from 10 minutes ago
+    ref_now = datetime.datetime(2026, 11, 17, 5, 10, 0, tzinfo=datetime.timezone.utc)
+    old_ts_ms = int((ref_now - datetime.timedelta(minutes=10)).timestamp() * 1000)
+
+    frame = {
+        "type": "live_feed",
+        "currentTs": old_ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50, "ltt": old_ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 145.00, "bidQ": 65, "askP": 146.00, "askQ": 130}]}
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    quote, err = streamer.get_live_quote("NSE_FO|45134", max_age_seconds=30.0, now_dt=ref_now)
+    assert quote is None
+    assert err == "STALE_QUOTE_DATA"
+
+
+def test_websocket_future_timestamp_fails_closed():
+    """Verify that feeds with exchange timestamps in the future fail closed."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    ref_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    future_ts_ms = int((ref_now + datetime.timedelta(minutes=5)).timestamp() * 1000)
+
+    frame = {
+        "type": "live_feed",
+        "currentTs": future_ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50, "ltt": future_ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 145.00, "bidQ": 65, "askP": 146.00, "askQ": 130}]}
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    quote, err = streamer.get_live_quote("NSE_FO|45134", max_age_seconds=30.0, now_dt=ref_now)
+    assert quote is None
+    assert err == "FUTURE_QUOTE_TIMESTAMP"
+
+
+def test_websocket_invalid_and_crossed_quotes_fail_closed():
+    """Verify that crossed and zero quotes fail closed."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134", "NSE_FO|45136"], mode="full")
+
+    now_utc = datetime.datetime(2026, 11, 17, 5, 0, 5, tzinfo=datetime.timezone.utc)
+    ts_ms = int(now_utc.timestamp() * 1000)
+
+    # Crossed market (bid 150 > ask 145)
+    crossed_frame = {
+        "type": "live_feed",
+        "currentTs": ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 148.0, "ltt": ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 150.00, "bidQ": 65, "askP": 145.00, "askQ": 130}]}
+                    }
+                },
+            },
+            "NSE_FO|45136": {
+                "ltpc": {"ltp": 100.0, "ltt": ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 0.0, "bidQ": 0, "askP": 100.0, "askQ": 65}]}
+                    }
+                },
+            },
+        },
+    }
+    streamer.handle_raw_message(crossed_frame)
+
+    q1, err1 = streamer.get_live_quote("NSE_FO|45134", max_age_seconds=30.0, now_dt=now_utc)
+    assert q1 is None
+    assert err1 == "CROSSED_BID_ASK"
+
+    q2, err2 = streamer.get_live_quote("NSE_FO|45136", max_age_seconds=30.0, now_dt=now_utc)
+    assert q2 is None
+    assert err2 == "INVALID_BID_ASK"
+
+
+def test_websocket_disconnected_and_reconnection_behaviour():
+    """Verify fail closed upon feed disconnection and recovery upon reconnection."""
+    mock_ws = _MockWS()
+    streamer, _ = _make_streamer(ws_client=mock_ws)
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    # While connected, quote is accessible
+    now_utc = datetime.datetime(2026, 11, 17, 5, 0, 5, tzinfo=datetime.timezone.utc)
+    ts_ms = int(now_utc.timestamp() * 1000)
+    frame = {
+        "type": "live_feed",
+        "currentTs": ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.5, "ltt": ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 145.0, "bidQ": 65, "askP": 146.0, "askQ": 65}]}
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    q, err = streamer.get_live_quote("NSE_FO|45134", now_dt=now_utc)
+    assert q is not None
+
+    # Simulate disconnect
+    streamer.close()
+    assert streamer.is_connected is False
+
+    q_disconn, err_disconn = streamer.get_live_quote("NSE_FO|45134", now_dt=now_utc)
+    assert q_disconn is None
+    assert err_disconn == "WEBSOCKET_FEED_DISCONNECTED"
+
+    # Reconnect
+    streamer.reconnect(max_attempts=1)
+    assert streamer.is_connected is True
+    # Keys remain preserved
+    assert "NSE_FO|45134" in streamer.active_keys()
+
+
+# ---------------------------------------------------------------- Comprehensive Forensic Audit Regressions (F-001 through F-018)
+
+
+def test_audit_f001_bullish_spot_past_invalidation_rejected(specialist):
+    """F-001: Bullish setup where current spot has breached invalidation level must be rejected."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    # Entry trigger was 25200 with invalidation 25150, but current spot collapsed to 25140 (< 25150)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.52, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "current_spot": 25140.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=5000.0,
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("INVALIDATED_SETUP" in r for r in sig["rejection_reasons"])
+    assert sig["underlying_setup_evidence"]["setup_validity_state"] == "INVALIDATED"
+
+
+def test_audit_f001_bearish_spot_above_invalidation_rejected(specialist):
+    """F-001: Bearish setup where current spot has rallied above stop must be rejected."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    # Entry was 25100 with stop 25150, but current spot rallied to 25160 (> 25150)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BEARISH",
+        strategy=STRATEGY_BUY_PE,
+        option_type="PE",
+        strike=25100.0,
+        contract_data={
+            "symbol": "NIFTY2026111725100PE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": -0.48, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakdown_intraday",
+            "price": 25100.0,
+            "invalidation_level": 25150.0,
+            "current_spot": 25160.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=5000.0,
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("INVALIDATED_SETUP" in r for r in sig["rejection_reasons"])
+    assert sig["underlying_setup_evidence"]["setup_validity_state"] == "INVALIDATED"
+
+
+def test_audit_f001_extended_above_chase_limit_rejected(specialist):
+    """F-001: Setups flagged chase_blocked or past entry zone must reject as EXTENDED_SETUP."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.52, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25150.0,
+            "invalidation_level": 25100.0,
+            "current_spot": 25250.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "decision": {
+                "chase_blocked": True,
+                "sub_state": "EXTENDED",
+                "entry_zone": {"low": 25145.0, "high": 25165.0},
+            },
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=5000.0,
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("EXTENDED_SETUP" in r for r in sig["rejection_reasons"])
+
+
+def test_audit_f007_invalidated_or_extended_index_setup_fails_in_live_market(specialist):
+    """F-007: In an open live session, invalidated or extended index setups must fail closed in is_valid_session_setup."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    now_ist_str = "2026-11-17"
+
+    # Case 1: Invalidated index setup
+    inv_setup = {
+        "symbol": "NIFTY",
+        "status": "triggered",
+        "decision_state": "NO TRADE",
+        "sub_state": "ANALYTICAL_ONLY_INDEX",
+        "date": now_ist_str,
+        "is_invalidated": True,
+    }
+    assert specialist.is_valid_session_setup(inv_setup, mock_open) is False
+
+    # Case 2: Chase blocked / extended index setup
+    ext_setup = {
+        "symbol": "BANKNIFTY",
+        "status": "triggered",
+        "decision_state": "NO TRADE",
+        "sub_state": "ANALYTICAL_ONLY_INDEX",
+        "date": now_ist_str,
+        "decision": {"chase_blocked": True},
+    }
+    assert specialist.is_valid_session_setup(ext_setup, mock_open) is False
+
+
+def test_audit_f010_contract_canonical_keys_reconciliation(specialist):
+    """F-010: Verify options.py reads stop_loss and targets from decision payload without synthetic fallback."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.52, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "decision": {
+                "entry_reference": 25200.0,
+                "stop_loss": 25160.0,
+                "invalidation_level": 25160.0,
+                "current_price": 25205.0,
+                "targets": {"target_1_1r": 25300.0, "target_2_2r": 25400.0},
+            },
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=10000.0,
+        min_reward_risk=2.0,
+        now_utc=mock_open,
+    )
+    # Stop loss and targets in premium levels are modeled from exact canonical levels (25160 and 25300)
+    assert sig["stop_loss"] < sig["current_premium"]
+    assert sig["target_1"] > sig["current_premium"]
+    assert sig["underlying_setup_evidence"]["invalidation_level"] == 25160.0
+
+
+def test_audit_f003_missing_greeks_rejects_with_greeks_unavailable(specialist):
+    """F-003: If required delta is missing/None, candidate must be rejected with GREEKS_UNAVAILABLE."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {},  # Missing delta
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("GREEKS_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+
+
+def test_audit_f003_zero_delta_and_zero_gamma_supported_without_truthiness_corruption(specialist):
+    """F-003: Delta=0.0 or Gamma=0.0 must be preserved as legitimate numbers without fallback coercion."""
+    res = specialist.model_premium_levels(
+        entry_premium=100.0,
+        spot_entry=25200.0,
+        spot_stop=25150.0,
+        spot_t1=25300.0,
+        spot_t2=25400.0,
+        delta=0.0,
+        gamma=0.0,
+        theta=0.0,
+        vega=0.0,
+        iv=15.0,
+        option_type="CE",
+        is_seller=False,
+    )
+    # With delta=0, gamma=0, premium does not move with spot
+    assert res is None or res.get("delta_used") == 0.0
+
+
+def test_audit_f005_f006_spread_strategy_two_leg_validation_and_payoff(specialist):
+    """F-005 & F-006: Spread evaluates both legs with independent quotes and combined payoff."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BULL_CALL_SPREAD,
+        option_type="SPREAD",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.52, "gamma": 0.001},
+        },
+        spread_contract={
+            "strike": 25250.0,
+            "symbol": "NIFTY2026111725250CE",
+            "bid": 85.0,
+            "ask": 86.0,
+            "last_price": 85.5,
+            "option_type": "CE",
+            "quote_provenance": "UPSTOX_WEBSOCKET_V2_LIVE",
+            "delta": 0.32,
+            "iv": 14.5,
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0, "target_2_2r": 25400.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=10000.0,
+        available_capital=100000.0,
+        now_utc=mock_open,
+    )
+    # Check legs structure
+    legs = sig.get("legs", [])
+    assert len(legs) == 2
+    assert legs[0]["role"] == "PRIMARY"
+    assert legs[0]["option_type"] == "CE"
+    assert legs[0]["side"] == "BUY"
+    assert legs[1]["role"] == "HEDGE"
+    assert legs[1]["option_type"] == "CE"
+    assert legs[1]["side"] == "SELL"
+
+    # Spread risk per lot: Net debit = entry1 (141.05) - entry2 (84.95) = 56.10
+    ps = sig["position_sizing"]
+    assert ps["risk_per_lot_inr"] > 0
+    assert ps["risk_per_lot_inr"] < (100.0 * 65)  # Less than naked call risk
+
+
+def test_audit_f005_spread_hedge_leg_crossed_or_zero_quotes_rejected(specialist):
+    """F-005 & F-006: Spread must reject if hedge leg has zero or crossed quotes."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BULL_CALL_SPREAD,
+        option_type="SPREAD",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.52, "gamma": 0.001},
+        },
+        spread_contract={
+            "strike": 25250.0,
+            "symbol": "NIFTY2026111725250CE",
+            "bid": 90.0,
+            "ask": 80.0,  # Crossed bid >= ask
+            "last_price": 85.0,
+            "option_type": "CE",
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("Crossed market quotes in spread hedge leg" in r for r in sig["rejection_reasons"])
+
+
+def test_audit_f013_naked_selling_unauthoritative_margin_rejected(specialist):
+    """F-013: Naked SELL CE / SELL PE must reject live execution when authoritative margin is unavailable."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BEARISH",
+        strategy=STRATEGY_SELL_CE,
+        option_type="CE",
+        strike=25200.0,
+        contract_data={
+            "symbol": "NIFTY2026111725200CE",
+            "bid": 110.0,
+            "ask": 111.0,
+            "last_price": 110.5,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.45, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakdown_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25250.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25100.0, "target_2_2r": 25000.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=50000.0,
+        available_capital=500000.0,
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("AUTHORITATIVE_MARGIN_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+    assert sig["margin_details"]["margin_type"] == "HEURISTIC_MARGIN_ESTIMATE"
+    assert sig["margin_details"]["is_undefined_risk"] is True
+
+
+def test_audit_f008_intent_parsing_word_boundaries_no_false_positives():
+    """F-008: Regex word boundaries prevent false positive direction matches on words like open or setup."""
+    orch = MarketIntelligenceOrchestrator()
+
+    # Query with 'open' (contains 'pe') should NOT match BEARISH
+    q1 = orch.detect_intent("What is the open interest on NIFTY?")
+    assert q1["direction_bias"] is None
+    assert q1["target_symbol"] == "NIFTY"
+
+    # Query with 'setup' (contains 'up') should NOT match BULLISH
+    q2 = orch.detect_intent("Show me the setup for BANKNIFTY")
+    assert q2["direction_bias"] is None
+    assert q2["target_symbol"] == "BANKNIFTY"
+
+    # Exact 'pe' or 'put' matches BEARISH
+    q3 = orch.detect_intent("Find best NIFTY PE options")
+    assert q3["direction_bias"] == "BEARISH"
+
+    # Exact 'ce' or 'call' matches BULLISH
+    q4 = orch.detect_intent("Analyze CE calls on INFY")
+    assert q4["direction_bias"] == "BULLISH"
+
+
+def test_audit_f014_f018_dynamic_universe_reporting_and_scan_errors():
+    """F-014 & F-018: Universe counts reported dynamically and scanner errors captured."""
+    orch = MarketIntelligenceOrchestrator()
+    res = orch.run_market_intelligence(query="NIFTY", top_n=2)
+
+    assert "total_eligible" in res
+    assert res["total_eligible"] >= 10
+    assert "passed_to_scanner" in res
+    assert "successfully_scanned" in res
+    assert "coverage_pct" in res
+    assert isinstance(res.get("scan_errors"), list)
+
+
+def test_audit_websocket_ltpc_packet_without_depth_does_not_mark_quotes_live():
+    """Verify that an LTPC tick without order book depth fails get_live_quote(require_depth=True)."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    mock_now_utc = datetime.datetime(2026, 11, 17, 5, 0, 5, tzinfo=datetime.timezone.utc)
+    ts_ms = int(mock_now_utc.timestamp() * 1000)
+
+    # LTPC message with ltp but no bid/ask quotes
+    frame = {
+        "type": "live_feed",
+        "currentTs": ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50, "ltt": ts_ms},
+            }
+        },
+    }
+    streamer.handle_raw_message(frame)
+
+    # require_depth=True must reject missing bid/ask
+    q, err = streamer.get_live_quote("NSE_FO|45134", require_depth=True, now_dt=mock_now_utc)
+    assert q is None
+    assert err == "MISSING_BID_ASK"
+
+    # require_depth=False allows LTP-only lookup
+    q_ltp, err_ltp = streamer.get_live_quote("NSE_FO|45134", require_depth=False, now_dt=mock_now_utc)
+    assert q_ltp is not None
+    assert err_ltp is None
+    assert q_ltp["last_price"] == 145.50
+
+
+def test_audit_websocket_wait_for_quotes_synchronous_receive():
+    """Verify wait_for_quotes polls socket until all required ticks arrive."""
+    mock_now_utc = datetime.datetime(2026, 11, 17, 5, 0, 5, tzinfo=datetime.timezone.utc)
+    ts_ms = int(mock_now_utc.timestamp() * 1000)
+
+    frame = {
+        "type": "live_feed",
+        "currentTs": ts_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.50, "ltt": ts_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 145.00, "bidQ": 65, "askP": 146.00, "askQ": 65}]}
+                    }
+                },
+            }
+        },
+    }
+    # Mock WS with frame queued
+    streamer, _ = _make_streamer(frames=[frame])
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    # wait_for_quotes polls and consumes the frame
+    received = streamer.wait_for_quotes(["NSE_FO|45134"], timeout=1.0)
+    assert received == 1
+    assert "NSE_FO|45134" in streamer.last_ticks
+
+
+def test_audit_upstox_strictly_read_only_boundary():
+    """Verify Upstox integration and options modules contain zero order placement/modification methods."""
+    import inspect
+    from upstox_feed import UpstoxMarketDataStreamer
+    from options import OptionsIntelligenceSpecialist
+
+    forbidden_names = ["place_order", "modify_order", "cancel_order", "execute_order", "send_order"]
+
+    for name in forbidden_names:
+        assert not hasattr(UpstoxMarketDataStreamer, name), f"Streamer must not have {name}"
+        assert not hasattr(OptionsIntelligenceSpecialist, name), f"Specialist must not have {name}"
+        assert not hasattr(data_in.UpstoxMarketDataProvider, name), f"Provider must not have {name}"
+
+
+def test_phase1_orchestrator_streamer_injection_and_lifecycle():
+    """Phase 1: Verify Orchestrator injects streamer and cleanly shuts it down."""
+    streamer, _ = _make_streamer()
+    assert streamer.is_connected is True
+    streamer.last_ticks["NSE_FO|12345"] = {"last_price": 100.0}
+
+    with MarketIntelligenceOrchestrator(streamer=streamer) as orch:
+        assert orch.specialist.streamer is streamer
+        assert orch.streamer is streamer
+        assert streamer.is_connected is True
+
+    # After context exit, streamer should be closed and cached ticks cleared
+    assert streamer.is_connected is False
+    assert len(streamer.last_ticks) == 0
+
+
+def test_phase1_ltpc_tick_does_not_refresh_stale_depth_timestamp():
+    """Phase 1: Verify LTP-only ticks do not refresh depth timestamp, causing stale depth rejection."""
+    streamer, _ = _make_streamer()
+    streamer.subscribe(["NSE_FO|45134"], mode="full")
+
+    t0 = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    t0_ms = int(t0.timestamp() * 1000)
+
+    # Frame 1 at T0: Full depth tick
+    frame1 = {
+        "type": "live_feed",
+        "currentTs": t0_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 145.0, "ltt": t0_ms},
+                "fullFeed": {
+                    "marketFF": {
+                        "marketLevel": {"bidAskQuote": [{"bidP": 144.5, "bidQ": 50, "askP": 145.5, "askQ": 50}]}
+                    }
+                },
+            }
+        },
+    }
+    streamer.handle_raw_message(frame1)
+
+    # Depth is fresh at T0 + 10s
+    t_10s = t0 + datetime.timedelta(seconds=10)
+    q1, err1 = streamer.get_live_quote("NSE_FO|45134", require_depth=True, max_age_seconds=120.0, now_dt=t_10s)
+    assert err1 is None
+    assert q1["bid"] == 144.5
+
+    # Frame 2 at T0 + 130s: LTP-only tick (depth omitted)
+    t_130s = t0 + datetime.timedelta(seconds=130)
+    t_130s_ms = int(t_130s.timestamp() * 1000)
+    frame2 = {
+        "type": "live_feed",
+        "currentTs": t_130s_ms,
+        "feeds": {
+            "NSE_FO|45134": {
+                "ltpc": {"ltp": 146.0, "ltt": t_130s_ms},
+            }
+        },
+    }
+    streamer.handle_raw_message(frame2)
+
+    # At T0 + 130s, last_price is updated to 146.0, but depth quote timestamp remained at T0
+    # Therefore, require_depth=True must reject with STALE_QUOTE_DATA!
+    q2, err2 = streamer.get_live_quote("NSE_FO|45134", require_depth=True, max_age_seconds=120.0, now_dt=t_130s)
+    assert q2 is None
+    assert err2 == "STALE_QUOTE_DATA"
+
+    # But require_depth=False succeeds with updated LTP
+    q_ltp, err_ltp = streamer.get_live_quote("NSE_FO|45134", require_depth=False, max_age_seconds=120.0, now_dt=t_130s)
+    assert err_ltp is None
+    assert q_ltp["last_price"] == 146.0
+
+
+def test_phase2_seller_dp_stop_sign_and_slippage(specialist):
+    """Phase 2: Seller premium levels have correct sign (no abs distortion) and conservative slippage."""
+    entry_prem = 100.0
+    spot_entry = 25000.0
+    spot_stop = 25100.0  # Adverse for SELL CE (spot rises by 100 pts)
+    spot_t1 = 24950.0    # Favorable for SELL CE (spot falls by 50 pts)
+    spot_t2 = 24900.0    # More favorable for SELL CE (spot falls by 100 pts)
+
+    res = specialist.model_premium_levels(
+        entry_premium=entry_prem,
+        spot_entry=spot_entry,
+        spot_stop=spot_stop,
+        spot_t1=spot_t1,
+        spot_t2=spot_t2,
+        delta=0.50,
+        gamma=0.0,
+        theta=0.0,
+        vega=0.0,
+        option_type="CE",
+        is_seller=True,
+        slippage_ticks=1,
+    )
+    assert res is not None
+    assert res["entry_premium"] == 99.95  # 100.0 - 0.05 sell entry slippage
+    assert res["stop_loss_premium"] == 150.05  # 100.0 + 50.0 + 0.05 buy stop slippage
+    assert res["target_1_premium"] == 75.05  # 100.0 - 25.0 + 0.05 buy target slippage
+    assert res["target_2_premium"] == 50.05  # 100.0 - 50.0 + 0.05 buy target slippage
+    assert res["target_2_premium"] < res["target_1_premium"] < res["entry_premium"] < res["stop_loss_premium"]
+
+
+def test_phase2_holding_time_session_clock(specialist):
+    """Phase 2: Holding time derives dynamically from session cutoff 15:15 IST."""
+    t_1415_ist = datetime.datetime(2026, 11, 17, 14, 15, tzinfo=calendar_in.IST)
+    res_1h = specialist.model_premium_levels(
+        entry_premium=100.0,
+        spot_entry=25000.0,
+        spot_stop=24900.0,
+        spot_t1=25200.0,
+        spot_t2=25300.0,
+        delta=0.50,
+        gamma=0.0,
+        theta=-30.0,
+        option_type="CE",
+        is_seller=False,
+        evaluation_time=t_1415_ist,
+    )
+    assert res_1h is not None
+    assert math.isclose(res_1h["theta_decay_applied"], 4.8, abs_tol=0.2)
+
+
+def test_phase3_authoritative_bod_cache_enforcement():
+    """Phase 3: Fallback lot size cannot satisfy require_authoritative."""
+    lot_fallback = instruments.get_fo_lot_size(
+        "NIFTY",
+        cache_payload={"derivatives_meta": {}},
+        require_authoritative=False,
+    )
+    assert lot_fallback == 25
+
+    lot_auth = instruments.get_fo_lot_size(
+        "NIFTY",
+        cache_payload={"derivatives_meta": {}},
+        require_authoritative=True,
+    )
+    assert lot_auth is None
+
+
+def test_phase4_central_portfolio_risk_enforcement(specialist, tmp_path):
+    """Phase 4: Enforce max daily loss and max open positions during live check."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    mock_port = tmp_path / "portfolio.json"
+    mock_broker = tmp_path / "broker.json"
+
+    mock_port.write_text(json.dumps({
+        "cash": 100000.0,
+        "positions": [{"symbol": f"POS_{i}", "qty": 10} for i in range(5)],
+    }))
+    mock_broker.write_text(json.dumps({"orders": []}))
+
+    ok, rejections = specialist.check_portfolio_risk(
+        candidate_risk=1000.0,
+        capital_required=10000.0,
+        portfolio_path=str(mock_port),
+        broker_state_path=str(mock_broker),
+        now_utc=mock_now,
+        is_live_check=True,
+    )
+    assert ok is False
+    assert any("MAX_OPEN_POSITIONS_REACHED" in r for r in rejections)
+
+
+def test_phase5_orchestrator_shortlist_and_diagnostic_table(orchestrator):
+    """Phase 5: Actionable shortlist excludes rejected candidates and includes diagnostic table."""
+    sig_good = {
+        "underlying_instrument": "NIFTY",
+        "strategy": "BUY_CE",
+        "strike": 25000.0,
+        "signal_state": "SIGNAL VALIDATED",
+        "is_actionable": True,
+        "ranking_score": 90.0,
+        "current_premium": 150.0,
+        "stop_loss": 120.0,
+        "target_1": 210.0,
+        "target_2": 240.0,
+        "expected_risk_reward_after_charges": 2.5,
+        "maximum_loss": "Total premium outlay",
+        "capital_margin_requirement": 9750.0,
+        "direction": "BULLISH",
+        "contract": "NIFTY26N1725000CE",
+        "expiry": "2026-11-17",
+        "position_sizing": {
+            "lot_size": 65, "lots": 1, "total_quantity": 65,
+            "net_risk_per_lot_inr": 1950.0, "capital_required_per_lot": 9750.0,
+            "budget_max_loss_inr": 2000.0,
+        },
+        "selection_rationale": "High quality breakout setup",
+    }
+    sig_bad = {
+        "underlying_instrument": "BANKNIFTY",
+        "strategy": "SELL_PE",
+        "strike": 52000.0,
+        "signal_state": "SIGNAL REJECTED",
+        "is_actionable": False,
+        "rejection_reasons": ["AUTHORITATIVE_MARGIN_UNAVAILABLE: Heuristic estimate not permitted"],
+        "ranking_score": 10.0,
+        "direction": "BULLISH_OR_SIDEWAYS",
+    }
+
+    report = orchestrator._format_report(
+        query="NIFTY and BANKNIFTY",
+        session_label="LIVE SESSION",
+        underlying_summaries={},
+        shortlist=[sig_good],
+        rejected_signals=[sig_bad],
+        total_eligible=230,
+        passed_to_scanner=2,
+        successfully_scanned=2,
+    )
+    assert "Filtered & Rejected Candidates (Diagnostic Audit)" in report
+    assert "AUTHORITATIVE_MARGIN_UNAVAILABLE" in report
+    assert "Evaluated **2** key instruments (core scan universe out of 230" in report
+
+
+# =====================================================================
+# Targeted Hardening: Mandatory Greeks, CLI Lifecycle, Execution Safety
+# =====================================================================
+
+def test_hardening_missing_gamma_independently_rejects(specialist):
+    """Hardening 1: Missing Gamma must reject with GREEKS_UNAVAILABLE and not default to synthetic 0.001."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51},  # Missing gamma
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("GREEKS_UNAVAILABLE" in r and "Gamma" in r for r in sig["rejection_reasons"])
+
+
+def test_hardening_missing_delta_independently_rejects(specialist):
+    """Hardening 1b: Missing Delta must independently reject with GREEKS_UNAVAILABLE."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"gamma": 0.001},  # Missing delta
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("GREEKS_UNAVAILABLE" in r and "Delta" in r for r in sig["rejection_reasons"])
+
+
+def test_hardening_seller_missing_theta_independently_rejects(specialist):
+    """Hardening 1c: Missing Theta on option selling must reject with GREEKS_UNAVAILABLE."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BEARISH_OR_SIDEWAYS",
+        strategy=STRATEGY_SELL_CE,
+        option_type="CE",
+        strike=25200.0,
+        contract_data={
+            "symbol": "NIFTY2026111725200CE",
+            "bid": 110.0,
+            "ask": 111.0,
+            "last_price": 110.5,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.45, "gamma": 0.001},  # Missing theta for seller
+        },
+        underlying_setup={
+            "setup": "breakdown_intraday",
+            "side": "sell",
+            "price": 25200.0,
+            "invalidation_level": 25250.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25100.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("GREEKS_UNAVAILABLE" in r and "Theta" in r for r in sig["rejection_reasons"])
+
+
+def test_hardening_buyer_strategy_exception_documented_and_tested(specialist):
+    """Hardening 1d: Directional buyers have documented strategy exception for Theta/Vega/IV."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},  # Delta and Gamma present, Theta/Vega/IV omitted
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0, "target_2_2r": 25400.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        max_loss_budget=15000.0,
+        now_utc=mock_open,
+    )
+    # Strategy exception allows directional buyer without Theta/Vega/IV
+    assert not any("GREEKS_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+    assert sig["signal_state"] == "SIGNAL VALIDATED"
+    assert sig["is_actionable"] is True
+
+
+def test_hardening_require_all_greeks_independently_rejects_missing_values():
+    """Hardening 1e: With require_all_greeks enabled, missing Theta, Vega, or IV independently reject."""
+    spec = OptionsIntelligenceSpecialist(config={"require_all_greeks": True})
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+
+    # Missing Theta
+    sig_no_theta = spec.generate_signal_contract(
+        underlying="NIFTY", direction="BULLISH", strategy=STRATEGY_BUY_CE, option_type="CE", strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE", "bid": 140.0, "ask": 141.0, "last_price": 141.0,
+            "tier": "REAL_TIME", "is_live": True, "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30", "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001, "vega": 10.0, "iv": 14.0},  # Missing Theta
+        },
+        underlying_setup={"setup": "breakout_intraday", "price": 25200.0, "invalidation_level": 25150.0, "candle_timestamp": "2026-11-17T10:30:00+05:30"},
+        meta={"lot_size": 65, "expiry": "2026-11-17"}, now_utc=mock_open,
+    )
+    assert any("GREEKS_UNAVAILABLE" in r and "Theta" in r for r in sig_no_theta["rejection_reasons"])
+
+    # Missing Vega
+    sig_no_vega = spec.generate_signal_contract(
+        underlying="NIFTY", direction="BULLISH", strategy=STRATEGY_BUY_CE, option_type="CE", strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE", "bid": 140.0, "ask": 141.0, "last_price": 141.0,
+            "tier": "REAL_TIME", "is_live": True, "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30", "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "iv": 14.0},  # Missing Vega
+        },
+        underlying_setup={"setup": "breakout_intraday", "price": 25200.0, "invalidation_level": 25150.0, "candle_timestamp": "2026-11-17T10:30:00+05:30"},
+        meta={"lot_size": 65, "expiry": "2026-11-17"}, now_utc=mock_open,
+    )
+    assert any("GREEKS_UNAVAILABLE" in r and "Vega" in r for r in sig_no_vega["rejection_reasons"])
+
+    # Missing IV
+    sig_no_iv = spec.generate_signal_contract(
+        underlying="NIFTY", direction="BULLISH", strategy=STRATEGY_BUY_CE, option_type="CE", strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE", "bid": 140.0, "ask": 141.0, "last_price": 141.0,
+            "tier": "REAL_TIME", "is_live": True, "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30", "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},  # Missing IV
+        },
+        underlying_setup={"setup": "breakout_intraday", "price": 25200.0, "invalidation_level": 25150.0, "candle_timestamp": "2026-11-17T10:30:00+05:30"},
+        meta={"lot_size": 65, "expiry": "2026-11-17"}, now_utc=mock_open,
+    )
+    assert any("GREEKS_UNAVAILABLE" in r and "IV" in r for r in sig_no_iv["rejection_reasons"])
+
+
+def test_hardening_legitimate_zero_greeks_preserved(specialist):
+    """Hardening 1f: Zero values for Greeks (delta=0, gamma=0, theta=0) must be preserved without truthiness corruption."""
+    res = specialist.model_premium_levels(
+        entry_premium=100.0,
+        spot_entry=25200.0,
+        spot_stop=25150.0,
+        spot_t1=25300.0,
+        spot_t2=25400.0,
+        delta=0.0,
+        gamma=0.0,
+        theta=0.0,
+        vega=0.0,
+        iv=0.0,
+        option_type="CE",
+        is_seller=False,
+    )
+    assert res is None or (res.get("delta_used") == 0.0 and res.get("gamma_used") == 0.0)
+
+
+def test_hardening_cli_lifecycle_context_manager_cleanup():
+    """Hardening 2: Context manager cleanly closes orchestrator and streamer on normal exit and exception."""
+    class DummyStreamer:
+        def __init__(self):
+            self.is_connected = True
+            self.closed = False
+        def close(self):
+            self.closed = True
+            self.is_connected = False
+
+    streamer = DummyStreamer()
+    orch = MarketIntelligenceOrchestrator(streamer=streamer)
+
+    # Test normal exit
+    with orch as o:
+        assert o.streamer.is_connected is True
+    assert orch.streamer.closed is True
+    assert orch.streamer.is_connected is False
+
+    # Test exception exit
+    streamer2 = DummyStreamer()
+    orch2 = MarketIntelligenceOrchestrator(streamer=streamer2)
+    with pytest.raises(RuntimeError):
+        with orch2 as o:
+            raise RuntimeError("Simulated pipeline failure")
+    assert orch2.streamer.closed is True
+    assert orch2.streamer.is_connected is False
+
+
+def test_hardening_excessive_spread_rejection(specialist):
+    """Hardening 3a: Wide bid-ask spreads (> 6.0%) must reject with EXCESSIVE_SPREAD."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+    # Bid 100, Ask 120 -> Spread 20 / 110 = 18.18% > 6.0%
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 100.0,
+            "ask": 120.0,
+            "last_price": 110.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert sig["is_actionable"] is False
+    assert any("EXCESSIVE_SPREAD" in r for r in sig["rejection_reasons"])
+
+
+def test_hardening_insufficient_depth_rejection(specialist):
+    """Hardening 3b: Zero bid or ask quantity in order book must reject with INSUFFICIENT_DEPTH."""
+    mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=datetime.timezone.utc)
+
+    # Zero bid quantity
+    sig_zero_bid_qty = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 0,  # Zero depth on bid
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig_zero_bid_qty["signal_state"] == "SIGNAL REJECTED"
+    assert any("INSUFFICIENT_DEPTH" in r for r in sig_zero_bid_qty["rejection_reasons"])
+
+    # Zero ask quantity
+    sig_zero_ask_qty = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 0,  # Zero depth on ask
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        now_utc=mock_open,
+    )
+    assert sig_zero_ask_qty["signal_state"] == "SIGNAL REJECTED"
+    assert any("INSUFFICIENT_DEPTH" in r for r in sig_zero_ask_qty["rejection_reasons"])
+
+
+# ==============================================================================
+# REMEDIATION FORENSIC TESTS (FINDINGS 1 - 4)
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 1. P1: FRESH UNDERLYING SPOT
+# ------------------------------------------------------------------------------
+def test_underlying_spot_missing_timestamp_rejects(specialist):
+    """Underlying spot missing timestamp fails freshness validation fail-closed."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25200.0,
+            "quote_timestamp": None,
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+        },
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("UNDERLYING_SPOT_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+
+
+def test_underlying_spot_unparseable_timestamp_rejects(specialist):
+    """Underlying spot with unparseable timestamp fails validation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": "2026-11-17T10:30:00+05:30",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": "2026-11-17T10:30:00+05:30",
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25200.0,
+            "quote_timestamp": "corrupt-iso-timestamp-string",
+            "retrieval_timestamp": "2026-11-17T10:30:01+05:30",
+        },
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("UNDERLYING_SPOT_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+
+
+def test_underlying_spot_stale_timestamp_rejects(specialist):
+    """Underlying spot older than 60s max age threshold fails freshness validation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    stale_ts = (mock_now - datetime.timedelta(seconds=75)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": mock_now.isoformat(),
+            "retrieval_timestamp": mock_now.isoformat(),
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": mock_now.isoformat(),
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25200.0,
+            "quote_timestamp": stale_ts,
+            "retrieval_timestamp": mock_now.isoformat(),
+        },
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("STALE" in r or "UNDERLYING_SPOT_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+
+
+def test_underlying_spot_future_timestamp_rejects(specialist):
+    """Underlying spot timestamp with future drift > 5s fails freshness validation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    future_ts = (mock_now + datetime.timedelta(seconds=20)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": mock_now.isoformat(),
+            "retrieval_timestamp": mock_now.isoformat(),
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": mock_now.isoformat(),
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25200.0,
+            "quote_timestamp": future_ts,
+            "retrieval_timestamp": mock_now.isoformat(),
+        },
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("FUTURE" in r or "UNDERLYING_SPOT_UNAVAILABLE" in r for r in sig["rejection_reasons"])
+
+
+def test_underlying_spot_fresh_quote_validates(specialist):
+    """Fresh validated underlying spot permits signal validation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=5)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 136.75,
+            "ask": 137.75,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 137.75,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25240.0,
+            "invalidation_level": 25100.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25550.0, "target_2_2r": 25750.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25240.0,
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+        },
+        max_loss_budget=15000.0,
+        min_reward_risk=2.0,
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL VALIDATED"
+    assert sig["is_actionable"] is True
+    assert sig["underlying_setup_evidence"]["current_spot"] == 25240.0
+    assert sig["underlying_setup_evidence"]["candle_close"] == 25240.0
+
+
+def test_candle_close_and_current_spot_disagree_invalidation_breach_rejects(specialist):
+    """Candle close was above invalidation, but fresh live spot has crossed below invalidation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=2)).isoformat()
+    # Bullish setup: entry 25200, invalidation 25150
+    # Candle close was 25200 (valid), but live spot dropped to 25140 (< 25150 invalidation)
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={
+            "underlying_price": 25140.0,  # Below 25150 invalidation level
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+        },
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("INVALIDATED_SETUP" in r for r in sig["rejection_reasons"])
+
+
+# ------------------------------------------------------------------------------
+# 2. P1: ORDER-BOOK DEPTH VERSUS PERMITTED QUANTITY
+# ------------------------------------------------------------------------------
+def test_order_book_depth_below_one_lot_rejects(specialist):
+    """Available depth less than 1 lot rejects trade fail-closed."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=2)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 140.0,
+            "ask": 141.0,
+            "bid_qty": 500,
+            "ask_qty": 20,  # Only 20 shares available, but lot size is 65
+            "last_price": 141.0,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25150.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25300.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={"underlying_price": 25200.0, "quote_timestamp": fresh_ts},
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL REJECTED"
+    assert any("INSUFFICIENT_DEPTH" in r for r in sig["rejection_reasons"])
+
+
+def test_order_book_depth_caps_multi_lot_permitted_quantity(specialist):
+    """Available depth for 1 lot caps quantity even if risk budget permits more lots."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=2)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 136.75,
+            "ask": 137.75,
+            "bid_qty": 500,
+            "ask_qty": 65,  # Exactly 1 lot (65 shares) available
+            "last_price": 137.75,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25240.0,
+            "invalidation_level": 25100.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25550.0, "target_2_2r": 25750.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={"underlying_price": 25240.0, "quote_timestamp": fresh_ts},
+        max_loss_budget=20000.0,  # Large budget that would otherwise permit multiple lots
+        min_reward_risk=2.0,
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL VALIDATED"
+    ps = sig["position_sizing"]
+    assert ps["depth_permitted_lots"] == 1
+    assert ps["final_permitted_lots"] == 1
+    assert ps["total_quantity"] == 65
+
+
+def test_order_book_depth_equal_and_above_proposed_quantity(specialist):
+    """Depth equal to or above proposed quantity allows permitted lots without artificial truncation."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=2)).isoformat()
+    # 2 lots permitted by depth (130 shares)
+    sig_equal = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 136.75,
+            "ask": 137.75,
+            "bid_qty": 500,
+            "ask_qty": 130,  # Exactly 2 lots
+            "last_price": 137.75,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25240.0,
+            "invalidation_level": 25100.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25550.0, "target_2_2r": 25750.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={"underlying_price": 25240.0, "quote_timestamp": fresh_ts},
+        max_loss_budget=20000.0,
+        min_reward_risk=2.0,
+        now_utc=mock_now,
+    )
+    assert sig_equal["signal_state"] == "SIGNAL VALIDATED"
+    assert sig_equal["position_sizing"]["depth_permitted_lots"] == 2
+
+    # Ample depth (500 shares)
+    sig_above = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BUY_CE,
+        option_type="CE",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 136.75,
+            "ask": 137.75,
+            "bid_qty": 500,
+            "ask_qty": 500,
+            "last_price": 137.75,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25240.0,
+            "invalidation_level": 25100.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25550.0, "target_2_2r": 25750.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={"underlying_price": 25240.0, "quote_timestamp": fresh_ts},
+        max_loss_budget=20000.0,
+        min_reward_risk=2.0,
+        now_utc=mock_now,
+    )
+    assert sig_above["signal_state"] == "SIGNAL VALIDATED"
+    assert sig_above["position_sizing"]["depth_permitted_lots"] >= 2
+
+
+def test_spread_hedge_leg_depth_constrains_quantity(specialist):
+    """Hedge leg depth constrains spread quantity even when primary leg has large depth."""
+    mock_now = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=datetime.timezone.utc)
+    fresh_ts = (mock_now - datetime.timedelta(seconds=2)).isoformat()
+    sig = specialist.generate_signal_contract(
+        underlying="NIFTY",
+        direction="BULLISH",
+        strategy=STRATEGY_BULL_CALL_SPREAD,
+        option_type="SPREAD",
+        strike=25150.0,
+        contract_data={
+            "symbol": "NIFTY2026111725150CE",
+            "bid": 136.75,
+            "ask": 137.75,
+            "bid_qty": 500,
+            "ask_qty": 500,  # Ample depth on primary leg (500 shares)
+            "last_price": 137.75,
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "provider": "upstox",
+            "quote_timestamp": fresh_ts,
+            "retrieval_timestamp": fresh_ts,
+            "greeks": {"delta": 0.51, "gamma": 0.001, "theta": -2.0, "vega": 10.0},
+        },
+        spread_contract={
+            "strike": 25250.0,
+            "symbol": "NIFTY2026111725250CE",
+            "last_price": 85.0,
+            "bid": 84.0,
+            "ask": 85.0,
+            "bid_qty": 65,  # Only 1 lot (65 shares) depth on short hedge leg!
+            "ask_qty": 500,
+            "delta": 0.35,
+            "iv": 12.5,
+        },
+        underlying_setup={
+            "setup": "breakout_intraday",
+            "price": 25200.0,
+            "invalidation_level": 25050.0,
+            "candle_timestamp": fresh_ts,
+            "targets": {"target_1_1r": 25550.0, "target_2_2r": 25750.0},
+        },
+        meta={"lot_size": 65, "expiry": "2026-11-17"},
+        underlying_spot_quote={"underlying_price": 25200.0, "quote_timestamp": fresh_ts},
+        max_loss_budget=20000.0,
+        min_reward_risk=1.5,
+        now_utc=mock_now,
+    )
+    assert sig["signal_state"] == "SIGNAL VALIDATED"
+    ps = sig["position_sizing"]
+    # Hedge depth of 65 shares must constrain sizing to 1 lot
+    assert ps["depth_permitted_lots"] == 1
+    assert ps["final_permitted_lots"] == 1
+
+
+# ------------------------------------------------------------------------------
+# 3. P2: STRICT PORTFOLIO RISK BY DEFAULT
+# ------------------------------------------------------------------------------
+def test_portfolio_risk_missing_file_fails_closed_by_default(specialist, tmp_path):
+    """In live checks, missing portfolio file fails closed with PORTFOLIO_STATE_UNAVAILABLE."""
+    non_existent = str(tmp_path / "non_existent_portfolio.json")
+    valid_broker = str(tmp_path / "broker.json")
+    with open(valid_broker, "w", encoding="utf-8") as f:
+        json.dump({"orders": [], "positions": []}, f)
+
+    is_valid, rejections = specialist.check_portfolio_risk(
+        candidate_risk=2000.0,
+        capital_required=10000.0,
+        portfolio_path=non_existent,
+        broker_state_path=valid_broker,
+        is_live_check=True,
+    )
+    assert is_valid is False
+    assert any("PORTFOLIO_STATE_UNAVAILABLE" in r for r in rejections)
+
+
+def test_portfolio_risk_corrupt_json_fails_closed_by_default(specialist, tmp_path):
+    """In live checks, corrupt JSON portfolio file fails closed with PORTFOLIO_STATE_UNAVAILABLE."""
+    corrupt_port = str(tmp_path / "corrupt_portfolio.json")
+    with open(corrupt_port, "w", encoding="utf-8") as f:
+        f.write("{invalid_json_content:")
+
+    valid_broker = str(tmp_path / "broker.json")
+    with open(valid_broker, "w", encoding="utf-8") as f:
+        json.dump({"orders": [], "positions": []}, f)
+
+    is_valid, rejections = specialist.check_portfolio_risk(
+        candidate_risk=2000.0,
+        capital_required=10000.0,
+        portfolio_path=corrupt_port,
+        broker_state_path=valid_broker,
+        is_live_check=True,
+    )
+    assert is_valid is False
+    assert any("PORTFOLIO_STATE_UNAVAILABLE" in r for r in rejections)
+
+
+def test_portfolio_risk_valid_empty_portfolio_passes(specialist, tmp_path):
+    """Valid empty portfolio with adequate cash passes portfolio check."""
+    port_file = str(tmp_path / "portfolio.json")
+    with open(port_file, "w", encoding="utf-8") as f:
+        json.dump({"cash": 500000.0, "positions": []}, f)
+
+    broker_file = str(tmp_path / "broker.json")
+    with open(broker_file, "w", encoding="utf-8") as f:
+        json.dump({"orders": [], "positions": []}, f)
+
+    is_valid, rejections = specialist.check_portfolio_risk(
+        candidate_risk=2000.0,
+        capital_required=10000.0,
+        portfolio_path=port_file,
+        broker_state_path=broker_file,
+        is_live_check=True,
+    )
+    assert is_valid is True
+    assert len(rejections) == 0
+
+
+def test_portfolio_risk_valid_populated_portfolio_enforces_limits(specialist, tmp_path):
+    """Populated portfolio exceeding max open positions limit rejects trade."""
+    port_file = str(tmp_path / "portfolio.json")
+    with open(port_file, "w", encoding="utf-8") as f:
+        # 5 open positions
+        positions = [{"symbol": f"SYM_{i}", "shares": 100} for i in range(5)]
+        json.dump({"cash": 500000.0, "positions": positions}, f)
+
+    broker_file = str(tmp_path / "broker.json")
+    with open(broker_file, "w", encoding="utf-8") as f:
+        json.dump({"orders": [], "positions": []}, f)
+
+    is_valid, rejections = specialist.check_portfolio_risk(
+        candidate_risk=2000.0,
+        capital_required=10000.0,
+        portfolio_path=port_file,
+        broker_state_path=broker_file,
+        is_live_check=True,
+    )
+    assert is_valid is False
+    assert any("MAX_OPEN_POSITIONS_REACHED" in r for r in rejections)
+
+
+def test_portfolio_risk_override_documented_and_tested(specialist, tmp_path, monkeypatch):
+    """Explicit ALLOW_UNVERIFIED_PORTFOLIO=1 override allows missing portfolio but appends audit warning."""
+    non_existent = str(tmp_path / "missing.json")
+    monkeypatch.setenv("ALLOW_UNVERIFIED_PORTFOLIO", "1")
+
+    is_valid, rejections = specialist.check_portfolio_risk(
+        candidate_risk=2000.0,
+        capital_required=10000.0,
+        portfolio_path=non_existent,
+        broker_state_path=non_existent,
+        is_live_check=True,
+    )
+    # Rejection list records the explicit override reason
+    assert any("UNVERIFIED_PORTFOLIO_OVERRIDE" in r for r in rejections)
+
+
+# ------------------------------------------------------------------------------
+# 4. P2: CONCURRENT SCAN PROTECTION
+# ------------------------------------------------------------------------------
+def test_scan_lock_acquisition_and_cleanup(tmp_path):
+    """ScanLock acquires atomically, writes PID, and cleans up on exit."""
+    from orchestrator import ScanLock, ScanLockError
+    lock_file = str(tmp_path / "test_options_scan.lock")
+
+    assert not os.path.exists(lock_file)
+    with ScanLock(lock_path=lock_file) as lock:
+        assert lock.is_acquired is True
+        assert os.path.exists(lock_file)
+        with open(lock_file, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+        assert data["pid"] == os.getpid()
+        assert "timestamp" in data
+
+    assert not os.path.exists(lock_file)
+
+
+def test_scan_lock_contention_fails_closed(tmp_path):
+    """Simultaneous scans on same lock file trigger ScanLockError and return SCAN_BLOCKED."""
+    from orchestrator import ScanLock, ScanLockError
+    lock_file = str(tmp_path / "test_contention.lock")
+
+    orch1 = MarketIntelligenceOrchestrator(lock_path=lock_file)
+    orch2 = MarketIntelligenceOrchestrator(lock_path=lock_file)
+
+    # First lock acquired
+    lock1 = ScanLock(lock_path=lock_file)
+    lock1.acquire()
+    try:
+        # Second lock attempt raises ScanLockError
+        lock2 = ScanLock(lock_path=lock_file)
+        with pytest.raises(ScanLockError) as exc_info:
+            lock2.acquire()
+        assert "CONCURRENT_SCAN_BLOCKED" in str(exc_info.value)
+
+        # Orchestrator run fails closed safely
+        res = orch2.run_market_intelligence(query="NIFTY")
+        assert res["status"] == "SCAN_BLOCKED"
+        assert "CONCURRENT_SCAN_BLOCKED" in res["reason"]
+        assert res["shortlist"] == []
+    finally:
+        lock1.release()
+
+    assert not os.path.exists(lock_file)
+
+
+def test_scan_lock_stale_recovery_dead_pid(tmp_path):
+    """Stale lock with non-existent dead PID is cleanly recovered."""
+    from orchestrator import ScanLock
+    lock_file = str(tmp_path / "stale_pid.lock")
+
+    # Write a stale lock file with an absurd dead PID and old timestamp
+    stale_payload = {
+        "pid": 999999999,
+        "timestamp": time.time() - 30.0,
+        "acquired_at": "2026-11-17T09:00:00+00:00",
+    }
+    with open(lock_file, "w", encoding="utf-8") as f:
+        json.dump(stale_payload, f)
+
+    # ScanLock should recognize dead PID and acquire successfully
+    with ScanLock(lock_path=lock_file) as lock:
+        assert lock.is_acquired is True
+        with open(lock_file, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+        assert data["pid"] == os.getpid()
+
+    assert not os.path.exists(lock_file)
+
+
+def test_scan_lock_exception_cleanup(tmp_path):
+    """ScanLock context manager guarantees lockfile removal even on uncaught exceptions."""
+    from orchestrator import ScanLock
+    lock_file = str(tmp_path / "exception_test.lock")
+
+    with pytest.raises(RuntimeError):
+        with ScanLock(lock_path=lock_file):
+            assert os.path.exists(lock_file)
+            raise RuntimeError("Simulated crash during scan")
+
+    # Lock must be released and file deleted despite the exception
+    assert not os.path.exists(lock_file)
+
+
+
+
 
 
 

@@ -529,26 +529,36 @@ def normalize_feed_message(raw_message: Any) -> Dict[str, Any]:
 
         # Feed & Exchange Timestamps (Requirement 2 & 4: never treat receipt time as exchange time)
         curr_ts = decoded.get("currentTs")
+        feed_iso = None
         if curr_ts is not None:
             try:
                 flat["feed_timestamp"] = int(curr_ts)
-            except (ValueError, TypeError):
+                dt_feed = datetime.datetime.fromtimestamp(float(curr_ts) / 1000.0, tz=datetime.timezone.utc)
+                feed_iso = dt_feed.isoformat()
+                flat["feed_time"] = feed_iso
+            except (ValueError, TypeError, OSError, OverflowError):
                 pass
 
-        exch_epoch_ms = flat.get("ltt")
-        if exch_epoch_ms is None:
-            exch_epoch_ms = flat.get("feed_timestamp")
-
-        if exch_epoch_ms is not None:
+        ltt_val = flat.get("ltt")
+        if ltt_val is not None:
             try:
-                dt_exch = datetime.datetime.fromtimestamp(float(exch_epoch_ms) / 1000.0, tz=datetime.timezone.utc)
-                flat["exchange_timestamp"] = dt_exch.isoformat()
-                flat["quote_timestamp"] = dt_exch.isoformat()
+                dt_trade = datetime.datetime.fromtimestamp(float(ltt_val) / 1000.0, tz=datetime.timezone.utc)
+                flat["last_trade_time"] = dt_trade.isoformat()
+                flat["exchange_timestamp"] = dt_trade.isoformat()
             except (ValueError, OSError, OverflowError):
+                flat["last_trade_time"] = None
                 flat["exchange_timestamp"] = None
-                flat["quote_timestamp"] = None
         else:
-            flat["exchange_timestamp"] = None
+            flat["last_trade_time"] = None
+            flat["exchange_timestamp"] = feed_iso
+
+        # Quote / Depth timestamp: only when order book depth is actually present in this packet
+        has_depth_quotes = bool("bid" in flat and "ask" in flat and flat["bid"] is not None and flat["ask"] is not None)
+        if has_depth_quotes:
+            flat["depth_timestamp"] = feed_iso or flat.get("exchange_timestamp")
+            flat["quote_timestamp"] = flat["depth_timestamp"]
+        else:
+            flat["depth_timestamp"] = None
             flat["quote_timestamp"] = None
 
         feeds_out[ikey] = flat
@@ -1180,7 +1190,18 @@ class UpstoxMarketDataStreamer:
             self.stale_detected = False
         for ikey, flat in feeds.items():
             merged = dict(self.last_ticks.get(ikey) or {})
-            merged.update(flat)
+            has_depth = bool("bid" in flat and "ask" in flat and flat["bid"] is not None and flat["ask"] is not None)
+            if has_depth:
+                merged["bid"] = flat["bid"]
+                merged["ask"] = flat["ask"]
+                merged["bid_qty"] = flat.get("bid_qty")
+                merged["ask_qty"] = flat.get("ask_qty")
+                merged["depth"] = flat.get("depth")
+                merged["depth_timestamp"] = flat.get("depth_timestamp")
+                merged["quote_timestamp"] = flat.get("quote_timestamp")
+            for k in ("last_price", "prev_close", "ltq", "ltt", "last_trade_time", "exchange_timestamp", "volume", "oi", "iv", "atp", "greeks", "feed_timestamp", "feed_time"):
+                if flat.get(k) is not None:
+                    merged[k] = flat[k]
             merged["received_at"] = now_t
             try:
                 dt_recv = datetime.datetime.now(datetime.timezone.utc)
@@ -1303,6 +1324,7 @@ class UpstoxMarketDataStreamer:
         instrument_key: str,
         max_age_seconds: float = 30.0,
         now_dt: Optional[datetime.datetime] = None,
+        require_depth: bool = True,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Validate and return verified live WebSocket quote for an instrument key.
 
@@ -1313,7 +1335,7 @@ class UpstoxMarketDataStreamer:
         - Exchange timestamp is missing or unparsable
         - Exchange quote is stale (> max_age_seconds)
         - Exchange quote is in the future (> 5s)
-        - Bid or ask is invalid or zero
+        - Bid or ask is invalid or zero (when require_depth=True)
         - Market is crossed (bid >= ask)
         """
         if not self.is_connected:
@@ -1330,9 +1352,29 @@ class UpstoxMarketDataStreamer:
             return None, "MISSING_TICK_UPDATE"
 
         tick = dict(self.last_ticks[ikey])
-        raw_quote_ts = tick.get("quote_timestamp") or tick.get("exchange_timestamp")
-        if not raw_quote_ts:
-            return None, "MISSING_QUOTE_TIMESTAMP"
+        # Bid/Ask sanity checks first when depth is required
+        bid = tick.get("bid")
+        ask = tick.get("ask")
+        if require_depth:
+            if bid is None or ask is None:
+                return None, "MISSING_BID_ASK"
+            try:
+                b_val = float(bid)
+                a_val = float(ask)
+                if b_val <= 0.0 or a_val <= 0.0:
+                    return None, "INVALID_BID_ASK"
+                if b_val >= a_val:
+                    return None, "CROSSED_BID_ASK"
+            except (ValueError, TypeError):
+                return None, "INVALID_BID_ASK"
+
+            raw_quote_ts = tick.get("depth_timestamp") or tick.get("quote_timestamp")
+            if not raw_quote_ts:
+                return None, "MISSING_QUOTE_TIMESTAMP"
+        else:
+            raw_quote_ts = tick.get("exchange_timestamp") or tick.get("last_trade_time") or tick.get("feed_time") or tick.get("quote_timestamp")
+            if not raw_quote_ts:
+                return None, "MISSING_QUOTE_TIMESTAMP"
 
         # Freshness verification
         ref_dt = now_dt or datetime.datetime.now(datetime.timezone.utc)
@@ -1351,10 +1393,7 @@ class UpstoxMarketDataStreamer:
         except Exception:
             return None, "UNPARSABLE_QUOTE_TIMESTAMP"
 
-        # Bid/Ask sanity checks
-        bid = tick.get("bid")
-        ask = tick.get("ask")
-        if bid is not None and ask is not None:
+        if not require_depth and bid is not None and ask is not None:
             try:
                 b_val = float(bid)
                 a_val = float(ask)
@@ -1366,6 +1405,32 @@ class UpstoxMarketDataStreamer:
                 return None, "INVALID_BID_ASK"
 
         return tick, None
+
+    def wait_for_quotes(
+        self,
+        instrument_keys: List[str],
+        timeout: float = 2.0,
+        now_dt: Optional[datetime.datetime] = None,
+    ) -> int:
+        """Poll incoming frames until ticks for subscribed keys are received or timeout expires."""
+        if not self.is_connected or not instrument_keys:
+            return 0
+        target_keys = set(instrument_keys)
+        start = time.monotonic()
+        while (time.monotonic() - start) < timeout:
+            ev = self.poll_once(timeout=min(0.2, timeout))
+            valid = sum(
+                1 for k in target_keys
+                if k in self.last_ticks and self.last_ticks[k].get("bid") is not None
+            )
+            if valid >= len(target_keys):
+                return valid
+            if ev is None and not self.is_connected:
+                break
+        return sum(
+            1 for k in target_keys
+            if k in self.last_ticks and self.last_ticks[k].get("bid") is not None
+        )
 
     def apply_live_quotes(
         self,
@@ -1393,7 +1458,7 @@ class UpstoxMarketDataStreamer:
                 ikey = contract.get("instrument_key")
                 if not ikey:
                     continue
-                live_tick, err = self.get_live_quote(ikey, max_age_seconds=max_age_seconds, now_dt=now_dt)
+                live_tick, err = self.get_live_quote(ikey, max_age_seconds=max_age_seconds, now_dt=now_dt, require_depth=True)
                 if live_tick is not None and err is None:
                     # Update contract in-place with verified live feed data
                     if live_tick.get("last_price") is not None:
@@ -1412,7 +1477,9 @@ class UpstoxMarketDataStreamer:
                         contract["open_interest"] = float(live_tick["oi"])
                     contract["quote_timestamp"] = live_tick.get("quote_timestamp")
                     contract["exchange_timestamp"] = live_tick.get("exchange_timestamp")
-                    contract["retrieval_timestamp"] = live_tick.get("retrieval_timestamp")
+                    contract["retrieval_timestamp"] = (
+                        now_dt.isoformat() if now_dt is not None else live_tick.get("retrieval_timestamp")
+                    )
                     contract["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
                     contract["is_live"] = True
                     contract["tier"] = "REAL_TIME"
@@ -1440,6 +1507,7 @@ class UpstoxMarketDataStreamer:
                 self._active_connections_counter[0] = max(0, self._active_connections_counter[0] - 1)
             self._connection_counted = False
         self._connected = False
+        self.last_ticks.clear()
 
     def close(self) -> None:
         self._close_socket_only()
