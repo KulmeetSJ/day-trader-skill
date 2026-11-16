@@ -36,3 +36,4 @@ trader/
 *~
 
 .agents/
+.claude/
