@@ -442,5 +442,137 @@ class BankNiftyAuditTests(unittest.TestCase):
         self.assertIsNotNone(res_nf["trigger"])
 
 
+class BankNiftyMarketDataRemediationTests(unittest.TestCase):
+    """Targeted regression tests for BANKNIFTY market-data findings remediation."""
+
+    def setUp(self):
+        self.options_mod = _load.load("trader-options", "options")
+        self.orch_mod = _load.load("trader-options", "orchestrator")
+
+    def test_orchestrator_streamer_initialization_credential_contract(self):
+        """P1: Verify orchestrator checks provider credentials using _analytics_token / resolve_credentials."""
+        class MockUpstoxProvider:
+            def __init__(self, has_token=True):
+                self._analytics_token = "mock_analytics_token_123" if has_token else None
+                self._config = {}
+                self.streamer_created = False
+
+            def create_streamer(self):
+                self.streamer_created = True
+                mock_s = unittest.mock.MagicMock()
+                mock_s.is_connected = False
+                mock_s.active_keys.return_value = []
+                return mock_s
+
+            def resolve_credentials(self, config=None):
+                return self._analytics_token
+
+        # Case 1: Provider has credentials -> streamer is created and attached
+        mock_prov = MockUpstoxProvider(has_token=True)
+        with patch.object(self.orch_mod.data_in, "get_provider", return_value=mock_prov):
+            orch = self.orch_mod.MarketIntelligenceOrchestrator()
+            self.assertIsNotNone(orch.streamer)
+            self.assertIs(orch.specialist.streamer, orch.streamer)
+            self.assertTrue(mock_prov.streamer_created)
+
+        # Case 2: Provider missing credentials -> streamer remains None
+        mock_prov_no_creds = MockUpstoxProvider(has_token=False)
+        with patch.object(self.orch_mod.data_in, "get_provider", return_value=mock_prov_no_creds):
+            orch = self.orch_mod.MarketIntelligenceOrchestrator()
+            self.assertIsNone(orch.streamer)
+
+    def test_banknifty_futures_resolution_and_volume_vwap(self):
+        """P1: Verify near-month BANKNIFTY futures resolution and volume-based VWAP calculation."""
+        specialist = self.options_mod.OptionsIntelligenceSpecialist()
+        meta = specialist.resolve_near_month_future("BANKNIFTY")
+        self.assertIsNotNone(meta, "Near-month BANKNIFTY future must resolve")
+        self.assertTrue(str(meta.get("symbol", "")).startswith("BANKNIFTY"))
+        self.assertEqual(meta.get("lot_size"), 30)
+        self.assertIn("NSE_FO", meta.get("instrument_key", ""))
+
+        vwap, info, fut_chart = specialist.get_futures_vwap("BANKNIFTY", meta)
+        self.assertIsNotNone(vwap, "BANKNIFTY futures VWAP must be computed from volume")
+        self.assertGreater(vwap, 0)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("source"), "NEAR_MONTH_FUTURES_VOLUME")
+        self.assertGreater(info.get("futures_total_volume", 0), 0)
+        self.assertEqual(info.get("future_instrument_key"), meta["instrument_key"])
+
+    def test_missing_futures_fails_closed_for_vwap_and_continues_non_vwap(self):
+        """P1: If futures cannot be resolved, VWAP setups fail-closed while non-VWAP setups evaluate cleanly."""
+        specialist = self.options_mod.OptionsIntelligenceSpecialist()
+        mock_chart = {
+            "symbol": "BANKNIFTY",
+            "bars": [
+                {"t": 1794800700 + i * 300, "o": 61200.0, "h": 61250.0, "l": 61150.0, "c": 61220.0, "v": 0}
+                for i in range(10)
+            ],
+            "meta": {"symbol": "BANKNIFTY", "instrument_key": "NSE_INDEX|Nifty Bank"},
+            "is_live": False,
+            "data_tier": "DELAYED",
+        }
+
+        # Mock resolve_near_month_future returning None (unresolvable)
+        with patch.object(specialist, "resolve_near_month_future", return_value=None):
+            # Evaluate vwap_reclaim setup on spot index chart with zero volume
+            eval_res = entry.evaluate(mock_chart, _utc_from_ts(1794803700), setup="vwap_reclaim", market="IN")
+            # Must fail closed: is_valid_session_setup returns False because VWAP is unavailable
+            self.assertFalse(
+                specialist.is_valid_session_setup(eval_res, _utc_from_ts(1794803700)),
+                "Unresolvable futures must fail closed for VWAP setups",
+            )
+
+            # Evaluate non-VWAP setup (breakout_intraday)
+            brk_res = entry.evaluate(mock_chart, _utc_from_ts(1794803700), setup="breakout_intraday", market="IN")
+            # Should evaluate and not be blocked by missing VWAP indicator
+            self.assertNotIn("session VWAP unavailable", brk_res.get("reason", ""))
+
+    def test_risk_reporting_stop_risk_vs_maximum_loss_disclosure(self):
+        """P2: Verify stop-based risk and maximum theoretical capital loss are reported with non-guarantee disclosure."""
+        specialist = self.options_mod.OptionsIntelligenceSpecialist()
+        mock_open = datetime.datetime(2026, 11, 17, 5, 0, tzinfo=timezone.utc)
+        sig = specialist.generate_signal_contract(
+            underlying="BANKNIFTY",
+            direction="BULLISH",
+            strategy=self.options_mod.STRATEGY_BUY_CE,
+            option_type="CE",
+            strike=61400.0,
+            contract_data={
+                "symbol": "BANKNIFTY2026112361400CE",
+                "bid": 250.0,
+                "ask": 252.0,
+                "last_price": 251.0,
+                "tier": "REAL_TIME",
+                "is_live": True,
+                "provider": "upstox",
+                "quote_timestamp": "2026-11-17T10:29:45+05:30",
+                "retrieval_timestamp": "2026-11-17T10:29:50+05:30",
+                "greeks": {"delta": 0.52, "gamma": 0.0008, "theta": -15.0, "vega": 25.0},
+            },
+            underlying_setup={
+                "setup": "breakout_intraday",
+                "price": 61420.0,
+                "invalidation_level": 61300.0,
+                "candle_timestamp": "2026-11-17T10:25:00+05:30",
+                "targets": {"target_1_1r": 61660.0, "target_2_2r": 61900.0},
+            },
+            meta={"lot_size": 30, "expiry": "2026-11-23"},
+            max_loss_budget=5000.0,
+            min_reward_risk=2.0,
+            now_utc=mock_open,
+        )
+
+        ps = sig.get("position_sizing") or {}
+        # Sizing reports defined stop risk and maximum theoretical capital loss
+        self.assertIn("stop_loss_risk_inr", ps)
+        self.assertIn("maximum_theoretical_capital_loss_inr", ps)
+        self.assertGreater(ps["stop_loss_risk_inr"], 0)
+        self.assertGreater(ps["maximum_theoretical_capital_loss_inr"], ps["stop_loss_risk_inr"])
+        # Explicit non-guaranteed execution disclosure
+        self.assertFalse(ps.get("stop_execution_guaranteed"))
+        self.assertIn("Stop-loss order execution is NOT guaranteed", ps.get("stop_execution_disclosure", ""))
+        self.assertIn("DISCLOSURE", ps.get("stop_execution_disclosure", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

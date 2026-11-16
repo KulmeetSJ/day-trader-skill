@@ -1942,9 +1942,19 @@ class OptionsIntelligenceSpecialist:
                 "total_stop_loss_risk_inr": charges_info["net_loss_stop"] if lots > 0 else 0.0,
                 "maximum_possible_loss": margin_info["max_loss"],
                 "maximum_possible_loss_value": margin_info.get("max_loss_value"),
+                "maximum_theoretical_capital_loss_inr": margin_info.get("max_loss_value"),
+                "stop_loss_risk_inr": charges_info["net_loss_stop"] if lots > 0 else 0.0,
+                "stop_execution_guaranteed": False,
+                "stop_execution_disclosure": (
+                    "DISCLOSURE: Stop-loss order execution is NOT guaranteed. Orders are subject "
+                    "to market liquidity, opening price gaps, and execution slippage. In an adverse gap "
+                    "opening or fast market event, actual loss may exceed the stop risk and approach the "
+                    "maximum theoretical capital loss."
+                ),
                 "risk_budget_policy_explanation": (
                     f"Position sized for stop-loss risk (Rs {charges_info['net_loss_stop'] if lots > 0 else 0.0:,.2f} fits within Rs {budget:,.0f} budget). "
-                    f"Note: Maximum possible loss ({margin_info['max_loss']}) is substantially higher in adverse gap/worthless expiry scenarios."
+                    f"Note: Maximum possible loss ({margin_info['max_loss']}) is substantially higher in adverse gap/worthless expiry scenarios. "
+                    "Stop execution is NOT guaranteed; subject to gap risk and market liquidity."
                 ),
             },
             "legs": legs_data,
@@ -2008,6 +2018,14 @@ class OptionsIntelligenceSpecialist:
             or (comp_candle.get("bar_end", "").split("T")[0] if "T" in str(comp_candle.get("bar_end", "")) else None)
         )
 
+        # Fail-closed if setup relies on VWAP but VWAP is unavailable
+        s_name = setup_res.get("setup") or ""
+        if s_name in ("vwap_reclaim", "vwap_rejection"):
+            if setup_res.get("indicators", {}).get("vwap_unavailable"):
+                return False
+            if setup_res.get("reason") and "session VWAP unavailable" in str(setup_res.get("reason")):
+                return False
+
         is_market_open = calendar_in.is_market_hours_in(now_dt, exchange="NSE")
         if is_market_open:
             if setup_res.get("is_invalidated") or (setup_res.get("decision") or {}).get("is_invalidated"):
@@ -2020,6 +2038,160 @@ class OptionsIntelligenceSpecialist:
                 return False  # Previous session trigger rejected in open market
 
         return True
+
+    def resolve_near_month_future(
+        self,
+        symbol: str,
+        exchange: Optional[str] = None,
+        now: Optional[datetime.datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve the near-month futures contract for an index or F&O underlying.
+        Inspects provider derivatives master / instruments first, then local cache.
+        Returns dict with instrument_key, symbol, expiry, lot_size, or None if unresolvable.
+        """
+        canon = symbol.upper().strip()
+        ref_dt = now or datetime.datetime.now(datetime.timezone.utc)
+        today_str = ref_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
+        exch = exchange or ("BSE" if canon in ("SENSEX", "BANKEX") else "NSE")
+
+        # 1. Try active market data provider or direct UpstoxMarketDataProvider (public CDN)
+        # 1. Try active market data provider or Upstox public market data
+        try:
+            prov = None
+            if hasattr(self, "provider") and self.provider:
+                prov = self.provider
+            else:
+                try:
+                    prov = data_in.get_provider(name="upstox")
+                except Exception:
+                    prov = data_in.UpstoxMarketDataProvider(analytics_token="public_read")
+            if prov and hasattr(prov, "get_instruments"):
+                inst_doc = prov.get_instruments(exchange=exch)
+                recs = inst_doc.get("instruments") or []
+                futs = []
+                for r in recs:
+                    if not isinstance(r, dict):
+                        continue
+                    itype = str(r.get("instrument_type") or "").upper()
+                    if itype not in ("FUT", "FUTIDX", "FUTSTK"):
+                        continue
+                    u_sym = str(r.get("underlying_symbol") or r.get("name") or "").upper().strip()
+                    t_sym = str(r.get("trading_symbol") or r.get("symbol") or "").upper().strip()
+                    if u_sym == canon or t_sym.startswith(canon):
+                        exp = r.get("expiry")
+                        exp_str = None
+                        if isinstance(exp, (int, float)) and exp > 1e11:
+                            exp_dt = datetime.datetime.fromtimestamp(exp / 1000.0, tz=datetime.timezone.utc)
+                            exp_str = exp_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
+                        elif exp:
+                            exp_str = str(exp)[:10]
+                        if exp_str and exp_str >= today_str:
+                            futs.append({
+                                "instrument_key": r.get("instrument_key"),
+                                "symbol": t_sym,
+                                "expiry": exp_str,
+                                "lot_size": r.get("lot_size"),
+                                "raw_expiry": exp,
+                            })
+                if futs:
+                    futs.sort(key=lambda x: x["expiry"])
+                    return futs[0]
+        except Exception:
+            pass
+
+        # 2. Try instruments.resolve_underlying_derivatives_meta
+        try:
+            meta = instruments.resolve_underlying_derivatives_meta(canon, exchange=exch)
+            if meta and meta.get("expiry"):
+                exp_date = str(meta.get("expiry"))[:10]
+                if exp_date >= today_str:
+                    fut_key = meta.get("future_instrument_key") or meta.get("futures_key")
+                    if not fut_key:
+                        try:
+                            c = instruments.load_instrument_cache(max_age_days=30)
+                            by_exch = c.get("instruments_by_exchange", {}).get(exch, {})
+                            for k, r in by_exch.items():
+                                if str(r.get("instrument_type") or "").upper() in ("FUT", "FUTIDX") and str(r.get("underlying") or "").upper() == canon:
+                                    if str(r.get("expiry"))[:10] == exp_date:
+                                        fut_key = r.get("instrument_key") or k
+                                        break
+                        except Exception:
+                            fut_key = None
+                    if fut_key:
+                        return {
+                            "instrument_key": fut_key,
+                            "symbol": f"{canon}_{exp_date}_FUT",
+                            "expiry": exp_date,
+                            "lot_size": meta.get("lot_size"),
+                        }
+        except Exception:
+            pass
+
+        return None
+
+    def get_futures_vwap(
+        self,
+        symbol: str,
+        future_meta: Dict[str, Any],
+        now: Optional[datetime.datetime] = None,
+    ) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Retrieve intraday bars for the near-month futures contract and compute volume-based VWAP.
+        Returns (futures_vwap, vwap_info_dict, futures_chart_dict) or (None, None, None).
+        Never fabricates volume or VWAP if bars or volume are missing.
+        """
+        fut_key = future_meta.get("instrument_key")
+        if not fut_key:
+            return None, None, None
+
+        try:
+            prov = None
+            if hasattr(self, "provider") and self.provider:
+                prov = self.provider
+            else:
+                try:
+                    prov = data_in.get_provider(name="upstox")
+                except Exception:
+                    prov = data_in.UpstoxMarketDataProvider(analytics_token="public_read")
+            bars_doc = prov.get_intraday_bars(fut_key, interval="5m", now=now)
+            bars = (bars_doc or {}).get("bars") or []
+            if not bars:
+                return None, None, None
+
+            # Verify genuine non-zero volume across bars
+            total_vol = sum(float(b.get("v") or 0) for b in bars)
+            if total_vol <= 0:
+                return None, None, None
+
+            import visuals
+            vwap_series = visuals.compute_vwap(bars) if visuals is not None else entry._vwap_series(bars)
+            if not vwap_series or vwap_series[-1] is None:
+                return None, None, None
+
+            fut_vwap = round(float(vwap_series[-1]), 2)
+            last_fut_bar = bars[-1]
+            fut_close = float(last_fut_bar["c"])
+
+            info = {
+                "future_instrument_key": fut_key,
+                "future_symbol": future_meta.get("symbol"),
+                "future_expiry": future_meta.get("expiry"),
+                "futures_vwap": fut_vwap,
+                "futures_last_price": fut_close,
+                "futures_total_volume": int(total_vol),
+                "source": "NEAR_MONTH_FUTURES_VOLUME",
+            }
+            fut_chart = {
+                "symbol": future_meta.get("symbol") or f"{symbol}_FUT",
+                "bars": bars,
+                "meta": {"instrument_key": fut_key, "underlying": symbol},
+                "data_tier": bars_doc.get("data_tier", "REAL_TIME"),
+                "is_live": bars_doc.get("is_live", True),
+            }
+            return fut_vwap, info, fut_chart
+        except Exception:
+            return None, None, None
 
     def analyze_symbol_for_options(
         self,
@@ -2096,6 +2268,15 @@ class OptionsIntelligenceSpecialist:
                 "signals": [],
             }
 
+        # Resolve underlying key for websocket subscription and spot verification
+        u_key = getattr(chain, "underlying_key", None)
+        if not u_key and symbol:
+            try:
+                meta_info = instruments.INDEX_INSTRUMENTS.get(symbol.upper(), {})
+                u_key = meta_info.get("upstox_key")
+            except Exception:
+                u_key = None
+
         # 2b. Integrate verified live WebSocket quotes if streamer is active
         ws_live_summary = None
         if self.streamer is not None:
@@ -2108,17 +2289,38 @@ class OptionsIntelligenceSpecialist:
                                 c_info = legs.get(l_side)
                                 if isinstance(c_info, dict) and c_info.get("instrument_key"):
                                     opt_keys.append(c_info["instrument_key"])
-                    if opt_keys:
-                        unsub = [k for k in opt_keys if k not in self.streamer.active_keys()]
+                    all_sub_keys = list(opt_keys)
+                    if u_key and u_key not in all_sub_keys:
+                        all_sub_keys.append(u_key)
+                    if all_sub_keys:
+                        unsub = [k for k in all_sub_keys if k not in self.streamer.active_keys()]
                         if unsub:
                             self.streamer.subscribe(unsub, mode="full")
                         if hasattr(self.streamer, "wait_for_quotes"):
-                            self.streamer.wait_for_quotes(opt_keys, timeout=2.0, now_dt=now)
+                            self.streamer.wait_for_quotes(all_sub_keys, timeout=2.0, now_dt=now)
                         ws_live_summary = self.streamer.apply_live_quotes(chain, max_age_seconds=30.0, now_dt=now)
                 except Exception as ws_err:
                     ws_live_summary = {"error": str(ws_err)}
 
-        # 3. Evaluate Real Technical Setups on Chart Bars
+        # Session status determination
+        is_market_open = calendar_in.is_market_hours_in(now, exchange="NSE")
+        chart_is_live = bool(chart.get("is_live", False)) and (str(chart.get("data_tier", "")).upper() == "REAL_TIME")
+        session_status = "MARKET_OPEN (LIVE SESSION)" if (is_market_open and chart_is_live) else "MARKET_CLOSED (POST-MARKET REVIEW)"
+
+        # 3. Evaluate Real Technical Setups on Chart Bars with Index Futures VWAP Support
+        is_index_sym = symbol.upper() in instruments.INDEX_INSTRUMENTS or all(
+            float(b.get("v") or 0) <= 0 for b in chart.get("bars", [])
+        )
+        fut_meta = None
+        fut_vwap = None
+        fut_vwap_info = None
+        fut_chart = None
+
+        if is_index_sym:
+            fut_meta = self.resolve_near_month_future(symbol, now=now)
+            if fut_meta:
+                fut_vwap, fut_vwap_info, fut_chart = self.get_futures_vwap(symbol, fut_meta, now=now)
+
         bull_setups = ["vwap_reclaim", "breakout_intraday", "orb"]
         bear_setups = ["vwap_rejection", "breakdown_intraday", "orb_breakdown"]
 
@@ -2135,23 +2337,53 @@ class OptionsIntelligenceSpecialist:
                     found_bear_setup = underlying_setup
 
         if not found_bull_setup and not found_bear_setup:
+            valid_bulls = []
             for s_name in bull_setups:
                 try:
+                    if s_name in ("vwap_reclaim", "vwap_rejection") and is_index_sym and fut_vwap is None:
+                        # Futures contract or volume unavailable; skip VWAP setups
+                        continue
                     res_b = entry.evaluate(chart, now, setup=s_name, market="IN")
+                    if is_index_sym and fut_vwap is not None and s_name in ("vwap_reclaim", "vwap_rejection"):
+                        res_b = dict(res_b)
+                        inds = dict(res_b.get("indicators") or {})
+                        inds["vwap"] = fut_vwap
+                        inds["vwap_unavailable"] = False
+                        res_b["indicators"] = inds
+                        res_b["futures_vwap_info"] = fut_vwap_info
+                        if res_b.get("reason") and "session VWAP unavailable" in str(res_b.get("reason")):
+                            res_b["reason"] = f"evaluated with near-month futures session VWAP ({fut_vwap:.2f})"
                     if self.is_valid_session_setup(res_b, now):
-                        found_bull_setup = res_b
-                        break
+                        valid_bulls.append(res_b)
                 except Exception:
                     continue
+            if valid_bulls:
+                valid_bulls.sort(key=lambda x: 0 if x.get("status") == "triggered" else 1)
+                found_bull_setup = valid_bulls[0]
 
+            valid_bears = []
             for s_name in bear_setups:
                 try:
+                    if s_name in ("vwap_reclaim", "vwap_rejection") and is_index_sym and fut_vwap is None:
+                        # Futures contract or volume unavailable; skip VWAP setups
+                        continue
                     res_bear = entry.evaluate(chart, now, setup=s_name, market="IN")
+                    if is_index_sym and fut_vwap is not None and s_name in ("vwap_reclaim", "vwap_rejection"):
+                        res_bear = dict(res_bear)
+                        inds = dict(res_bear.get("indicators") or {})
+                        inds["vwap"] = fut_vwap
+                        inds["vwap_unavailable"] = False
+                        res_bear["indicators"] = inds
+                        res_bear["futures_vwap_info"] = fut_vwap_info
+                        if res_bear.get("reason") and "session VWAP unavailable" in str(res_bear.get("reason")):
+                            res_bear["reason"] = f"evaluated with near-month futures session VWAP ({fut_vwap:.2f})"
                     if self.is_valid_session_setup(res_bear, now):
-                        found_bear_setup = res_bear
-                        break
+                        valid_bears.append(res_bear)
                 except Exception:
                     continue
+            if valid_bears:
+                valid_bears.sort(key=lambda x: 0 if x.get("status") == "triggered" else 1)
+                found_bear_setup = valid_bears[0]
 
         # If neither bullish nor bearish setups qualify on real chart
         if not found_bull_setup and not found_bear_setup:
@@ -2160,6 +2392,7 @@ class OptionsIntelligenceSpecialist:
                 "status": "NO_TRADE",
                 "reason": "NO_QUALIFIED_INTRADAY_SETUP: Real chart price action does not meet strategy rules",
                 "signals": [],
+                "session_status": session_status,
             }
 
         signals = []
@@ -2409,7 +2642,11 @@ class OptionsIntelligenceSpecialist:
             }
 
         is_market_open = calendar_in.is_market_hours_in(now, exchange="NSE")
-        session_status = "MARKET_OPEN (LIVE SESSION)" if is_market_open else "MARKET_CLOSED (POST-MARKET REVIEW)"
+        chart_is_live = bool(chart.get("is_live", False)) and (str(chart.get("data_tier", "")).upper() == "REAL_TIME")
+        if not is_market_open or not chart_is_live:
+            session_status = "MARKET_CLOSED (POST-MARKET REVIEW)"
+        else:
+            session_status = "MARKET_OPEN (LIVE SESSION)"
 
         return {
             "symbol": symbol,
@@ -2537,14 +2774,20 @@ def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
         print(f"Stop Loss: Rs {sig['stop_loss']:.2f} | Target 1: Rs {sig['target_1']:.2f} | Target 2: Rs {sig['target_2']:.2f}")
         print(f"Net R:R: {sig['expected_risk_reward_after_charges']}:1 (Net of STT, NSE txn, SEBI, Stamp Duty, GST, Brokerage)")
 
-        # 4. Margin transparency
+        # 4. Risk reporting (Stop-loss risk vs Maximum theoretical capital loss)
+        ps_info = sig.get("position_sizing") or {}
+        print(f"Defined Stop-Loss Risk: Rs {ps_info.get('total_stop_loss_risk_inr', 0):,.2f} (Rs {ps_info.get('net_risk_per_lot_inr', 0):,.2f}/lot incl. charges; Budget: Rs {ps_info.get('budget_max_loss_inr', 0):,.2f})")
+        print(f"Maximum Theoretical Capital Loss: {sig['maximum_loss']}")
+        print("Execution Warning: Stop-loss order execution is NOT guaranteed. Subject to market liquidity, slippage, and opening price gaps.")
+
+        # 5. Margin transparency
         print(f"Capital / Margin Required: Rs {sig['capital_margin_requirement']:,.2f} [{margin.get('margin_type', 'HEURISTIC_MARGIN_ESTIMATE')}]")
         print(f"Margin Model: {margin.get('formula')} -> {margin.get('assumptions')}")
         print(f"Broker Margin Disclaimer: {margin.get('broker_margin_disclaimer')}")
         print(f"Max Loss: {sig['maximum_loss']}")
         print(f"Tail Risk: {margin.get('tail_risk')}")
 
-        # 5. Data provenance
+        # 6. Data provenance
         print(f"Data Provenance: Provider: {prov.get('data_provider')}, Tier: {prov.get('data_tier')}, Session: {prov.get('market_session_status')}, Freshness: {prov.get('freshness_validation_result')}")
         print(f"Timestamps: Quote: {prov.get('exchange_quote_timestamp')} (Age: {prov.get('quote_age_seconds')}s), Candle: {prov.get('underlying_candle_timestamp')} (Age: {prov.get('candle_age_seconds')}s), Retrieval: {prov.get('retrieval_timestamp')} (Age: {prov.get('retrieval_age_seconds')}s)")
 

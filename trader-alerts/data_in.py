@@ -3561,7 +3561,14 @@ class UpstoxMarketDataProvider(MarketDataProvider):
     def get_instruments(self, exchange="NSE", symbol=None, force_refresh=False):
         exch_req = str(exchange or "NSE").strip().upper()
         norm_exch = _normalize_exchange(exch_req)
-        url_key = "complete" if exch_req in ("ALL", "COMPLETE") else norm_exch
+        if norm_exch in ("NSE_FO", "NFO"):
+            url_key = "NSE"
+        elif norm_exch in ("BSE_FO", "BFO"):
+            url_key = "BSE"
+        elif exch_req in ("ALL", "COMPLETE"):
+            url_key = "complete"
+        else:
+            url_key = norm_exch
 
         records = None if force_refresh else self._instruments_by_exch.get(url_key)
         if records is None:

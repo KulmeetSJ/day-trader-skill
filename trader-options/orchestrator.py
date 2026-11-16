@@ -188,7 +188,7 @@ def get_fo_scan_universe(include_stocks: bool = True) -> List[str]:
     if not include_stocks:
         return core_indices
     try:
-        c = instruments.load_instrument_cache()
+        c = instruments.load_instrument_cache(max_age_days=7)
         dm = c.get("derivatives_meta", {})
         fo_syms = []
         for k in dm.keys():
@@ -223,9 +223,14 @@ class MarketIntelligenceOrchestrator:
         else:
             if streamer is None:
                 try:
-                    prov = data_in.get_market_data_provider("upstox")
-                    if prov and hasattr(prov, "create_streamer") and getattr(prov, "has_credentials", False):
-                        streamer = prov.create_streamer()
+                    prov = data_in.get_provider(name="upstox")
+                    if prov and hasattr(prov, "create_streamer") and callable(getattr(prov, "create_streamer", None)):
+                        has_creds = bool(getattr(prov, "_analytics_token", None)) or (
+                            hasattr(prov, "resolve_credentials")
+                            and bool(prov.resolve_credentials(config=getattr(prov, "_config", None)))
+                        ) or getattr(prov, "has_credentials", False)
+                        if has_creds:
+                            streamer = prov.create_streamer()
                 except Exception:
                     streamer = None
             self.specialist = OptionsIntelligenceSpecialist(streamer=streamer)
@@ -355,10 +360,10 @@ class MarketIntelligenceOrchestrator:
         if self.streamer is not None and not getattr(self.streamer, "is_connected", False):
             try:
                 self.streamer.connect()
-                if getattr(self.specialist, "streamer", None) is None:
-                    self.specialist.streamer = self.streamer
             except Exception:
                 pass
+        if self.streamer is not None and getattr(self.specialist, "streamer", None) is None:
+            self.specialist.streamer = self.streamer
 
         # 2. Determine target universe dynamically (DEF-03)
         if sym:
