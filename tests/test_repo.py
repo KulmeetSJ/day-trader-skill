@@ -80,7 +80,10 @@ class Repo(unittest.TestCase):
             self.assertTrue(os.path.isdir(dist_path), "dist at root must be a directory")
         root = sorted(
             d for d in os.listdir(ROOT)
-            if not d.startswith((".git", ".pytest")) and d not in (".agents", ".env", ".DS_Store", "agents", "dist", "trader", ".vscode", "pyrightconfig.json")
+            if not d.startswith((".git", ".pytest")) and d not in (
+                ".agents", ".env", ".DS_Store", "agents", "dist", "trader", ".vscode", "pyrightconfig.json",
+                ".claude", "CLAUDE.md",
+            )
         )
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "config", "guides", "tests"] + SKILLS))
 

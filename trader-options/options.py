@@ -63,9 +63,31 @@ STRATEGY_IRON_CONDOR = "IRON_CONDOR"
 # Statutory Indian Charge Defaults & Risk Policy
 DEFAULT_MAX_LOSS_INR = 2000.0
 DEFAULT_MIN_REWARD_RISK = 2.0
-DEFAULT_SPREAD_TOLERANCE_PCT = 6.0  # max 6% bid-ask spread
+# Stage 2 tightening: guides/OPTIONS_RISK_SPEC.md documents a stricter bar (OI >= 50,000, spread
+# <= 1.0%) than was previously enforced here (no OI floor at all, 6% spread). These defaults are a
+# deliberate interim tightening -- materially stricter than before without being calibrated
+# against real NIFTY chain OI/spread distributions -- and are overridable via
+# config["options_max_spread_pct"] / config["options_min_open_interest"]. Revisit against real
+# chain data before relying on either the old or the fully doc-matching (50,000 / 1.0%) bar.
+DEFAULT_SPREAD_TOLERANCE_PCT = 2.0  # max 2% bid-ask spread (was 6.0%; doc target is 1.0%)
 DEFAULT_MIN_VOLUME = 500
+DEFAULT_MIN_OPEN_INTEREST = 20000  # new floor (was none); doc target is 50,000
 TRADING_HOURS_PER_DAY = 6.25
+
+# Theta unit contract: every theta value consumed by model_premium_levels() MUST be expressed as
+# decay PER CALENDAR DAY (a 24-hour day), not per trading session.
+#   - trader-alerts/data_in.py black_scholes() theta is DERIVED on a /365.0 calendar-day basis
+#     (verified by direct inspection of its formula) -- this is a CONFIRMED calendar-day figure.
+#   - Upstox-sourced theta (data_in.py UpstoxMarketDataProvider.get_option_chain) is passed through
+#     verbatim from the broker's option_greeks.theta field. Upstox's public API documentation does
+#     not state a time unit for theta (checked Nov 2026). It is ASSUMED to follow the same
+#     industry-standard per-calendar-day convention used by Black-Scholes and virtually all retail
+#     options platforms (NSE option chain, Sensibull, Upstox's own UI) -- but this is a documented
+#     ASSUMPTION, not a verified guarantee. See data_in.py's `theta_unit` field on each Greeks
+#     payload for the per-source verification status.
+# Using the 24-hour calendar-day basis here (instead of TRADING_HOURS_PER_DAY) is what makes the
+# conversion from "hours held" to "fraction of theta's own time unit" dimensionally consistent.
+THETA_TIME_BASIS_HOURS = 24.0
 
 # DEF-01: Configurable Freshness Thresholds (seconds)
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 120.0       # 2 minutes for option quote
@@ -193,10 +215,24 @@ class OptionsIntelligenceSpecialist:
     def validate_liquidity(
         self,
         contract: Dict[str, Any],
-        max_spread_pct: float = DEFAULT_SPREAD_TOLERANCE_PCT,
-        min_volume: int = DEFAULT_MIN_VOLUME,
+        max_spread_pct: Optional[float] = None,
+        min_volume: Optional[int] = None,
+        min_open_interest: Optional[int] = None,
     ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-        """Validate option liquidity, bid/ask presence, and spread tightness."""
+        """Validate option liquidity, bid/ask presence, open interest, and spread tightness.
+
+        Thresholds default to config overrides (`options_max_spread_pct`,
+        `options_min_volume`, `options_min_open_interest`) when not passed explicitly, falling
+        back to the module DEFAULT_* constants. See those constants' comments for the gap against
+        guides/OPTIONS_RISK_SPEC.md's documented (stricter) bar.
+        """
+        if max_spread_pct is None:
+            max_spread_pct = float(self.config.get("options_max_spread_pct", DEFAULT_SPREAD_TOLERANCE_PCT))
+        if min_volume is None:
+            min_volume = int(self.config.get("options_min_volume", DEFAULT_MIN_VOLUME))
+        if min_open_interest is None:
+            min_open_interest = int(self.config.get("options_min_open_interest", DEFAULT_MIN_OPEN_INTEREST))
+
         if not contract:
             return False, "Contract missing or null", {}
 
@@ -239,6 +275,10 @@ class OptionsIntelligenceSpecialist:
         if min_volume > 0 and vol < min_volume:
             return False, f"Contract volume ({vol}) below liquidity threshold ({min_volume})", metrics
 
+        # 4. Minimum open interest check (previously absent entirely -- see DEFAULT_MIN_OPEN_INTEREST)
+        if min_open_interest > 0 and oi < min_open_interest:
+            return False, f"Open interest ({oi}) below liquidity threshold ({min_open_interest})", metrics
+
         return True, None, metrics
 
     def model_premium_levels(
@@ -269,6 +309,11 @@ class OptionsIntelligenceSpecialist:
         - Vega: Volatility shift sensitivity (conservative zero-benefit assumption at stop)
         - Slippage: 1 tick on entry and exit
 
+        Theta unit contract: `theta` MUST be supplied as decay per CALENDAR day (see
+        THETA_TIME_BASIS_HOURS above for the verification status of each data source). The
+        holding-period fraction is computed against a 24-hour calendar day, not a 6.25-hour
+        trading session, to stay dimensionally consistent with that convention.
+
         Zero Fabrication Policy: If the Taylor expansion or inputs yield non-viable premium levels
         (e.g. stop above entry for buyer or target below entry for buyer), this function returns None
         (OPTION RISK UNAVAILABLE). It never silently falls back to arbitrary percentages.
@@ -292,8 +337,12 @@ class OptionsIntelligenceSpecialist:
             except Exception:
                 pass
 
-        # Theta decay over expected intraday holding window
-        time_fraction = eff_holding_hours / TRADING_HOURS_PER_DAY
+        # Theta decay over expected intraday holding window.
+        # theta is a PER-CALENDAR-DAY figure (see THETA_TIME_BASIS_HOURS docstring above), so the
+        # holding period must be expressed as a fraction of a 24-hour calendar day -- not a 6.25
+        # hour trading session -- or the decay applied here is overstated by a ~3.8x factor
+        # relative to what the theta value actually represents.
+        time_fraction = eff_holding_hours / THETA_TIME_BASIS_HOURS
         theta_decay = abs(theta) * time_fraction
 
         # Conservative IV impact: No assumed IV expansion to cushion buyer's stop
@@ -361,7 +410,31 @@ class OptionsIntelligenceSpecialist:
         primary_delta: Optional[float] = None,
         spread_delta: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Compute full statutory Indian charges, net PnL, and true Net Risk-to-Reward ratio across T1 and T2 targets."""
+        """Compute full statutory Indian charges, net PnL, and true Net Risk-to-Reward ratio across T1 and T2 targets.
+
+        Zero Fabrication Policy: if `stop_prem` or `t1_prem` is None (the premium model could not
+        produce a viable level), this returns an explicit MODEL_UNAVAILABLE result with every
+        numeric field set to None. It never substitutes 0.0 or any other sentinel number for a
+        missing premium -- callers must check `model_unavailable` (or the None fields) before
+        using this result for risk sizing or R:R display.
+        """
+        if stop_prem is None or t1_prem is None:
+            return {
+                "model_unavailable": True,
+                "statutory_charges_target": None,
+                "statutory_charges_target_2": None,
+                "statutory_charges_stop": None,
+                "charges_breakdown": None,
+                "gross_profit_t1": None,
+                "net_profit_t1": None,
+                "gross_profit_t2": None,
+                "net_profit_t2": None,
+                "gross_loss_stop": None,
+                "net_loss_stop": None,
+                "net_reward_risk": None,
+                "net_reward_risk_t1": None,
+                "net_reward_risk_t2": None,
+            }
         is_seller = strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE)
         is_spread = (
             strategy in (
@@ -1346,14 +1419,22 @@ class OptionsIntelligenceSpecialist:
             evaluation_time=now_dt,
         )
 
-        if not prem_levels:
+        premium_model_unavailable = not prem_levels
+        if premium_model_unavailable:
             rejection_reasons.append("OPTION_RISK_UNAVAILABLE: Delta/Gamma model produced non-viable stop or target premiums")
-            # Create dummy container for structure consistency
+            rejection_reasons.append(
+                "MODEL_UNAVAILABLE: Net R:R, stop-loss, and target premiums cannot be modeled (N/A) for this candidate"
+            )
+            # Zero Fabrication Policy: an unavailable premium model must never be represented
+            # by 0.0 (a concrete, misleading number). Only entry_premium (the observed quote,
+            # independent of the Delta/Gamma projection) remains populated; stop/target are
+            # explicit None sentinels that every downstream consumer must treat as "unavailable",
+            # never as "zero risk" or "zero reward".
             prem_levels = {
                 "entry_premium": round_tick(reconciled_entry, 0.05),
-                "stop_loss_premium": 0.0,
-                "target_1_premium": 0.0,
-                "target_2_premium": 0.0,
+                "stop_loss_premium": None,
+                "target_1_premium": None,
+                "target_2_premium": None,
             }
 
         execution_recon["execution_price"] = prem_levels["entry_premium"]
@@ -1459,6 +1540,9 @@ class OptionsIntelligenceSpecialist:
                 net_credit = max(0.05, round_tick(reconciled_entry - hedge_entry, 0.05))
                 risk_per_share = max(0.0, width - net_credit)
                 risk_per_lot = round(risk_per_share * lot_size, 2)
+        elif prem_levels["stop_loss_premium"] is None:
+            # Premium model unavailable: there is no validated stop to size risk from.
+            risk_per_lot = None
         else:
             prem_risk_per_share = abs(prem_levels["entry_premium"] - prem_levels["stop_loss_premium"])
             risk_per_lot = round(prem_risk_per_share * lot_size, 2)
@@ -1506,11 +1590,23 @@ class OptionsIntelligenceSpecialist:
         if eff_daily_limit:
             effective_budget = min(effective_budget, float(eff_daily_limit))
 
-        theoretical_lots = int(effective_budget // net_risk_1_lot) if net_risk_1_lot > 0 else 0
+        theoretical_lots = int(effective_budget // net_risk_1_lot) if (net_risk_1_lot is not None and net_risk_1_lot > 0) else 0
 
         # Tier 2: Risk Budget Permitted Lots
-        spread_max_loss_1_lot = round((net_debit * lot_size) + charges_1_lot.get("statutory_charges_stop", 0.0), 2) if is_spread else net_risk_1_lot
-        if risk_per_lot <= 0.0 or net_risk_1_lot <= 0.0:
+        unavailable_sizing = premium_model_unavailable or risk_per_lot is None or net_risk_1_lot is None
+        spread_max_loss_1_lot = (
+            None
+            if unavailable_sizing
+            else (round((net_debit * lot_size) + charges_1_lot.get("statutory_charges_stop", 0.0), 2) if is_spread else net_risk_1_lot)
+        )
+        if unavailable_sizing:
+            # The premium model could not produce a validated stop/target, so no risk-per-lot or
+            # net-loss-at-stop figure exists to size against. Fail closed: zero lots, and do not
+            # misclassify this as a computed "zero or negative risk" or "RR below minimum" --
+            # the OPTION_RISK_UNAVAILABLE / MODEL_UNAVAILABLE reasons already recorded are the
+            # precise, non-fabricated cause.
+            risk_budget_permitted_lots = 0
+        elif risk_per_lot <= 0.0 or net_risk_1_lot <= 0.0:
             risk_budget_permitted_lots = 0
             rejection_reasons.append("ZERO_OR_NEGATIVE_RISK: Trade risk per lot is zero or negative")
         elif (spread_max_loss_1_lot if is_spread else net_risk_1_lot) > budget:
@@ -1598,10 +1694,17 @@ class OptionsIntelligenceSpecialist:
                 depth_permitted_lots = int(avail_depth // lot_size)
 
         # Tier 4: Final Permitted Lots
-        # Sizing is constrained by the most restrictive tier: Risk Budget, Capital Limit, and Order Book Depth
+        # Sizing is constrained by the most restrictive tier: Risk Budget, Capital Limit, Order
+        # Book Depth, and the configured max_option_lots policy cap.
+        max_option_lots_cfg = self.config.get("max_option_lots")
         limits = [risk_budget_permitted_lots, capital_permitted_lots]
         if depth_permitted_lots is not None:
             limits.append(depth_permitted_lots)
+        if max_option_lots_cfg is not None:
+            try:
+                limits.append(int(max_option_lots_cfg))
+            except (TypeError, ValueError):
+                pass
         final_permitted_lots = min(limits)
         lots = final_permitted_lots
         qty = lots * lot_size if lots > 0 else lot_size  # reference size for quote/charge calculations
@@ -1625,10 +1728,13 @@ class OptionsIntelligenceSpecialist:
         )
 
         net_rr = charges_info["net_reward_risk"]
-        if net_rr < min_rr:
+        if net_rr is not None and net_rr < min_rr:
             rejection_reasons.append(
                 f"RR_BELOW_MINIMUM: Net R:R ({net_rr}:1) below configured minimum ({min_rr}:1)"
             )
+        # net_rr is None only when the premium model was unavailable (premium_model_unavailable);
+        # that case is already recorded via OPTION_RISK_UNAVAILABLE / MODEL_UNAVAILABLE above and
+        # must never be re-classified as a computed RR_BELOW_MINIMUM result.
 
         # Margin & Capital Check evaluated for final lots (or 1 lot if 0 for reference)
         margin_info = self.evaluate_margin_and_capital(
@@ -1647,6 +1753,18 @@ class OptionsIntelligenceSpecialist:
             )
 
         if strategy in (STRATEGY_SELL_CE, STRATEGY_SELL_PE):
+            # Structural, unconditional prohibition: naked (unhedged) single-leg option selling
+            # is never approvable, mirroring trader-risk/check.py's explicit rule ("options
+            # selling / naked short options are prohibited (undefined risk)"). This must NOT
+            # depend on margin_info_1_lot["is_authoritative"] -- that check below is a separate,
+            # additional reason and is kept for its own diagnostic value, but if it were ever
+            # satisfied (e.g. a future authoritative SPAN margin integration), this prohibition
+            # must still stand on its own so naked selling can never become approvable by accident.
+            rejection_reasons.append(
+                "NAKED_OPTION_PROHIBITED: Undefined/severe-tail-risk single-leg option selling "
+                "is structurally prohibited for decision-support signals; only defined-risk "
+                "hedged spread structures may ever be marked actionable"
+            )
             if not margin_info_1_lot.get("is_authoritative"):
                 rejection_reasons.append(
                     "AUTHORITATIVE_MARGIN_UNAVAILABLE: Exchange SPAN + Exposure margin data unavailable; "
@@ -1674,7 +1792,11 @@ class OptionsIntelligenceSpecialist:
         p_path = portfolio_path or self.portfolio_path or os.path.join(BASE_DIR, "trader", "portfolio.json")
         b_path = broker_state_path or self.broker_state_path or os.path.join(BASE_DIR, "trader", "state", "broker.json")
         port_ok, port_rejections = self.check_portfolio_risk(
-            candidate_risk=charges_info.get("net_loss_stop", 0.0),
+            # Unavailable premium model -> no stop-based risk figure exists; this candidate is
+            # already fail-closed via OPTION_RISK_UNAVAILABLE/MODEL_UNAVAILABLE above regardless
+            # of the portfolio check outcome, so contribute 0 (not a fabricated real number) to
+            # the aggregate daily/weekly exposure counter.
+            candidate_risk=charges_info.get("net_loss_stop") or 0.0,
             capital_required=margin_info.get("capital_required", 0.0),
             portfolio_path=p_path,
             broker_state_path=b_path,
@@ -1877,9 +1999,10 @@ class OptionsIntelligenceSpecialist:
             ),
         }
 
+        net_rr_display = f"{net_rr}:1" if net_rr is not None else "N/A (MODEL_UNAVAILABLE)"
         rationale = (
             f"Evaluated {strategy} on {underlying} ({strike} {option_type}, Delta: {delta:+.2f}, IV: {iv:.1f}%). "
-            f"Net R:R: {net_rr}:1. "
+            f"Net R:R: {net_rr_display}. "
             + (f"Approved ({signal_state})." if is_approved else f"REJECTED: {'; '.join(rejection_reasons)}.")
         )
 
@@ -1923,6 +2046,7 @@ class OptionsIntelligenceSpecialist:
             "capital_margin_requirement": margin_info["capital_required"],
             "margin_details": margin_info,
             "position_sizing": {
+                "sizing_state": "MODEL_UNAVAILABLE" if unavailable_sizing else "COMPUTED",
                 "lots": lots,
                 "lot_size": lot_size,
                 "total_quantity": lots * lot_size,
@@ -1963,7 +2087,12 @@ class OptionsIntelligenceSpecialist:
                 f"with minimum volume participation and option bid/ask spread <= {DEFAULT_SPREAD_TOLERANCE_PCT}%."
             ),
             "invalidation_conditions": (
-                f"Underlying crosses invalidation level {spot_stop} or option premium drops below {prem_levels['stop_loss_premium']}."
+                f"Underlying crosses invalidation level {spot_stop} or option premium drops below "
+                + (
+                    f"{prem_levels['stop_loss_premium']}."
+                    if prem_levels["stop_loss_premium"] is not None
+                    else "N/A (premium stop/target model unavailable -- see rejection_reasons)."
+                )
             ),
             "data_provider": contract_data.get("provider", "upstox"),
             "data_quality": {
@@ -2427,14 +2556,39 @@ class OptionsIntelligenceSpecialist:
             except Exception:
                 u_key = None
 
+        is_cash_index = bool(
+            symbol.upper() in instruments.INDEX_INSTRUMENTS
+            or (u_key and ("INDEX" in str(u_key).upper() or str(u_key).startswith("NSE_INDEX|")))
+        )
+
         if self.streamer is not None and u_key:
-            live_u_tick, _ = self.streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now)
-            if live_u_tick and live_u_tick.get("last_price"):
-                underlying_spot_quote = dict(live_u_tick)
-                underlying_spot_quote["price"] = float(live_u_tick["last_price"])
-                underlying_spot_quote["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
-                underlying_spot_quote["is_live"] = True
-                underlying_spot_quote["tier"] = "REAL_TIME"
+            require_depth = not is_cash_index
+            live_u_tick, _ = self.streamer.get_live_quote(
+                u_key,
+                max_age_seconds=DEFAULT_MAX_UNDERLYING_SPOT_AGE_SECONDS,
+                now_dt=now,
+                require_depth=require_depth,
+            )
+            if live_u_tick and live_u_tick.get("last_price") is not None:
+                try:
+                    px_val = float(live_u_tick["last_price"])
+                    if px_val > 0.0:
+                        underlying_spot_quote = dict(live_u_tick)
+                        underlying_spot_quote["price"] = px_val
+                        exch_ts = (
+                            live_u_tick.get("exchange_timestamp")
+                            or live_u_tick.get("last_trade_time")
+                            or live_u_tick.get("feed_time")
+                            or live_u_tick.get("quote_timestamp")
+                        )
+                        underlying_spot_quote["quote_timestamp"] = exch_ts
+                        underlying_spot_quote["exchange_timestamp"] = exch_ts
+                        underlying_spot_quote["quote_provenance"] = "UPSTOX_WEBSOCKET_V2_LIVE"
+                        underlying_spot_quote["is_live"] = True
+                        underlying_spot_quote["tier"] = "REAL_TIME"
+                        underlying_spot_quote["is_request_timestamp_only"] = False
+                except (ValueError, TypeError):
+                    underlying_spot_quote = None
 
         if underlying_spot_quote is None and getattr(chain, "underlying_price", None) is not None:
             chain_exch_ts = getattr(chain, "exchange_timestamp", None)
@@ -2453,7 +2607,10 @@ class OptionsIntelligenceSpecialist:
         if found_bull_setup:
             ce_strike = chain.select_strike("ATM", "CE") or atm_strike
             ce_contract = _enrich_contract(chain.get_contract(ce_strike, "CE"))
-            if ce_contract:
+            # buy_ce_enabled gates BUY_CE analysis only; ce_contract remains available below for
+            # the Bull Call Spread leg regardless of this flag (spreads are a separate, defined-
+            # risk structure and are not documented as controlled by this toggle).
+            if ce_contract and self.config.get("buy_ce_enabled", True):
                 liq_ok, _, _ = self.validate_liquidity(ce_contract)
                 if liq_ok:
                     sig_ce = self.generate_signal_contract(
@@ -2545,7 +2702,9 @@ class OptionsIntelligenceSpecialist:
         if found_bear_setup:
             pe_strike = chain.select_strike("ATM", "PE") or atm_strike
             pe_contract = _enrich_contract(chain.get_contract(pe_strike, "PE"))
-            if pe_contract:
+            # buy_pe_enabled gates BUY_PE analysis only; pe_contract remains available below for
+            # the Bear Put Spread leg regardless of this flag.
+            if pe_contract and self.config.get("buy_pe_enabled", True):
                 liq_ok, _, _ = self.validate_liquidity(pe_contract)
                 if liq_ok:
                     sig_pe = self.generate_signal_contract(
@@ -2771,12 +2930,21 @@ def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
         print(f"Execution Entry: Rs {sig['current_premium']:.2f} (Conservative {recon.get('baseline_quote_type')}: Rs {recon.get('baseline_quote_price'):.2f}, Slippage: {recon.get('slippage_applied', 0):+.2f} | Bid: Rs {recon.get('bid', 0):.2f}, Ask: Rs {recon.get('ask', 0):.2f}, Spread: {recon.get('spread_pct', 0)}%)")
 
         # 3. Dynamic exits & net R:R
-        print(f"Stop Loss: Rs {sig['stop_loss']:.2f} | Target 1: Rs {sig['target_1']:.2f} | Target 2: Rs {sig['target_2']:.2f}")
-        print(f"Net R:R: {sig['expected_risk_reward_after_charges']}:1 (Net of STT, NSE txn, SEBI, Stamp Duty, GST, Brokerage)")
+        # Zero Fabrication Policy: a premium level that the Delta/Gamma model could not validate
+        # is None (MODEL_UNAVAILABLE), never a printed 0.0 -- render it explicitly as N/A.
+        def _prem_or_na(v):
+            return f"Rs {v:.2f}" if v is not None else "N/A"
+
+        rr_val = sig.get("expected_risk_reward_after_charges")
+        rr_or_na = f"{rr_val}:1" if rr_val is not None else "N/A (MODEL_UNAVAILABLE)"
+        print(f"Stop Loss: {_prem_or_na(sig['stop_loss'])} | Target 1: {_prem_or_na(sig['target_1'])} | Target 2: {_prem_or_na(sig['target_2'])}")
+        print(f"Net R:R: {rr_or_na} (Net of STT, NSE txn, SEBI, Stamp Duty, GST, Brokerage)")
 
         # 4. Risk reporting (Stop-loss risk vs Maximum theoretical capital loss)
         ps_info = sig.get("position_sizing") or {}
-        print(f"Defined Stop-Loss Risk: Rs {ps_info.get('total_stop_loss_risk_inr', 0):,.2f} (Rs {ps_info.get('net_risk_per_lot_inr', 0):,.2f}/lot incl. charges; Budget: Rs {ps_info.get('budget_max_loss_inr', 0):,.2f})")
+        net_risk_per_lot = ps_info.get("net_risk_per_lot_inr")
+        net_risk_per_lot_str = f"Rs {net_risk_per_lot:,.2f}" if net_risk_per_lot is not None else "N/A"
+        print(f"Defined Stop-Loss Risk: Rs {ps_info.get('total_stop_loss_risk_inr', 0):,.2f} ({net_risk_per_lot_str}/lot incl. charges; Budget: Rs {ps_info.get('budget_max_loss_inr', 0):,.2f})")
         print(f"Maximum Theoretical Capital Loss: {sig['maximum_loss']}")
         print("Execution Warning: Stop-loss order execution is NOT guaranteed. Subject to market liquidity, slippage, and opening price gaps.")
 
@@ -2798,6 +2966,45 @@ def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
     return 0
 
 
+def run_standalone_analysis(args, orchestrator_cls=None) -> int:
+    """Execute standalone options analysis using shared orchestrator streamer lifecycle."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    is_open = calendar_in.is_market_hours_in(now_utc, exchange="NSE")
+
+    if orchestrator_cls is None:
+        from orchestrator import MarketIntelligenceOrchestrator
+        orchestrator_cls = MarketIntelligenceOrchestrator
+
+    with orchestrator_cls() as orch:
+        # Check credentials and streamer availability during live market hours
+        if is_open:
+            if orch.streamer is None:
+                print(
+                    "\n[FAIL CLOSED] Live analysis requires an authenticated WebSocket streamer for real-time exchange timestamps.\n"
+                    "Upstox credentials unavailable (set UPSTOX_ANALYTICS_TOKEN or config provider_credentials.upstox.analytics_token).\n"
+                    "REST-only fallback cannot produce actionable live recommendations.\n"
+                )
+                return 1
+
+            if not getattr(orch.streamer, "is_connected", False):
+                try:
+                    orch.streamer.connect()
+                except Exception:
+                    pass
+
+            if not getattr(orch.streamer, "is_connected", False):
+                print(
+                    "\n[FAIL CLOSED] Live analysis requires an active WebSocket streamer connection.\n"
+                    "Failed to establish live WebSocket connection to market feed.\n"
+                )
+                return 1
+
+        if orch.streamer is not None and getattr(orch.specialist, "streamer", None) is None:
+            orch.specialist.streamer = orch.streamer
+
+        return cmd_analyze(args, orch.specialist)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="trader-options: Dedicated Options Intelligence Specialist")
     sub = ap.add_subparsers(dest="cmd")
@@ -2816,11 +3023,11 @@ def main(argv=None):
         ap.print_help()
         return 0
 
-    specialist = OptionsIntelligenceSpecialist()
     if args.cmd == "chain":
+        specialist = OptionsIntelligenceSpecialist()
         return cmd_chain(args, specialist)
     elif args.cmd == "analyze":
-        return cmd_analyze(args, specialist)
+        return run_standalone_analysis(args)
 
     return 0
 

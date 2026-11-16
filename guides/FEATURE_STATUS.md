@@ -1,6 +1,6 @@
 # Day Trader: Comprehensive Feature Status & Specialist Skill Audit
 
-This document provides the authoritative, evidence-based feature status for Day Trader, auditing all 11 specialist skills, their exact input/output contracts, dependencies, test coverage, and non-negotiable operational boundaries.
+This document provides the authoritative, evidence-based feature status for Day Trader, auditing all 12 specialist skills, their exact input/output contracts, dependencies, test coverage, and non-negotiable operational boundaries.
 
 ---
 
@@ -10,8 +10,8 @@ The following constraints are non-negotiable across the entire Day Trader archit
 
 1. **Indian Equity Trading is Strictly Long-Only Paper Trading**: Live execution in the Indian market (NSE/BSE) is hard-blocked at the schema level (`config/schema.py`). Downstream sizing and fill accounting support only long (`side: "buy"`) trades.
 2. **Bearish VWAP Rejection is Analytical Only**: `trader-entry/entry.py` evaluates short-side geometry (`side: "sell"`), but downstream execution planning in `trader-exit/exit.py` and sizing in `trader-budget/size.py` reject short trades fail-closed.
-3. **Options BUY CE is Analytical Only**: `options_orb` in `trader-entry/entry.py` emits analytical call alerts. Option order sizing in `trader-budget/size.py` is hard-disabled (`SizeError: options are not enabled`).
-4. **Options BUY PE, SELL CE/PE, and Multi-Leg Spreads are Unsupported**: Put buying, option selling, naked short options, credit spreads, iron condors, and multi-leg execution are unsupported and blocked in `trader-risk/check.py`.
+3. **Options BUY CE is Analytical Only (path 1)**: `options_orb` in `trader-entry/entry.py` emits analytical call alerts. Option order sizing in `trader-budget/size.py` is hard-disabled (`SizeError: options are not enabled`). This item describes path 1 only -- see item 4 and §2.12 below for `trader-options` (path 2).
+4. **Options BUY PE, SELL CE/PE, and Multi-Leg Spreads: two different surfaces, two different statuses**: In the `trader-entry`/`trader-exit`/`trader-budget`/`trader-risk` order-execution pipeline (path 1), BUY PE, option selling, and multi-leg spreads are unsupported/blocked, and naked short options are explicitly rejected by `trader-risk/check.py` (`side == "sell"` -> "options selling / naked short options are prohibited"). Separately, `trader-options/` (path 2, `OptionsIntelligenceSpecialist` -- see §2.12) is a standalone, non-execution-connected decision-support engine that **does** implement BUY_PE, SELL_CE, SELL_PE, and two debit spreads (Bull Call Spread, Bear Put Spread) as analytical signals. Naked SELL_CE/SELL_PE there are evaluated and fully disclosed but are unconditionally rejected by that engine's own `NAKED_OPTION_PROHIBITED` check (not `trader-risk/check.py`'s, which path 2 never calls) and can never be marked actionable. Credit spreads and Iron Condor remain unimplemented in both paths. See `trader-options/SKILL.md` for the authoritative per-strategy status.
 5. **Upstox Integration is Strictly Read-Only**: Upstox REST endpoints and WebSocket V3 streams provide market data, live quotes, and security master files only. Zero order routing or execution endpoints exist.
 6. **TimeMachine Historical Replay Supports ORB Only**: `history_replay` in `trader-timemachine/timemachine.py` strictly evaluates Opening Range Breakouts (`orb`). Non-ORB strategies return `None` for historical replay.
 7. **Monte Carlo Uses Predefined Trade Boundaries**: `simulate()` in `trader-timemachine/timemachine.py` tests static barrier hit rates (`entry`, `stop`, `target`) across resampled historical bars. It does not execute dynamic trailing exit logic or live indicators.
@@ -210,6 +210,25 @@ The following constraints are non-negotiable across the entire Day Trader archit
 - **Failure Behaviour**: Handles missing files or invalid XML gracefully with error codes.
 - **Test Coverage**: Unit tested in `test_pelosi.py`. Verified via CLI `--help` in system integration suite.
 
+### 2.12. `trader-options`
+- **Primary Modules**: `options.py` (`OptionsIntelligenceSpecialist`), `orchestrator.py` (`MarketIntelligenceOrchestrator`), `replay.py` (`OptionsTimeMachineReplay`).
+- **Actual Implemented Functionality**:
+  - Standalone, non-execution-connected options decision-support engine for Indian indices (NIFTY, BANKNIFTY, FINNIFTY) and F&O equities. Never writes `trader/orders.json`; never calls `trader-budget/size.py`'s order-sizing path or `trader-risk/check.py`'s order validator (it imports `check.py` only as a library, for its own internal portfolio-risk re-check).
+  - Analytically evaluates and ranks BUY_CE, BUY_PE, SELL_CE, SELL_PE, and two debit spreads (Bull Call Spread, Bear Put Spread) per underlying, with Black-Scholes/live Greeks, Delta-Gamma-Theta premium stop/target modeling, full Indian statutory charges, 4-tier position sizing, and portfolio-level sequential capital/risk allocation across a shortlist.
+  - BUY_CE/BUY_PE are gated by config `buy_ce_enabled`/`buy_pe_enabled` (default `true`). SELL_CE/SELL_PE are always evaluated and fully disclosed (premium, margin, tail risk) but unconditionally rejected by an internal `NAKED_OPTION_PROHIBITED` check -- they can never be marked actionable. Credit spreads (`STRATEGY_BEAR_CALL_SPREAD`/`STRATEGY_BULL_PUT_SPREAD`) and Iron Condor exist as strategy constants with margin math written, but no code path ever generates a signal for them.
+  - `max_option_lots` (config, default 2) is enforced as a hard ceiling on final position sizing across all strategies.
+  - Liquidity gate (`validate_liquidity`): open interest and bid/ask spread thresholds, config-overridable (`options_min_open_interest`, `options_max_spread_pct`; defaults 20,000 / 2.0%, an interim tightening from a prior state of no OI floor and 6% spread -- see `trader-options/SKILL.md` for the long-term 50,000/1.0% target).
+  - `OptionsTimeMachineReplay` (`replay.py`): synthetic, explicitly-labeled `SYNTHETIC_OPTIONS_SIMULATION` backtest over real historical spot bars using the same Delta-Gamma premium model; not authentic tick-level options backtesting.
+- **Required Inputs**: Symbol, option chain (via `trader-alerts/data_in.py`), underlying technical setup (via `trader-scanner/scan.py` or `trader-entry/entry.py`), config.
+- **Outputs**: Signal contracts (in-memory/CLI/markdown report via `orchestrator.py`); never a file in the `trader/orders.json` execution chain.
+- **Data Dependencies**: `trader-alerts/data_in.py` (`fetch_option_chain`: Upstox live chain if credentialed, else simulated Black-Scholes chain), `trader-alerts/instruments.py` (authoritative lot size/strike interval/expiry metadata).
+- **Configuration Dependencies**: `buy_ce_enabled`, `buy_pe_enabled`, `max_option_lots`, `options_min_open_interest`, `options_max_spread_pct`, `max_loss_per_trade_inr`/`max_daily_loss_inr`, `budget`. `sell_ce_enabled`/`sell_pe_enabled` are reserved for the not-yet-implemented credit spreads and currently have no effect.
+- **Supported Market Profiles**: IN only.
+- **Operational Limitations**: Spread (debit) net R:R is derived by scaling the primary leg's own modeled premium move rather than independently projecting both legs' Greeks -- an approximation, not a full two-leg model (loss is still strictly capped by strike width). Theta is assumed per-calendar-day for all providers; confirmed for the internal Black-Scholes model, unverified against Upstox's own documentation for live broker Greeks (both paths are explicitly tagged with a `theta_unit` field so this assumption is auditable).
+- **Unsupported Functionality**: Any order execution; credit spreads; Iron Condor; approvable naked option selling.
+- **Failure Behaviour**: Fails closed -- no synthetic underlying setups fabricated, no fabricated premium/R:R numbers (unavailable Delta/Gamma models propagate `None`/`N/A`, never `0.0`), stale/offline data downgrades a signal to `HISTORICAL ANALYSIS`/non-actionable rather than presenting it as live.
+- **Test Coverage**: `test_options_intelligence.py`, `test_bharat_options_risk.py`, `test_options_premium_model_integrity.py`, `test_options_stage2_safety_gates.py`.
+
 ---
 
 ## 3. Operational Safety & Compliance Summary
@@ -224,3 +243,6 @@ The following constraints are non-negotiable across the entire Day Trader archit
 | **Stale/Future Data Defense** | Timestamps in future or older than threshold fail closed | `data_in.py:1924`, `entry.py:1594` |
 | **Read-Only Upstox** | Read-only GET requests only; zero order endpoints | `data_in.py:2494-2650` |
 | **T2T Restrictions** | Trade-to-Trade delivery-only stocks blocked from day trading | `instruments.py:1260`, `check.py:1157` |
+| **Naked Option Prohibition (order pipeline)** | Single-leg `side == "sell"` option orders rejected | `check.py:1295-1297` |
+| **Naked Option Prohibition (trader-options analysis)** | SELL_CE/SELL_PE unconditionally non-actionable, independent of margin-authority status | `options.py` `generate_signal_contract` (`NAKED_OPTION_PROHIBITED`) |
+| **Zero Fabrication (trader-options premiums)** | Unavailable Delta/Gamma premium model propagates `None`/`N/A`, never `0.0` | `options.py` `model_premium_levels`, `calculate_charges_and_net_rr` |

@@ -14,34 +14,36 @@ The **trader-options** specialist acts as an expert "second pair of eyes" for a 
 
 ## 1. Supported Options Strategies
 
-The engine analytically supports all four primary options strategies plus defined-risk structures without artificial directional bias:
+Status key: **ACTIONABLE** = can reach `SIGNAL VALIDATED`/`is_actionable: true`. **ANALYSIS ONLY (never actionable)** = fully evaluated and disclosed, but structurally always rejected. **NOT IMPLEMENTED** = no code path generates this signal today; listed here only so a future contributor knows what's spec'd but not built.
 
-1. **BUY CE (Long Call)**:
+1. **BUY CE (Long Call)** -- ACTIONABLE (gated by config `buy_ce_enabled`, default `true`):
    - **Market Regime**: Bullish breakout, session VWAP reclaim, EMA bullish alignment (EMA9 > EMA21), or RSI momentum (> 60).
    - **Strike Selection**: ATM or OTM1 call with tight bid-ask spread and robust volume.
    - **Risk Profile**: Strictly defined risk capped at premium paid.
 
-2. **BUY PE (Long Put)**:
+2. **BUY PE (Long Put)** -- ACTIONABLE (gated by config `buy_pe_enabled`, default `true`):
    - **Market Regime**: Bearish breakdown, session VWAP rejection, EMA bearish alignment (EMA9 < EMA21), or RSI breakdown (< 40).
    - **Strike Selection**: ATM or OTM1 put with tight bid-ask spread and robust volume.
    - **Risk Profile**: Strictly defined risk capped at premium paid.
 
-3. **SELL CE (Short Call / Premium Collection)**:
+3. **SELL CE (Short Call / Premium Collection)** -- ANALYSIS ONLY, never actionable:
    - **Market Regime**: Bearish resistance rejection or range-bound market with capped upside.
    - **Strike Selection**: OTM1 or OTM2 call.
    - **Risk & Margin**: Naked short calls carry **theoretically unlimited maximum loss**. Requires full exchange initial margin (SPAN + Exposure Margin $\approx 12\% - 15\%$ of contract notional).
+   - **Structurally prohibited**: unhedged single-leg option selling is unconditionally rejected (`NAKED_OPTION_PROHIBITED`), mirroring `trader-risk/check.py`'s rule for the order-execution path. This is evaluated and fully disclosed (premium, margin, tail risk) for the human trader's reference, but can never be marked actionable.
 
-4. **SELL PE (Short Put / Premium Collection)**:
+4. **SELL PE (Short Put / Premium Collection)** -- ANALYSIS ONLY, never actionable:
    - **Market Regime**: Bullish support bounce or range-bound market with strong floor.
    - **Strike Selection**: OTM1 or OTM2 put.
    - **Risk & Margin**: Naked short puts carry **substantial maximum loss** ($\text{Strike} \times \text{Lot Size}$). Requires full initial margin.
+   - **Structurally prohibited**: same `NAKED_OPTION_PROHIBITED` rule as SELL CE above.
 
-5. **Defined-Risk Vertical Spreads**:
-   - **Bull Call Spread (Debit)**: Buy ATM CE + Sell OTM2 CE. Capped upside, strictly capped max loss.
-   - **Bear Put Spread (Debit)**: Buy ATM PE + Sell OTM2 PE. Capped downside profit, strictly capped max loss.
-   - **Bear Call Credit Spread**: Sell OTM1 CE + Buy OTM2 CE. Hedged premium selling with margin capped at strike width.
-   - **Bull Put Credit Spread**: Sell OTM1 PE + Buy OTM2 PE. Hedged premium selling with margin capped at strike width.
-   - **Iron Condor**: Non-directional range-bound spread combining Bear Call Spread + Bull Put Spread.
+5. **Defined-Risk Debit Spreads** -- ACTIONABLE:
+   - **Bull Call Spread (Debit)**: Buy ATM CE + Sell OTM2 CE. Capped upside, strictly capped max loss. Note: the spread's reward/R:R is currently derived by scaling the primary leg's own modeled premium move rather than independently projecting both legs' Greeks -- an approximation, not a full two-leg model.
+   - **Bear Put Spread (Debit)**: Buy ATM PE + Sell OTM2 PE. Capped downside profit, strictly capped max loss. Same single-leg-derived R:R approximation as above.
+
+6. **Credit Spreads and Iron Condor** -- NOT IMPLEMENTED:
+   - **Bear Call Credit Spread**, **Bull Put Credit Spread**, **Iron Condor**: these strategy constants exist in `options.py` (`STRATEGY_BEAR_CALL_SPREAD`, `STRATEGY_BULL_PUT_SPREAD`, `STRATEGY_IRON_CONDOR`) and their margin/charges math is written, but `analyze_symbol_for_options` never generates a signal for any of them. No contract will ever appear with these strategies today. `sell_ce_enabled`/`sell_pe_enabled` in config are reserved for gating these once implemented -- they currently have no effect on anything the engine actually produces.
 
 ---
 
@@ -123,7 +125,9 @@ Every trade proposal evaluates the full schedule of Indian regulatory levies and
 - **Minimum 2.0R Net R:R Enforcement**: Any setup with `net_reward_risk < 2.0` (e.g. 1.58:1) is rejected with `RR_BELOW_MINIMUM`.
 - **Available Capital & Margin Gating**: Total required capital/margin must not exceed available capital.
 - **Data Provenance & Freshness Gating**: Only real-time live quotes during open market hours can produce `SIGNAL VALIDATED`. Historical or closed-session quotes produce `HISTORICAL ANALYSIS` or `SIGNAL REJECTED`.
-- **Zero Fabrication**: No dummy setups are created if underlying chart data is missing. Missing chart returns `NO TRADE / MISSING_UNDERLYING_CHART`. Premium models never use arbitrary percentage stops/targets.
+- **Zero Fabrication**: No dummy setups are created if underlying chart data is missing. Missing chart returns `NO TRADE / MISSING_UNDERLYING_CHART`. Premium models never use arbitrary percentage stops/targets. When the Delta/Gamma model cannot produce a viable stop/target (`MODEL_UNAVAILABLE`), `stop_loss`/`target_1`/`target_2`/net R:R are reported as `None`/`N/A`, never as a fabricated `0.0` -- a `0.0` always means a genuinely computed value, never "unavailable."
+- **Naked Option Prohibition**: SELL CE and SELL PE are evaluated and fully disclosed (premium, margin, tail risk) for reference, but are unconditionally rejected (`NAKED_OPTION_PROHIBITED`) and can never reach `SIGNAL VALIDATED` -- this does not depend on margin data being authoritative.
+- **Policy Caps Honored**: `buy_ce_enabled` / `buy_pe_enabled` (config) suppress that strategy's generation entirely when `false`; `max_option_lots` (config, default 2) is enforced as a hard ceiling on `position_sizing.lots` regardless of what the risk-budget/capital/depth tiers alone would otherwise permit.
 
 ---
 

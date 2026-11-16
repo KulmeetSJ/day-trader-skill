@@ -1465,12 +1465,16 @@ def test_risk_reporting_stop_loss_vs_maximum_loss_distinction(specialist):
     assert ps["lots"] >= 1
     assert ps["actual_net_risk_inr"] <= 2000.0  # Stop-loss risk fits inside budget
     assert ps["total_stop_loss_risk_inr"] == ps["actual_net_risk_inr"]
-    # Maximum possible loss includes premium outlay + transaction charges (> ₹26,841.75)
+    # Maximum possible loss includes premium outlay + transaction charges.
+    # Stage 2: max_option_lots (config default 2) is now enforced as a hard sizing cap (it was
+    # previously dead configuration), so the uncapped ~4-lot figure this test originally pinned
+    # (~Rs 26,841.75) is no longer reachable with the default config -- the thresholds below
+    # reflect the now-correctly-capped ~2-lot outcome.
     assert "Premium Outlay" in sig["maximum_loss"]
     assert "Transaction Charges" in sig["maximum_loss"]
-    assert ps["maximum_possible_loss_value"] > 26841.75
-    # Sizing satisfies stop risk budget while maximum possible loss is ~13.5x higher
-    assert ps["maximum_possible_loss_value"] > (10 * ps["budget_max_loss_inr"])
+    assert ps["maximum_possible_loss_value"] > 15000.0
+    # Sizing satisfies stop risk budget while maximum possible loss is still substantially higher
+    assert ps["maximum_possible_loss_value"] > (8 * ps["budget_max_loss_inr"])
     assert "substantially higher" in ps["risk_budget_policy_explanation"]
 
 
@@ -2418,7 +2422,10 @@ def test_phase2_holding_time_session_clock(specialist):
         evaluation_time=t_1415_ist,
     )
     assert res_1h is not None
-    assert math.isclose(res_1h["theta_decay_applied"], 4.8, abs_tol=0.2)
+    # Theta is a per-calendar-day figure (Stage 1 fix): decay over 1 held hour is
+    # theta * (1 / 24), not theta * (1 / 6.25) -- the holding-time-shrinking behavior under
+    # test (1 hour remaining to the 15:15 IST cutoff) is otherwise unchanged.
+    assert math.isclose(res_1h["theta_decay_applied"], 1.25, abs_tol=0.05)
 
 
 def test_phase3_authoritative_bod_cache_enforcement():

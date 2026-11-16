@@ -1,5 +1,6 @@
 """Targeted correctness audit regression tests for BANKNIFTY and peer indices."""
 
+import argparse
 import contextlib
 import datetime
 import io
@@ -257,7 +258,7 @@ class BankNiftyAuditTests(unittest.TestCase):
                     json.dump({"market": "IN", "paper_only": True, "budget": 100000, "max_loss": 1500, "daily_max_loss": 3000}, fh)
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--now", "2026-11-12 10:15", "--json"])
+                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--instruments", cache_path, "--now", "2026-11-12 10:15", "--json"])
                 rd = json.loads(buf.getvalue())
                 chk5 = {c["check"]: c for c in rd["checks"]}["Derivatives & Expiry Metadata"]
                 self.assertIn("BANKNIFTY [NSE] (exp 2026-11-23, 11d, lot 30, step 100)", chk5["detail"])
@@ -572,6 +573,290 @@ class BankNiftyMarketDataRemediationTests(unittest.TestCase):
         self.assertFalse(ps.get("stop_execution_guaranteed"))
         self.assertIn("Stop-loss order execution is NOT guaranteed", ps.get("stop_execution_disclosure", ""))
         self.assertIn("DISCLOSURE", ps.get("stop_execution_disclosure", ""))
+
+
+class OptionsSpotValidationAndCLILifecycleTests(unittest.TestCase):
+    """Targeted regression tests for cash index spot validation and standalone CLI lifecycle."""
+
+    def setUp(self):
+        self.options_mod = _load.load("trader-options", "options")
+        self.orch_mod = _load.load("trader-options", "orchestrator")
+        self.upstox_feed_mod = _load.load("trader-alerts", "upstox_feed")
+        self.specialist = self.options_mod.OptionsIntelligenceSpecialist()
+
+    def _make_connected_streamer(self, key):
+        streamer = self.upstox_feed_mod.UpstoxMarketDataStreamer(authorize_fn=lambda: "wss://dummy")
+        streamer._connected = True
+        streamer._ws = unittest.mock.MagicMock()
+        streamer._subscriptions["full"].add(key)
+        return streamer
+
+    def test_1_fresh_nifty_index_tick_without_bid_ask_is_accepted(self):
+        """1. A fresh NIFTY index tick with LTP and exchange timestamp but no bid/ask is accepted."""
+        u_key = "NSE_INDEX|Nifty 50"
+        streamer = self._make_connected_streamer(u_key)
+        now_dt = datetime.datetime(2026, 11, 17, 5, 0, 10, tzinfo=timezone.utc)
+        streamer.last_ticks[u_key] = {
+            "last_price": 25250.0,
+            "exchange_timestamp": "2026-11-17T05:00:05+00:00",
+            "last_trade_time": "2026-11-17T05:00:05+00:00",
+            "feed_time": "2026-11-17T05:00:05.100000+00:00",
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "bid": None,
+            "ask": None,
+            "bid_qty": None,
+            "ask_qty": None,
+            "quote_provenance": "UPSTOX_WEBSOCKET_V2_LIVE",
+        }
+
+        # Index retrieval with require_depth=False must succeed
+        quote, err = streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now_dt, require_depth=False)
+        self.assertIsNone(err)
+        self.assertIsNotNone(quote)
+        self.assertEqual(quote["last_price"], 25250.0)
+
+        # Specialist validate_underlying_spot must accept the quote
+        v_ok, v_px, v_err, _ = self.specialist.validate_underlying_spot(quote, now_utc=now_dt, max_age_seconds=60.0)
+        self.assertTrue(v_ok)
+        self.assertEqual(v_px, 25250.0)
+        self.assertIsNone(v_err)
+
+    def test_2_stale_index_tick_is_rejected(self):
+        """2. A stale index tick is rejected."""
+        u_key = "NSE_INDEX|Nifty 50"
+        streamer = self._make_connected_streamer(u_key)
+        # Tick timestamp is 120s old relative to now_dt
+        now_dt = datetime.datetime(2026, 11, 17, 5, 2, 0, tzinfo=timezone.utc)
+        stale_tick = {
+            "last_price": 25250.0,
+            "exchange_timestamp": "2026-11-17T05:00:00+00:00",
+            "tier": "REAL_TIME",
+            "is_live": True,
+            "bid": None,
+            "ask": None,
+            "quote_provenance": "UPSTOX_WEBSOCKET_V2_LIVE",
+        }
+        streamer.last_ticks[u_key] = stale_tick
+
+        quote, err = streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now_dt, require_depth=False)
+        self.assertIsNone(quote)
+        self.assertEqual(err, "STALE_QUOTE_DATA")
+
+        # Specialist validation also independently fails closed
+        v_ok, _, v_err, _ = self.specialist.validate_underlying_spot(stale_tick, now_utc=now_dt, max_age_seconds=60.0)
+        self.assertFalse(v_ok)
+        self.assertIn("STALE_UNDERLYING_SPOT", v_err)
+
+    def test_3_index_tick_with_missing_timestamp_is_rejected(self):
+        """3. An index tick with a missing timestamp is rejected."""
+        u_key = "NSE_INDEX|Nifty 50"
+        streamer = self._make_connected_streamer(u_key)
+        now_dt = datetime.datetime(2026, 11, 17, 5, 0, 10, tzinfo=timezone.utc)
+        missing_ts_tick = {
+            "last_price": 25250.0,
+            "exchange_timestamp": None,
+            "quote_timestamp": None,
+            "last_trade_time": None,
+            "feed_time": None,
+            "bid": None,
+            "ask": None,
+        }
+        streamer.last_ticks[u_key] = missing_ts_tick
+
+        quote, err = streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now_dt, require_depth=False)
+        self.assertIsNone(quote)
+        self.assertEqual(err, "MISSING_QUOTE_TIMESTAMP")
+
+        v_ok, _, v_err, _ = self.specialist.validate_underlying_spot(missing_ts_tick, now_utc=now_dt)
+        self.assertFalse(v_ok)
+        self.assertIn("UNDERLYING_SPOT_UNVERIFIED", v_err)
+
+    def test_4_index_tick_with_future_timestamp_is_rejected(self):
+        """4. An index tick with a future timestamp is rejected."""
+        u_key = "NSE_INDEX|Nifty 50"
+        streamer = self._make_connected_streamer(u_key)
+        now_dt = datetime.datetime(2026, 11, 17, 5, 0, 0, tzinfo=timezone.utc)
+        future_tick = {
+            "last_price": 25250.0,
+            "exchange_timestamp": "2026-11-17T05:00:20+00:00",  # 20s in future (>5s permitted drift)
+            "bid": None,
+            "ask": None,
+            "quote_provenance": "UPSTOX_WEBSOCKET_V2_LIVE",
+        }
+        streamer.last_ticks[u_key] = future_tick
+
+        quote, err = streamer.get_live_quote(u_key, max_age_seconds=60.0, now_dt=now_dt, require_depth=False)
+        self.assertIsNone(quote)
+        self.assertEqual(err, "FUTURE_QUOTE_TIMESTAMP")
+
+        v_ok, _, v_err, _ = self.specialist.validate_underlying_spot(future_tick, now_utc=now_dt)
+        self.assertFalse(v_ok)
+        self.assertIn("FUTURE_UNDERLYING_SPOT_TIMESTAMP", v_err)
+
+    def test_5_option_quote_without_bid_ask_depth_remains_rejected(self):
+        """5. An option quote without bid/ask depth remains rejected."""
+        opt_key = "NSE_FO|45401"
+        streamer = self._make_connected_streamer(opt_key)
+        now_dt = datetime.datetime(2026, 11, 17, 5, 0, 10, tzinfo=timezone.utc)
+        # Option quote missing bid/ask must fail closed
+        streamer.last_ticks[opt_key] = {
+            "last_price": 100.0,
+            "exchange_timestamp": "2026-11-17T05:00:05+00:00",
+            "bid": None,
+            "ask": None,
+        }
+        quote, err = streamer.get_live_quote(opt_key, require_depth=True, now_dt=now_dt)
+        self.assertIsNone(quote)
+        self.assertEqual(err, "MISSING_BID_ASK")
+
+    def test_6_futures_and_options_still_require_depth(self):
+        """6. Futures and options still require depth."""
+        fut_key = "NSE_FO|61466"
+        streamer = self._make_connected_streamer(fut_key)
+        now_dt = datetime.datetime(2026, 11, 17, 5, 0, 10, tzinfo=timezone.utc)
+
+        # Missing depth returns MISSING_BID_ASK
+        streamer.last_ticks[fut_key] = {
+            "last_price": 61400.0,
+            "exchange_timestamp": "2026-11-17T05:00:05+00:00",
+            "bid": None,
+            "ask": None,
+        }
+        q_fail, err_fail = streamer.get_live_quote(fut_key, require_depth=True, now_dt=now_dt)
+        self.assertIsNone(q_fail)
+        self.assertEqual(err_fail, "MISSING_BID_ASK")
+
+        # Valid depth passes
+        streamer.last_ticks[fut_key] = {
+            "last_price": 61400.0,
+            "exchange_timestamp": "2026-11-17T05:00:05+00:00",
+            "depth_timestamp": "2026-11-17T05:00:05+00:00",
+            "bid": 61395.0,
+            "ask": 61405.0,
+            "bid_qty": 300,
+            "ask_qty": 450,
+        }
+        q_ok, err_ok = streamer.get_live_quote(fut_key, require_depth=True, now_dt=now_dt)
+        self.assertIsNotNone(q_ok)
+        self.assertIsNone(err_ok)
+
+    def test_7_standalone_cli_initializes_and_injects_streamer_lifecycle(self):
+        """7. Standalone CLI initializes/injects the shared streamer lifecycle."""
+        class MockStreamer:
+            def __init__(self):
+                self.is_connected = False
+                self.closed = False
+            def connect(self):
+                self.is_connected = True
+            def close(self):
+                self.closed = True
+            def active_keys(self):
+                return []
+
+        mock_s = MockStreamer()
+        mock_specialist = unittest.mock.MagicMock()
+        mock_specialist.streamer = None
+
+        class MockOrchestrator:
+            def __init__(self):
+                self.streamer = mock_s
+                self.specialist = mock_specialist
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+            def close(self):
+                if self.streamer:
+                    self.streamer.close()
+
+        args = argparse.Namespace(symbol="NIFTY", budget=2000.0, limit=5)
+        with patch.object(self.options_mod.calendar_in, "is_market_hours_in", return_value=True):
+            with patch.object(self.options_mod, "cmd_analyze", return_value=0) as mock_cmd:
+                code = self.options_mod.run_standalone_analysis(args, orchestrator_cls=MockOrchestrator)
+                self.assertEqual(code, 0)
+                mock_cmd.assert_called_once()
+                # Verify streamer was connected and injected
+                self.assertTrue(mock_s.is_connected)
+                self.assertIs(mock_specialist.streamer, mock_s)
+                # Verify streamer was closed upon exit
+                self.assertTrue(mock_s.closed)
+
+    def test_8_streamer_is_closed_after_successful_and_failed_analysis(self):
+        """8. Streamer is closed after successful and failed analysis."""
+        class MockStreamer:
+            def __init__(self):
+                self.is_connected = True
+                self.closed = False
+            def close(self):
+                self.closed = True
+
+        mock_s = MockStreamer()
+        mock_specialist = unittest.mock.MagicMock()
+
+        class MockOrchestrator:
+            def __init__(self):
+                self.streamer = mock_s
+                self.specialist = mock_specialist
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+            def close(self):
+                self.streamer.close()
+
+        args = argparse.Namespace(symbol="NIFTY", budget=2000.0, limit=5)
+        # Failure/Exception scenario: cmd_analyze raises RuntimeError
+        with patch.object(self.options_mod.calendar_in, "is_market_hours_in", return_value=True):
+            with patch.object(self.options_mod, "cmd_analyze", side_effect=RuntimeError("Analysis error")):
+                with self.assertRaises(RuntimeError):
+                    self.options_mod.run_standalone_analysis(args, orchestrator_cls=MockOrchestrator)
+                # Streamer must be closed despite exception
+                self.assertTrue(mock_s.closed)
+
+    def test_9_missing_credentials_do_not_produce_actionable_recommendations(self):
+        """9. Missing credentials do not produce actionable recommendations."""
+        class MockOrchestratorNoCreds:
+            def __init__(self):
+                self.streamer = None  # Credentials missing
+                self.specialist = unittest.mock.MagicMock()
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def close(self):
+                pass
+
+        args = argparse.Namespace(symbol="NIFTY", budget=2000.0, limit=5)
+        with patch.object(self.options_mod.calendar_in, "is_market_hours_in", return_value=True):
+            with patch("builtins.print") as mock_print:
+                code = self.options_mod.run_standalone_analysis(args, orchestrator_cls=MockOrchestratorNoCreds)
+                # Must fail closed with code 1 during live market hours
+                self.assertEqual(code, 1)
+                printed = " ".join(str(call) for call in mock_print.call_args_list)
+                self.assertIn("FAIL CLOSED", printed)
+                self.assertIn("credentials unavailable", printed.lower())
+
+    def test_10_historical_analysis_does_not_require_live_websocket(self):
+        """10. Historical analysis does not accidentally require a live WebSocket."""
+        class MockOrchestratorOffline:
+            def __init__(self):
+                self.streamer = None  # No streamer available
+                self.specialist = unittest.mock.MagicMock()
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def close(self):
+                pass
+
+        args = argparse.Namespace(symbol="NIFTY", budget=2000.0, limit=5)
+        # Market is closed (historical / off-hours)
+        with patch.object(self.options_mod.calendar_in, "is_market_hours_in", return_value=False):
+            with patch.object(self.options_mod, "cmd_analyze", return_value=0) as mock_cmd:
+                code = self.options_mod.run_standalone_analysis(args, orchestrator_cls=MockOrchestratorOffline)
+                self.assertEqual(code, 0)
+                mock_cmd.assert_called_once()
 
 
 if __name__ == "__main__":

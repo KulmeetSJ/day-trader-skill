@@ -259,7 +259,7 @@ class DerivativesAuditTests(unittest.TestCase):
                 # 4. Readiness Check 5 and options_orb on 2026-11-12 match identically
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--now", "2026-11-12 10:15", "--json"])
+                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--instruments", cache_path, "--now", "2026-11-12 10:15", "--json"])
                 rd = json.loads(buf.getvalue())
                 chk5 = {c["check"]: c for c in rd["checks"]}["Derivatives & Expiry Metadata"]
                 self.assertIn("SENSEX [BSE] (exp 2026-11-12, 0d, lot 20, step 100)", chk5["detail"])
@@ -379,7 +379,7 @@ class DerivativesAuditTests(unittest.TestCase):
 
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--now", "2026-11-12 10:15", "--json"])
+                    alerts.main(["readiness", "--market", "IN", "--config", cfg_path, "--instruments", cache_path, "--now", "2026-11-12 10:15", "--json"])
                 rd = json.loads(buf.getvalue())
                 chk5 = {c["check"]: c for c in rd["checks"]}["Derivatives & Expiry Metadata"]
                 self.assertIn("FINNIFTY [NSE] (exp 2026-11-23, 11d, lot 60, step 50)", chk5["detail"])

@@ -1829,6 +1829,7 @@ def black_scholes(spot, strike, t_years, rate=0.07, vol=0.18, option_type="CE"):
             "theta": 0.0,
             "vega": 0.0,
             "rho": 0.0,
+            "theta_unit": "PER_CALENDAR_DAY",
         }
 
     v_sqrt_t = v * math.sqrt(t)
@@ -1855,7 +1856,11 @@ def black_scholes(spot, strike, t_years, rate=0.07, vol=0.18, option_type="CE"):
         "price": max(0.05, round(price, 2)),
         "delta": round(delta, 4),
         "gamma": round(gamma, 6),
+        # theta is divided by 365.0 above -> a confirmed per-calendar-day decay figure.
+        # Consumers (e.g. trader-options model_premium_levels) must divide holding time by a
+        # 24-hour calendar day, not a trading-session-hours figure, to stay unit-consistent.
         "theta": round(theta, 2),
+        "theta_unit": "PER_CALENDAR_DAY",
         "vega": round(vega, 2),
         "rho": round(rho, 2),
     }
@@ -3859,6 +3864,13 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                     "delta": gdata.get("delta"),
                     "gamma": gdata.get("gamma"),
                     "theta": gdata.get("theta"),
+                    # Upstox's public API documentation does not state theta's time unit
+                    # (verified Nov 2026). It is passed through verbatim and ASSUMED to follow
+                    # the industry-standard per-calendar-day convention (same as this module's
+                    # own black_scholes()), but this is unverified against the broker -- flag it
+                    # explicitly rather than silently presenting it as equivalent to a confirmed
+                    # calendar-day figure.
+                    "theta_unit": ("PER_CALENDAR_DAY_ASSUMED_UNVERIFIED" if gdata.get("theta") is not None else None),
                     "vega": gdata.get("vega"),
                 }
                 if gdata.get("pop") is not None:
