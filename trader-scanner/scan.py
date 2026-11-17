@@ -2801,7 +2801,7 @@ def scan_intraday(symbols, now_utc, strategies=None, interval="5m", range_str=No
         "interval": interval,
         "range": rng,
         "strategies": strategies,
-        "provider": ("offline" if offline is not None else (in_provider or "yahoo")),
+        "provider": ("offline" if offline is not None else (getattr(in_provider, "provider_name", None) or "yahoo")),
     }
 
 
