@@ -41,6 +41,7 @@ for path in [
         sys.path.insert(0, path)
 
 import _load  # noqa: E402,F401
+from _options_offline import offline_options_market  # noqa: E402,F401  (autouse: no live data)
 from options import (  # noqa: E402
     OptionsIntelligenceSpecialist,
     STRATEGY_BUY_CE,
