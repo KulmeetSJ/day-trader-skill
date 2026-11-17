@@ -3413,6 +3413,16 @@ def setup_name(res):
     return ("close above %s%.2f" % (curr, res["level"])) if res["level"] is not None else "close above a level"
 
 
+def _trigger_clause(res, t, curr):
+    """What the trigger bar did. Indicator-only setups (rsi_momentum, ma_crossover, trend)
+    have no price level, so they are described by their condition, never a None level."""
+    vol = (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""
+    if res.get("level") is None:
+        return "closed at %s%.2f with %s confirmed%s" % (curr, t["close"], setup_name(res), vol)
+    return "closed above %s %s%.2f (%+.2f%%%s)" % (
+        "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"] or 0.0, vol)
+
+
 def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
@@ -3465,20 +3475,18 @@ def describe(res):
     t = res.get("trigger")
     if t:
         if closed_analysis:
-            out.append("[HISTORICAL ANALYSIS] TRIGGERED on session %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
+            out.append("[HISTORICAL ANALYSIS] TRIGGERED on session %s at %s%.2f: the %s bar (bar %d) %s." % (
                 candle_sess, curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-                "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
-                (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+                _trigger_clause(res, t, curr)))
             out.append("Market is CLOSED. Evaluated on historical candles from session %s (Data tier: %s, status: %s)." % (
                 candle_sess, tier, str(res.get("data_status", "stale")).upper()))
             out.append("NOT a live-session signal. Orders evaluated outside market hours are for research and paper trading only. Nothing was placed.")
             out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
                        "(exit.py plan --from trader/entry.json).")
         else:
-            out.append("TRIGGERED %s at %s%.2f: the %s bar (bar %d) closed above %s %s%.2f (%+.2f%%%s)." % (
+            out.append("TRIGGERED %s at %s%.2f: the %s bar (bar %d) %s." % (
                 t["time"], curr, t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-                "the range high" if res["setup"] == "orb" else "the level", curr, res["level"], t["pct_over"],
-                (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+                _trigger_clause(res, t, curr)))
             step = INTERVALS[res["interval"]] // 60
             if res.get("minutes_since", 0) > step and res.get("last"):
                 out.append("That was %d minutes ago; the last close is %s%.2f (%s bar). A late entry is a different "
@@ -3634,8 +3642,12 @@ def bar_line(b, res):
         if b["slot"] == n_or - 1:
             note = "opening range set: high %s%.2f, low %s%.2f" % (curr, orr["high"], curr, orr["low"])
     elif t and t["bar_index"] == b["slot"]:
-        note = "TRIGGERED: closed above %s%.2f (%+.2f%%). Get in now if you take it: %s, %s%.2f" % (
-            curr, lvl, t["pct_over"], t["time"], curr, t["price"])
+        if lvl is None:
+            note = "TRIGGERED: %s confirmed. Get in now if you take it: %s, %s%.2f" % (
+                setup_name(res), t["time"], curr, t["price"])
+        else:
+            note = "TRIGGERED: closed above %s%.2f (%+.2f%%). Get in now if you take it: %s, %s%.2f" % (
+                curr, lvl, t["pct_over"], t["time"], curr, t["price"])
     elif lvl is None:
         note = ""
     elif b["c"] > lvl:

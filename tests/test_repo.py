@@ -85,7 +85,7 @@ class Repo(unittest.TestCase):
                 ".claude", "CLAUDE.md",
             )
         )
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "config", "guides", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "config", "guides", "scripts", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

@@ -166,9 +166,14 @@ def round_tick(price: float, tick: float = 0.05) -> float:
     return float(rounded)
 
 
+def _utc_now() -> datetime.datetime:
+    """The engine's single wall-clock read (aware UTC), so replays and tests can pin it."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 def get_current_ist_time() -> datetime.datetime:
     """Current time in Indian Standard Time (IST)."""
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+    return _utc_now() + datetime.timedelta(hours=5, minutes=30)
 
 
 def parse_timestamp(val: Any) -> Optional[datetime.datetime]:
@@ -1066,7 +1071,7 @@ class OptionsIntelligenceSpecialist:
                 return False, ["PORTFOLIO_RISK_UNAVAILABLE: Central trader-risk module could not be imported"]
             return True, []
 
-        now_dt = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        now_dt = now_utc or _utc_now()
         today_iso = now_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
 
         cfg = risk_check.load_config(path=config_path, market="IN")
@@ -1194,7 +1199,7 @@ class OptionsIntelligenceSpecialist:
         min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
         capital_limit = available_capital if available_capital is not None else self.available_capital
 
-        now_dt = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
+        now_dt = now_utc if now_utc is not None else _utc_now()
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
 
@@ -1859,7 +1864,7 @@ class OptionsIntelligenceSpecialist:
             )
 
         # DEF-01: Genuine Live Data Freshness & Provenance Gating
-        now_dt = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
+        now_dt = now_utc if now_utc is not None else _utc_now()
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
 
@@ -2290,7 +2295,7 @@ class OptionsIntelligenceSpecialist:
         Returns dict with instrument_key, symbol, expiry, lot_size, or None if unresolvable.
         """
         canon = symbol.upper().strip()
-        ref_dt = now or datetime.datetime.now(datetime.timezone.utc)
+        ref_dt = now or _utc_now()
         today_str = ref_dt.astimezone(calendar_in.IST).strftime("%Y-%m-%d")
         exch = exchange or ("BSE" if canon in ("SENSEX", "BANKEX") else "NSE")
 
@@ -2458,7 +2463,7 @@ class OptionsIntelligenceSpecialist:
         computes it itself (single-symbol CLI usage) and degrades to "UNCERTAIN" on any failure
         -- regime is disclosed context, never a reason by itself to fail this call.
         """
-        now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        now = now_utc or _utc_now()
         budget = max_loss_budget if max_loss_budget is not None else self.max_loss_budget
         min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
         p_path = portfolio_path or self.portfolio_path
@@ -3199,7 +3204,7 @@ def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
 
 def run_standalone_analysis(args, orchestrator_cls=None) -> int:
     """Execute standalone options analysis using shared orchestrator streamer lifecycle."""
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_utc = _utc_now()
     is_open = calendar_in.is_market_hours_in(now_utc, exchange="NSE")
 
     if orchestrator_cls is None:

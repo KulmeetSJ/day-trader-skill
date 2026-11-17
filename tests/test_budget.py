@@ -395,5 +395,29 @@ class WeightsMode(unittest.TestCase):
             self.assertIn("no weights file", err)
 
 
+class PositionCapMatchesRisk(unittest.TestCase):
+    """trader-risk caps a position at max_position_pct of the account (cash + holdings).
+    When portfolio cash is a little under the budget, the sizer must cap on cash, or the
+    order it writes fails risk's position check by a few rupees (2026-11-17 CROMPTON:
+    356 x 210.65 = 74,991.40 sized vs 74,932.80 allowed on 99,910.40 cash)."""
+
+    def _sized(self, cash):
+        c = cfg(max_loss_per_trade_usd=100000, max_order_usd=100000, cash_buffer_pct=0)
+        return size.size_trade(plan(), c, cash=cash, today=TODAY)
+
+    def test_cash_below_budget_caps_on_cash(self):
+        s = self._sized(cash=4990.0)
+        self.assertEqual(s["bound_by"][0] if isinstance(s["bound_by"], list) else s["bound_by"], "position cap")
+        self.assertLessEqual(s["cost"], 4990.0 * 0.75 + 1e-6)
+        cap_row = [l for l in s["limits"] if l["name"] == "position cap"][0]
+        self.assertEqual(cap_row["amount"], 3742.5)
+        self.assertIn("cash", cap_row["how"])
+
+    def test_cash_at_or_above_budget_keeps_budget_base(self):
+        s = self._sized(cash=9000.0)
+        cap_row = [l for l in s["limits"] if l["name"] == "position cap"][0]
+        self.assertEqual(cap_row["amount"], 3750.0)
+
+
 if __name__ == "__main__":
     unittest.main()

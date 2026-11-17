@@ -1075,9 +1075,15 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
                                  "%s max loss / %s risk a share" % (money(max_loss, market=market), _price(risk, tick_size))))
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
-        cap = round(budget * cap_pct / 100.0, 2)
+        # trader-risk measures the cap against the account (cash + holdings). When the
+        # portfolio's cash is below the budget, cap on cash so a sized order can never
+        # fail risk's position check by a few rupees (fail-closed: never larger).
+        cap_base, cap_base_name = budget, money(budget, market=market)
+        if cash is not None and cash < budget:
+            cap_base, cap_base_name = cash, "%s cash" % money(cash, market=market)
+        cap = round(cap_base * cap_pct / 100.0, 2)
         limits.append(_limit_row("position cap", cap, ref, shares_for(cap, ref, lot_size=lot_size),
-                                 "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget, market=market), money(cap, market=market), _price(ref, tick_size))))
+                                 "%s%% of %s = %s / %s" % (_num(cap_pct), cap_base_name, money(cap, market=market), _price(ref, tick_size))))
     max_order = _f(_cfg_money(raw_cfg, c, "max_order", market))
     if max_order:
         limits.append(_limit_row("max order", max_order, ref, shares_for(max_order, ref, lot_size=lot_size),
