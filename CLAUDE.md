@@ -72,7 +72,7 @@ No build step, no package manager, no dependencies to install -- Python 3.8+ sta
 - Long-only execution everywhere; short-side signals (`vwap_rejection`) are analytical only, blocked fail-closed downstream.
 - Options execution (both paths): never happens. Path 1 (`options_orb`) is BUY-CE-analytical-only. Path 2 (`trader-options/`) is decision-support-only by design, regardless of strategy.
 - Options config gates in `trader-options`: `buy_ce_enabled`/`buy_pe_enabled` (default `true`) and `sell_ce_enabled`/`sell_pe_enabled` (default `false` -- gate the Bear Call / Bull Put credit spreads, opt-in since their margin is a heuristic estimate) each suppress that strategy's generation; `max_option_lots` is a hard sizing cap; `max_correlated_exposure_pct` caps capital committed to the broad-index correlation group (all 5 major indices) per sweep. Iron Condor remains unimplemented (needs a 4-leg combined-margin model and a range-bound trigger condition neither exists today).
-- `trader-timemachine` historical replay (`history_replay`) only implements the `orb` setup; other setups return `None`.
+- `trader-timemachine` historical replay covers `orb` (`history_replay`) and the four intraday setups the scanner trades -- `breakout_intraday`, `vwap_reclaim`, `ema_alignment`, `rsi_momentum` -- via `setup_history_replay`, which re-runs `trader-entry`'s own `evaluate()` on past sessions with a horizon matched to the plan. Other setups get the Monte Carlo only.
 - Upstox integration is strictly read-only (GET only) -- never add an order-routing call against it.
 
 ## Guides

@@ -56,6 +56,12 @@ HEARTBEAT_MINUTES = 30
 ERROR_REPEAT_SECONDS = 3600
 MAX_POPUPS_PER_CYCLE = 3
 DEFAULT_UNIVERSE = os.path.join("trader", "universe_nifty200.txt")
+EXIT_SETUPS = ("breakout_intraday", "vwap_reclaim", "ema_alignment", "rsi_momentum")
+# Default exit rule, chosen on a 37-session NIFTY200 backtest (scripts/backtest_intraday.py, 2026-11-17):
+# swing-low stop + 2.2R cut stop-outs from ~64% to ~14-22% vs 1.5xATR + 3R and lifted net expectancy
+# from about -0.2R to about break-even. Re-run the backtest before changing these.
+DEFAULT_STOP = "swing"
+DEFAULT_TARGET_R = 2.2
 
 
 def now_ist():
@@ -163,13 +169,15 @@ class Watcher(object):
         trig = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         return (now - trig).total_seconds() / 60.0
 
-    def exit_plan(self, sym, entry, entry_time, stop_arg):
+    def exit_plan(self, sym, entry, entry_time, stop_arg, setup=None):
         cmd = [sys.executable, os.path.join(BASE_DIR, "trader-exit", "exit.py"), "plan",
                "--symbol", sym, "--entry", str(entry), "--interval", "5m", "--market", "IN",
                "--exchange", "NSE", "--instruments", self.args.instruments,
                "--stop", stop_arg, "--target", "%sR" % self.args.target_r, "--json"]
         if entry_time:
             cmd[cmd.index("--interval"):cmd.index("--interval")] = ["--time", str(entry_time)]
+        if setup in EXIT_SETUPS:   # so the plan (and the Time Machine) knows which setup to replay
+            cmd += ["--setup", setup]
         try:
             out = subprocess.run(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  universal_newlines=True, timeout=60)
@@ -210,7 +218,7 @@ class Watcher(object):
             # --stop/--target flags you'd use in the pipeline -- the watcher computes nothing.
             stop_arg = ("price:%s" % d.get("stop_loss")) if self.args.stop == "scanner" else self.args.stop
             try:
-                ex = self.exit_plan(h.get("symbol"), entry, trig.get("close_time"), stop_arg)
+                ex = self.exit_plan(h.get("symbol"), entry, trig.get("close_time"), stop_arg, h.get("setup"))
             except Exception as e:
                 self.seen.add(key)
                 self.confirmed_rejected += 1
@@ -373,10 +381,11 @@ def main(argv=None):
     ap.add_argument("--budget", type=float, default=2000.0, help="options max-loss budget (INR)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--instruments", default=os.path.join("trader", "state", "instruments.json"))
-    ap.add_argument("--stop", default="atr:1.5",
-                    help="trader-exit stop rule for the plan: 'scanner' (scanner's invalidation level), "
-                         "atr:K, or pct:X (default atr:1.5)")
-    ap.add_argument("--target-r", type=float, default=3.0, help="target in R for trader-exit (default 3)")
+    ap.add_argument("--stop", default=DEFAULT_STOP,
+                    help="trader-exit stop rule for the plan: swing[:N], 'scanner' (scanner's invalidation "
+                         "level), atr:K, or pct:X (default %(default)s)")
+    ap.add_argument("--target-r", type=float, default=DEFAULT_TARGET_R,
+                    help="target in R for trader-exit (default %(default)s)")
     ap.add_argument("--max-trigger-age", type=float, default=10.0,
                     help="only alert on triggers whose candle closed within this many minutes (default 10)")
     ap.add_argument("--setups", default=SETUPS,

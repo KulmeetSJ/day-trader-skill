@@ -553,6 +553,35 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
+def simulate_exit(D, start, last, entry, stop, target, side="buy", breakeven_r=None):
+    """Walk bars D[start..last] (a list or {slot: bar}) for one trade.
+
+    Each bar checks the stop before the target, so a bar that touches both counts
+    as the stop (the conservative call, same as the Monte Carlo). With
+    breakeven_r, once a bar's high reaches entry + breakeven_r x risk the stop moves
+    to the entry from the NEXT bar on (no intrabar look-ahead). Returns
+    (outcome, exit_price, exit_slot), outcome one of "target", "stop",
+    "breakeven" or "close" (still open at the `last` bar's close)."""
+    long = side == "buy"
+    risk = (entry - stop) if long else (stop - entry)
+    cur = stop
+    moved = False
+    for i in range(start, last + 1):
+        b = D[i] if not isinstance(D, dict) else D.get(i)
+        if b is None:
+            continue
+        if (b["l"] <= cur) if long else (b["h"] >= cur):
+            return ("breakeven" if moved else "stop"), cur, i
+        if (b["h"] >= target) if long else (b["l"] <= target):
+            return "target", target, i
+        if breakeven_r is not None and not moved and risk > 0:
+            trig = entry + breakeven_r * risk if long else entry - breakeven_r * risk
+            if (b["h"] >= trig) if long else (b["l"] <= trig):
+                cur, moved = entry, True
+    lb = D[last] if not isinstance(D, dict) else D.get(last)
+    return "close", (lb["c"] if lb else entry), last
+
+
 def history_replay(sessions, rule, last, side="buy"):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
@@ -571,14 +600,8 @@ def history_replay(sessions, rule, last, side="buy"):
         if risk <= 0:
             continue
         t = round(e + rule["target_r"] * risk, 2) if long else round(e - rule["target_r"] * risk, 2)
-        oc = None
-        for b in D[kk + 1:last + 1]:
-            if (b["l"] <= s) if long else (b["h"] >= s):
-                oc = "stop"
-                break
-            if (b["h"] >= t) if long else (b["l"] <= t):
-                oc = "target"
-                break
+        oc, _px, _at = simulate_exit(D, kk + 1, last, e, s, t, side)
+        oc = None if oc == "close" else oc
         cl = D[last]["c"]
         R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
             ((cl - e) if long else (e - cl)) / risk
@@ -736,6 +759,7 @@ def normalize_plan(raw, src="flags", market=None):
         "opening_range": dict(orng, minutes=or_min) if isinstance(orng, dict) else {"minutes": or_min},
         "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m",
         "flat_by": raw.get("flat_by"), "from": src,
+        "atr": raw.get("atr"), "trading_style": raw.get("trading_style"), "swing_bars": raw.get("swing_bars"),
     }
     if market == "IN":
         res_plan["market"] = "IN"
@@ -750,7 +774,11 @@ def resolve_rule(plan, entry_day):
     """The rule the history replay uses: orb, the plan's opening range, its stop rule
     (or_mid, or_low / or_high, or 'pct' = the plan's stop distance as a percent of
     the entry), and the plan's target R. 'auto' works the stop rule out from the
-    plan day's own opening range. None when the setup is not orb."""
+    plan day's own opening range. Intraday setups the scanner trades
+    (SETUP_REPLAY) get a setup rule replayed with trader-entry's own evaluate().
+    None for any other setup."""
+    if plan["setup"].lower() in SETUP_REPLAY:
+        return setup_rule(plan)
     if plan["setup"].lower() != "orb":
         return None
     long = plan["side"] == "buy"
@@ -774,6 +802,226 @@ def resolve_rule(plan, entry_day):
     if rule["stop_rule"] != "pct":
         del rule["stop_pct"]
     return rule
+
+
+# ---------------------------------------------------------------- setup-aware history (intraday setups)
+
+SETUP_REPLAY = ("breakout_intraday", "vwap_reclaim", "ema_alignment", "rsi_momentum")
+SETUP_WINDOW_BARS = 18      # history triggers within +-90 minutes of the plan's entry bar
+MIN_SETUP_TRADES = 8        # fewer than this in the window -> widen to the whole session
+WARMUP_DAYS = 3             # prior days handed to evaluate() for EMA/RSI/ATR warm-up
+ATR_BARS = 14               # same as trader-exit's ATR(14)
+SWING_BARS = 6              # same as trader-exit's `--stop swing`
+SWING_BUFFER_ATR = 0.1
+
+
+def _import_skill(folder, name):
+    d = os.path.join(os.path.dirname(_DIR), folder)
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    return __import__(name)
+
+
+def setup_rule(plan):
+    """History rule for an intraday setup: the plan's setup, its target R, and its
+    stop rule -- k x ATR(14) when trader-exit planned an ATR stop (k = risk / ATR),
+    else the plan's stop distance as a percent of the entry."""
+    rule = {"setup": plan["setup"].lower(), "target_r": plan["target_r"], "window_bars": SETUP_WINDOW_BARS}
+    atr = plan.get("atr")
+    if atr and str(plan.get("stop_rule") or "").lower() in ("atr", "swing"):
+        # Replay at the plan's own stop distance in volatility units (risk / ATR). Re-deriving a
+        # swing stop per past session gave much tighter stops than the trades the budget gate
+        # actually lets through (it over-predicted stop-outs ~3x on the 2026-11 holdout).
+        rule["stop_rule"] = "atr"
+        rule["stop_atr"] = round(plan["risk_per_share"] / float(atr), 3)
+        rule["from_rule"] = str(plan.get("stop_rule")).lower()
+    else:
+        rule["stop_rule"] = "pct"
+        rule["stop_pct"] = round(100.0 * plan["risk_per_share"] / plan["entry"], 4)
+    return rule
+
+
+def _session_atr(D, upto):
+    """trader-exit's ATR(14): true range over the session's bars up to `upto`, first bar = its own range."""
+    trs, prev = [], None
+    for i in range(0, upto + 1):
+        b = D[i] if not isinstance(D, dict) else D.get(i)
+        if b is None:
+            continue
+        tr = b["h"] - b["l"]
+        if prev is not None:
+            tr = max(tr, abs(b["h"] - prev), abs(b["l"] - prev))
+        trs.append(tr)
+        prev = b["c"]
+    use = trs[-ATR_BARS:]
+    return sum(use) / len(use) if use else None
+
+
+def _entry_chart(entry_mod, sym, days, dates, market):
+    """trader-entry chart for the given dates from the time machine's own bars."""
+    open_min = OPEN_MIN_IN if market == "IN" else OPEN_MIN
+    ts, o, h, l, c, v = [], [], [], [], [], []
+    for d in dates:
+        dd = datetime.date.fromisoformat(d)
+        for sl in sorted(days[d]):
+            b = days[d][sl]
+            m = open_min + 5 * sl
+            start = local_to_utc(datetime.datetime(dd.year, dd.month, dd.day, m // 60, m % 60), market=market)
+            ts.append(int(start.replace(tzinfo=datetime.timezone.utc).timestamp()) if start.tzinfo is None
+                      else int(start.timestamp()))
+            o.append(b["o"]); h.append(b["h"]); l.append(b["l"]); c.append(b["c"]); v.append(b.get("v") or 0)
+    meta = {"symbol": sym, "dataGranularity": "5m", "regularMarketPrice": c[-1] if c else None}
+    v8 = {"chart": {"result": [{"meta": meta, "timestamp": ts, "indicators": {"quote": [
+        {"open": o, "high": h, "low": l, "close": c, "volume": v}]}}], "error": None}}
+    chart = entry_mod.parse_chart(json.dumps(v8), sym)
+    chart.update(market=market, provider="offline", source="offline", data_tier="HISTORICAL",
+                 provider_data_status="HISTORICAL", is_live=False, is_offline=True)
+    return chart
+
+
+def setup_history_replay(days, sessions, rule, plan, last):
+    """The plan's own intraday setup on every past full session, through
+    trader-entry's evaluate() -- the same function the live scanner calls.
+
+    A trade is a fresh ENTRY CONFIRMED, actionable trigger at its own bar close,
+    within +-SETUP_WINDOW_BARS of the plan's entry bar (widened to the whole session
+    when that gives fewer than MIN_SETUP_TRADES). Entry = the trigger close, stop by
+    the plan's rule (ATR multiple or percent), target = the plan's R, then
+    simulate_exit() bar by bar for the SAME number of bars the plan has left (its
+    entry bar to --until), so a late entry is judged on a late-entry horizon even
+    when the history trigger came in the morning. Only sessions strictly before
+    the plan's date are used, and evaluate() trims every bar after its own clock."""
+    market = plan.get("market") or "US"
+    open_min = OPEN_MIN_IN if market == "IN" else OPEN_MIN
+    long = plan["side"] == "buy"
+    try:
+        entry_mod = _import_skill("trader-entry", "entry")
+        cfg = entry_mod.read_config(None, market=market)
+    except Exception as e:
+        return {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
+                "note": "skipped: trader-entry is unavailable (%s)" % e}
+    all_dates = sorted(days)
+    k = plan["entry_bar"]
+    cutoff_bar = last - 1
+    nea = cfg.get("no_entries_after")
+    if nea:
+        try:
+            cutoff_bar = min(cutoff_bar, (parse_clock(nea, "no_entries_after", market=market) - open_min) // 5 - 1)
+        except Exception:
+            pass
+
+    def run(lo, hi):
+        trades = []
+        for d, D in sessions:
+            i = all_dates.index(d)
+            if i < WARMUP_DAYS:
+                continue
+            chart = _entry_chart(entry_mod, plan["symbol"], days, all_dates[i - WARMUP_DAYS:i + 1], market)
+            dd = datetime.date.fromisoformat(d)
+            seen = set()
+            for sl in range(max(1, lo), min(hi, cutoff_bar) + 1):
+                m = open_min + 5 * (sl + 1)
+                now = local_to_utc(datetime.datetime(dd.year, dd.month, dd.day, m // 60, m % 60), market=market)
+                try:
+                    res = entry_mod.evaluate(chart, now, setup=rule["setup"], interval="5m", cfg=cfg, market=market,
+                                             trading_style="intraday")
+                except Exception:
+                    continue
+                dec = res.get("decision") or {}
+                tr = res.get("trigger") or {}
+                if res.get("decision_state") != "ENTRY CONFIRMED" or not dec.get("actionable"):
+                    continue
+                if tr.get("close_time") != clock24(m) or tr.get("close_time") in seen:
+                    continue
+                seen.add(tr.get("close_time"))
+                e = float(dec.get("entry_reference") or D[sl]["c"])
+                if rule["stop_rule"] == "atr":
+                    a = _session_atr(D, sl)
+                    if not a:
+                        continue
+                    st = cents_away(e - rule["stop_atr"] * a if long else e + rule["stop_atr"] * a, long)
+                elif rule["stop_rule"] == "swing":
+                    a = _session_atr(D, sl)
+                    lows = [D[j]["l"] for j in range(max(0, sl - rule["swing_bars"] + 1), sl + 1) if j < len(D)]
+                    if not a or not lows or not long:
+                        continue
+                    st = cents_away(min(lows) - SWING_BUFFER_ATR * a, long)
+                else:
+                    frac = rule["stop_pct"] / 100.0
+                    st = cents_away(e * (1 - frac) if long else e * (1 + frac), long)
+                risk = (e - st) if long else (st - e)
+                if risk <= 0:
+                    continue
+                t = round(e + rule["target_r"] * risk, 2) if long else round(e - rule["target_r"] * risk, 2)
+                # same horizon as the plan: a 2:55 PM entry gets the same 5 bars a morning trigger does
+                oc, px, _ = simulate_exit(D, sl + 1, min(last, sl + horizon), e, st, t, plan["side"])
+                R = ((px - e) if long else (e - px)) / risk
+                trades.append({"date": d, "time": clock12(m), "entry": round(e, 2), "stop": st, "target": t,
+                               "outcome": oc, "R": round(R, 2)})
+        return trades
+
+    horizon = last - k
+    w = rule.get("window_bars", SETUP_WINDOW_BARS)
+    trades = run(k - w, k + w)
+    scope = "within %d minutes of %s" % (5 * w, plan["entry_time"])
+    if len(trades) < MIN_SETUP_TRADES:
+        trades = run(1, cutoff_bar)
+        scope = "any time of day (fewer than %d in the +-%d-minute window)" % (MIN_SETUP_TRADES, 5 * w)
+    out = _summarize_history(trades, len(sessions), rule)
+    out["scope"] = scope
+    return out
+
+
+def _summarize_history(trades, n_sessions, rule):
+    win_cnt = sum(1 for x in trades if x["R"] > 0)
+    r_vals = [x["R"] for x in trades]
+    avg_r = round(statistics.mean(r_vals), 3) if trades else None
+    return {"sessions": n_sessions, "triggered": len(trades),
+            "target": sum(1 for x in trades if x["outcome"] == "target"),
+            "stop": sum(1 for x in trades if x["outcome"] == "stop"),
+            "close": sum(1 for x in trades if x["outcome"] == "close"),
+            "green": win_cnt, "win_rate": round(100.0 * win_cnt / len(trades), 1) if trades else 0.0,
+            "avg_R": avg_r, "expectancy": avg_r, "rule": rule, "trades": trades}
+
+
+def cost_in_r(plan, cfg_path=None):
+    """Round-trip Indian charges for this plan as a fraction of its rupee risk, at the
+    qty trader-budget would size (size_trade gives qty even when it refuses on R:R).
+    None outside India or when sizing is unavailable."""
+    if (plan.get("market") or "US") != "IN":
+        return None
+    try:
+        size = _import_skill("trader-budget", "size")
+        cfg = size.load_config(cfg_path, market="IN")
+        sp = {"symbol": plan["symbol"], "side": plan["side"], "entry": plan["entry"], "stop": plan["stop"],
+              "target": plan["target"], "asset_type": "EQUITY", "trading_style": plan.get("trading_style") or "intraday",
+              "market": "IN", "exchange": "NSE", "currency": "INR"}
+        r = size.size_trade(sp, cfg, today=plan["date"], market="IN", trading_style=sp["trading_style"], exchange="NSE")
+        q = r.get("qty") or 0
+        cost = (r.get("transaction_costs") or {}).get("total")
+        if not q or cost is None:
+            return None
+        return round(float(cost) / (q * plan["risk_per_share"]), 4)
+    except Exception:
+        return None
+
+
+def prediction_of(mc, cost_r=None):
+    """The odds the verdict uses: the Monte Carlo (replayed to flat-by for an intraday
+    plan), plus average R after estimated charges when known.
+
+    The setup's own per-stock history is reported but deliberately NOT blended in:
+    on the 2026-09..11 NIFTY200 holdout (scripts/backtest_intraday.py calibrate) its
+    ~25 trades per stock were noisier than the Monte Carlo and every blend weight
+    scored worse (Brier 0.28 -> 0.35 swing stop, 0.515 -> 0.535 ATR stop), while ending
+    the replay at flat-by improved it slightly."""
+    out = {"p_target": mc["p_target"], "p_stop": mc["p_stop"], "p_neither": mc["p_neither"],
+           "avg_R": mc["avg_R"], "source": "Monte Carlo to %s" % (mc.get("until") or "the close"),
+           "r_at_target": mc.get("r_at_target"), "until": mc.get("until")}
+    if cost_r is not None:
+        out["avg_R_net"] = round(mc["avg_R"] - cost_r, 3)
+        out["cost_R"] = cost_r
+    return out
 
 
 # ---------------------------------------------------------------- the run
@@ -908,6 +1156,8 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     k = plan["entry_bar"]
     early = False if market == "IN" else (plan["date"] in NYSE_EARLY_CLOSE)
     end_min = EARLY_MIN if early else close_min
+    if until is None and plan.get("flat_by") and market == "IN":
+        until = plan["flat_by"]        # an intraday plan is flat by then: replay to that bar, not the close
     until_min = end_min if until is None else parse_clock(until, "--until", market=market)
     if (until_min - open_min) % 5 or until_min > end_min:
         raise TMError("--until must be on the 5-minute grid and no later than %s%s"
@@ -939,13 +1189,21 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
               band_times=[clock24(open_min + 5 * (j + 1)) for j in range(k, last + 1)])
     rule = resolve_rule(plan, entry_day)
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
-    if rule:
+    if rule and rule.get("setup") in SETUP_REPLAY:
+        history = setup_history_replay(days, sessions, rule, plan, last)
+    elif rule:
         plan_out["stop_rule"] = rule["stop_rule"]
         history = history_replay(sessions, rule, last, plan["side"])
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
                            "this plan's setup is %r" % plan["setup"]}
+    cost_r = cost_in_r(plan) if market == "IN" else None
+    if cost_r is not None:
+        mc["avg_R_net"] = round(mc["avg_R"] - cost_r, 3)
+        if history.get("avg_R") is not None:
+            history["avg_R_net"] = round(history["avg_R"] - cost_r, 3)
+    prediction = prediction_of(mc, cost_r)
     last_bar = bars[-1]
     last_ts_utc = _bar_end_utc(last_bar, market=market)
     if now_utc is not None and last_ts_utc > now_utc:
@@ -966,6 +1224,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "history": history,
         "verdict": verdict(mc),
         "verdict_notes": verdict_notes(mc),
+        "prediction": prediction,
         "warnings": warn,
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
@@ -1013,7 +1272,20 @@ def report(doc):
         % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
         "",
     ]
-    if h.get("rule"):
+    if h.get("rule") and h["rule"].get("setup") in SETUP_REPLAY:
+        ru = h["rule"]
+        stop_words = ("%g x ATR(14)" % ru["stop_atr"]) if ru["stop_rule"] == "atr" else (
+            ("the %d-bar swing low" % ru["swing_bars"]) if ru["stop_rule"] == "swing" else
+            "%.2f %% from the entry" % ru.get("stop_pct", 0))
+        if h["triggered"]:
+            lines.append("History: %s confirmed (trader-entry's own rule) %d times in those %d real sessions, %s; "
+                         "stop %s, %gR target: %d target, %d stop, %d neither. Average R %+.3f%s."
+                         % (ru["setup"], h["triggered"], h["sessions"], h.get("scope", ""), stop_words, ru["target_r"],
+                            h["target"], h["stop"], h["close"], h["avg_R"],
+                            (", %+.3f after charges" % h["avg_R_net"]) if h.get("avg_R_net") is not None else ""))
+        else:
+            lines.append("History: %s never confirmed in those %d sessions." % (ru["setup"], h["sessions"]))
+    elif h.get("rule"):
         ru = h["rule"]
         stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
                       "or_high": "opening-range high"}.get(ru["stop_rule"],
@@ -1027,6 +1299,13 @@ def report(doc):
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
     else:
         lines.append("History: " + h.get("note", "skipped."))
+    pr = doc.get("prediction") or {}
+    if h.get("rule") and h["rule"].get("setup") in SETUP_REPLAY and h.get("triggered"):
+        lines.append("  (a small per-stock sample: shown for context, not used in the odds -- it predicted worse "
+                     "than the replays in testing)")
+    if pr.get("avg_R_net") is not None:
+        lines.append("After estimated Indian charges (%.3fR a trade) the average R is %+.3f."
+                     % (pr["cost_R"], pr["avg_R_net"]))
     lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
     for w in doc.get("warnings") or []:
         lines.append("Note: " + w + ".")

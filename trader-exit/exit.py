@@ -77,6 +77,8 @@ DEFAULT_EXIT_STATE = "trader/state/exit_decisions.json"
 DEFAULTS = {"flat_by": "15:55", "min_reward_risk": 2.0}
 DEFAULTS_IN = {"flat_by": "15:20", "min_reward_risk": 2.0}
 ATR_BARS = 14
+SWING_BARS = 6                     # swing stop: lowest low of the entry bar and the 5 before it
+SWING_BUFFER_ATR = Decimal("0.1")  # ... minus 0.1 x ATR(14), so a wick to the exact low doesn't stop you
 MIN_RISK_PCT = Decimal("0.05")     # risk under 0.05% of the price is inside the spread's noise
 CENT = Decimal("0.01")
 TICK_IN = Decimal("0.05")
@@ -416,9 +418,17 @@ def parse_stop(text):
         return "or_low", None
     if t in ("breakout-invalidation", "breakout_invalidation", "invalidation"):
         return "breakout_invalidation", None
+    if t == "swing":
+        return "swing", D(SWING_BARS)
+    m = re.match(r"^swing:\s*([0-9]+)$", t)
+    if m:
+        n = int(m.group(1))
+        if not 2 <= n <= 30:
+            raise PlanError("--stop swing:N needs N from 2 to 30 bars")
+        return "swing", D(n)
     m = re.match(r"^(price|pct|atr):\s*(?:\$|\u20b9|rs\.?\s*)?([0-9][0-9,]*\.?[0-9]*)$", t)
     if not m:
-        raise PlanError("--stop is or-mid, or-low, price:X, pct:X or atr:K (got %r)" % text)
+        raise PlanError("--stop is or-mid, or-low, swing[:N], price:X, pct:X or atr:K (got %r)" % text)
     kind, val = m.group(1), D(m.group(2), "--stop")
     if val <= 0:
         raise PlanError("--stop %s needs a number above 0" % kind)
@@ -447,7 +457,7 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None, market="US", tick_size=None, min_reward_risk=2.0):
+            atr=None, atr_bars=None, market="US", tick_size=None, min_reward_risk=2.0, swing_low=None):
     """The stop, the target and the risk, in exact ticks. Raises PlanError with the reason."""
     if tick_size is not None:
         if isinstance(tick_size, bool):
@@ -496,6 +506,15 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         label = "%s x ATR(%d) under the entry" % (num(stop_param), atr_bars)
         detail = "ATR %s%s over the %d bars to the entry%s" % (
             curr, num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
+    elif stop_rule == "swing":
+        if atr is None or atr_bars is None or swing_low is None:
+            raise PlanError("a swing stop needs the session's bars")
+        a = D(round(atr, 6))
+        sl = D(str(swing_low))
+        raw = sl - SWING_BUFFER_ATR * a
+        label = "swing low of the last %d bars minus %s x ATR(%d)" % (int(stop_param), num(SWING_BUFFER_ATR), atr_bars)
+        detail = "low %s%s - %s x ATR %s%s" % (curr, num(sl), num(SWING_BUFFER_ATR), curr,
+                                               num(a.quantize(Decimal("0.0001"))))
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
     stop = floor_tick(raw, tick)
@@ -1048,7 +1067,7 @@ def build_plan(a, now_utc=None):
         elif info["setup"] == "breakout_20d" and (info.get("doc") or {}).get("invalidation_level") is not None:
             stop_text = "breakout-invalidation"
         else:
-            raise PlanError("a %s setup has no opening-range stop to default to: give --stop price:X, pct:X or atr:K"
+            raise PlanError("a %s setup has no opening-range stop to default to: give --stop swing, price:X, pct:X or atr:K"
                             % info["setup"])
     stop_rule, stop_param = parse_stop(stop_text)
     if stop_rule == "breakout_invalidation":
@@ -1088,29 +1107,31 @@ def build_plan(a, now_utc=None):
                 "Entry time %s on %s is after simulated time %s (look-ahead blocked)"
                 % (ampm(entry_time), day.isoformat(), sim_local.strftime("%Y-%m-%d %H:%M:%S"))
             )
-    atr = atr_n = None
+    atr = atr_n = swing_low = None
     chart_provider = None
     chart_last_ts_iso = None
-    if stop_rule == "atr":
+    if stop_rule in ("atr", "swing"):
         atr_now = now_utc if explicit_now else None
         chart = load_chart(info["symbol"], info["interval"], day, a.offline, market=market, cfg=cfg_market, now_utc=atr_now)
         chart_provider = chart.get("provider")
         bars = session_bars(chart, day, info["interval"], info["entry_bar"], atr_now, market=market)
         if len(bars) < 3:
             raise PlanError(
-                "an atr stop needs at least 3 closed %s bars of %s on %s%s; found %d"
-                % (info["interval"], info["symbol"], day,
+                "an %s stop needs at least 3 closed %s bars of %s on %s%s; found %d"
+                % (stop_rule, info["interval"], info["symbol"], day,
                    " by the cutoff (%s)" % sim_local.strftime("%Y-%m-%d %H:%M:%S") if explicit_now else " by the entry",
                    len(bars))
             )
         atr, atr_n = atr_of(bars)
+        if stop_rule == "swing":
+            swing_low = min(b["l"] for b in bars[-int(stop_param):])
         last_bar_end = utc_of(bars[-1]["t"] + INTERVALS[info["interval"]])
         if atr_now is not None and last_bar_end > atr_now:
             last_bar_end = atr_now
         chart_last_ts_iso = chart.get("last_data_timestamp") or _market_iso(last_bar_end, market=market)
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n, market=market, tick_size=tick_size,
-                min_reward_risk=cfg_market.get("min_reward_risk", 2.0))
+                min_reward_risk=cfg_market.get("min_reward_risk", 2.0), swing_low=swing_low)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(round_tick(info["or_high"], tick=c["tick_size"])),
@@ -1149,6 +1170,9 @@ def build_plan(a, now_utc=None):
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
+    if stop_rule == "swing":
+        plan["swing_bars"] = int(stop_param)
+        plan["swing_low"] = float(swing_low)
     d = info.get("doc") or {}
     for k in ("is_market_open", "is_live_data", "is_historical_analysis", "is_live_signal",
               "is_fixture", "data_tier", "last_trading_session", "last_data_timestamp",
@@ -1948,7 +1972,7 @@ def main(argv=None):
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument(
         "--setup",
-        choices=["orb", "level", "breakout_20d", "ma_crossover", "trend", "rsi_momentum", "options_orb"],
+        choices=["orb", "level", "breakout_20d", "breakout_intraday", "vwap_reclaim", "ema_alignment", "ma_crossover", "trend", "rsi_momentum", "options_orb"],
     )
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")

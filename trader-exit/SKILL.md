@@ -31,6 +31,7 @@ and a neat plan does not change that.
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/entry.json: midpoint stop, 2R target
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 2R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo or --offline)
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop swing --target 2.2R --setup vwap_reclaim  # intraday-setup default
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --market IN --exchange NSE --instruments trader/state/instruments.json --entry 2950.10 --or-high 2950 --or-low 2920 --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --trading-style positional --market IN --exchange NSE --symbol RELIANCE --entry 2950.10 --stop pct:2 --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol TSLA --entry 364.18 --or-high 362.18 --or-low 354.47
@@ -64,6 +65,7 @@ entry.json), `--offline PATH` (bars for `atr:K`), `--now "2026-10-19 10:15"`,
 | `price:X` | your price |
 | `pct:X` | X percent under the entry |
 | `atr:K` | K times the 14-bar ATR under the entry, on the session's bars up to the entry bar |
+| `swing` / `swing:N` | the lowest low of the entry bar and the N-1 bars before it (default N = 6), minus 0.1 x ATR(14). The default stop for the intraday setups (`breakout_intraday`, `vwap_reclaim`, `ema_alignment`, `rsi_momentum`) in `scripts/market_watch.py`. On a 37-session NIFTY 200 backtest (`scripts/backtest_intraday.py`) it cut stop-outs from about 64% to 14-22% vs `atr:1.5` + 3R, and net expectancy rose from about -0.2R to about break-even. That is not a proven edge. |
 
 A level setup has no opening range to lean on, so it needs a stop you name.
 

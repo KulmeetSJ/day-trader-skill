@@ -102,7 +102,14 @@ class Math(unittest.TestCase):
             c(364.18, "price:364.00")
         with self.assertRaises(exitp.PlanError):
             c(358.00, "or-mid")                                     # the midpoint is above this entry
-        for bad in ("mid-ish", "pct:100", "price:0", "atr:-1"):
+        self.assertEqual(exitp.parse_stop("swing"), ("swing", Decimal(6)))
+        self.assertEqual(exitp.parse_stop("swing:4"), ("swing", Decimal(4)))
+        with self.assertRaises(exitp.PlanError):
+            c(364.18, "swing", atr=3.0, n=9)                       # a swing stop needs the swing low
+        sw = exitp.compute(364.18, "swing", Decimal(6), "r", Decimal(2), atr=3.0, atr_bars=9, swing_low=360.0)
+        self.assertEqual(sw["stop"], Decimal("359.70"))             # 360.00 - 0.1 x 3.00
+        self.assertEqual(sw["target"], Decimal("373.14"))           # 2R on a 4.48 risk
+        for bad in ("mid-ish", "pct:100", "price:0", "atr:-1", "swing:1", "swing:31"):
             with self.assertRaises(exitp.PlanError):
                 exitp.parse_stop(bad)
         for bad in ("0R", "R", "lots", "price:x"):
@@ -206,6 +213,25 @@ class Cli(unittest.TestCase):
         code, _, err = self.plan("--stop", "atr:1.5", "--offline", TSLA, "--entry-bar", "1")
         self.assertEqual(code, 1)
         self.assertIn("at least 3 closed", err)
+
+    def test_swing_stop_reads_bars(self):
+        self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
+        code, text, err = self.plan("--stop", "swing", "--offline", TSLA, "--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        ch = exitp.load_chart("TSLA", "5m", None, TSLA)
+        bars = exitp.session_bars(ch, exitp.datetime.date(2026, 10, 19), "5m", upto_slot=8)
+        atr, n = exitp.atr_of(bars)
+        low = min(b["l"] for b in bars[-6:])
+        self.assertEqual(p["stop_rule"], "swing")
+        self.assertEqual(p["swing_bars"], 6)
+        self.assertAlmostEqual(p["swing_low"], low, places=4)
+        self.assertEqual(Decimal(str(p["stop"])),
+                         exitp.floor_tick(Decimal(str(low)) - Decimal("0.1") * Decimal(str(round(atr, 6))),
+                                          exitp.CENT))
+        self.assertLess(p["stop"], 364.18)
+        code, _, err = self.plan("--stop", "swing:3", "--offline", TSLA, "--json")
+        self.assertEqual(code, 0, err)
 
     def test_refusals_from_the_cli(self):
         self.write(os.path.join("trader", "entry.json"), dict(REEL_ENTRY, status="waiting", time=None, price=None,

@@ -1094,6 +1094,21 @@ def _infer_exchange_in(symbol, exchange=None, chart=None, cfg=None, market="US")
     return "NSE" if market == "IN" else "NYSE"
 
 
+_TICK_MEMO = {}
+
+
+def _tick_memo_key(inst_path, symbol, exchange, as_of):
+    """Key for a resolved tick: the cache file's identity (path, mtime, size) plus the
+    lookup. Scanning 200 symbols x 4 setups otherwise re-parsed the ~5,000-record
+    instrument master on every evaluate() call (~90% of its runtime). Only successful
+    resolutions are memoized; failures re-run and raise every time (fail-closed)."""
+    try:
+        st = os.stat(inst_path)
+    except OSError:
+        return None
+    return (os.path.abspath(inst_path), st.st_mtime_ns, st.st_size, symbol, exchange, as_of)
+
+
 def _resolve_entry_tick(symbol, market="US", chart=None, cfg=None, exchange=None,
                         instruments_path=None, tick_size=None, eval_day=None):
     """Return (eff_tick, explicit_resolved, eff_exchange)."""
@@ -1121,9 +1136,16 @@ def _resolve_entry_tick(symbol, market="US", chart=None, cfg=None, exchange=None
             meta_err_cls = getattr(instruments, "InstrumentMetadataError", Exception)
             try:
                 as_of = eval_day.isoformat() if hasattr(eval_day, "isoformat") else eval_day
+                memo_key = _tick_memo_key(inst_path, symbol, eff_exch, as_of)
+                if memo_key is not None and memo_key in _TICK_MEMO:
+                    return _TICK_MEMO[memo_key]
                 cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=as_of)
                 rec = instruments.resolve_instrument(symbol, cache_payload=cache, require_intraday=False, exchange=eff_exch)
-                return _validate_tick_value(rec.get("tick_size"), context="instrument master (%s)" % (rec.get("exchange") or eff_exch)), True, (rec.get("exchange") or eff_exch)
+                out = (_validate_tick_value(rec.get("tick_size"), context="instrument master (%s)" % (rec.get("exchange") or eff_exch)),
+                       True, (rec.get("exchange") or eff_exch))
+                if memo_key is not None:
+                    _TICK_MEMO[memo_key] = out
+                return out
             except tick_err_cls as exc:
                 raise EntryError(str(exc))
             except meta_err_cls as exc:
