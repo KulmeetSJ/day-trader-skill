@@ -39,7 +39,34 @@ import scan
 from options import OptionsIntelligenceSpecialist, DEFAULT_MAX_LOSS_INR
 
 
-DEFAULT_SCAN_UNIVERSE = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS"]
+# All five NSE/BSE index derivatives this system has authoritative expiry/lot metadata for
+# (per trader-alerts/instruments.py and the readiness check's "Derivatives & Expiry Metadata"
+# section) -- previously only NIFTY/BANKNIFTY/FINNIFTY were scanned by default, silently omitting
+# MIDCPNIFTY and SENSEX from every "scan the market" / "best trade" request.
+MAJOR_INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"]
+
+DEFAULT_SCAN_UNIVERSE = MAJOR_INDICES + ["RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS"]
+
+# Rejection-reason prefixes that a human with more capital, a bigger risk budget, or looser
+# directional conviction could plausibly override -- i.e. nothing structurally wrong with the
+# data/contract/liquidity, just "didn't clear the configured bar today." A rejected candidate is
+# shown in full in the report only if EVERY one of its reasons falls in this set; otherwise it's
+# collapsed to a one-line count so the report highlights near-misses instead of burying them under
+# candidates that failed for hard, non-negotiable reasons (missing data, naked-option prohibition,
+# stale quotes, etc).
+SOFT_REJECTION_PREFIXES = (
+    "RISK_EXCEEDS_BUDGET", "DAILY_LOSS_LIMIT_EXCEEDED", "INSUFFICIENT_CAPITAL",
+    "RR_BELOW_MINIMUM", "ZERO_LOT_ALLOCATION", "INSUFFICIENT_REMAINING_CAPITAL",
+    "TRADE_RISK_EXCEEDS_BUDGET", "MAX_OPEN_POSITIONS_REACHED", "INSUFFICIENT_PORTFOLIO_CASH",
+    "MAX_CORRELATED_EXPOSURE_EXCEEDED",
+)
+
+
+def _is_soft_rejection(reasons):
+    """True only if every rejection reason is budget/capital/R:R-driven (see SOFT_REJECTION_PREFIXES)."""
+    if not reasons:
+        return False
+    return all(any(r.startswith(p) for p in SOFT_REJECTION_PREFIXES) for r in reasons)
 
 
 class ScanLockError(RuntimeError):
@@ -184,7 +211,7 @@ class ScanLock:
 
 def get_fo_scan_universe(include_stocks: bool = True) -> List[str]:
     """Dynamically load eligible Indian F&O universe (indices + liquid F&O stocks)."""
-    core_indices = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    core_indices = list(MAJOR_INDICES)
     if not include_stocks:
         return core_indices
     try:
@@ -199,7 +226,7 @@ def get_fo_scan_universe(include_stocks: bool = True) -> List[str]:
             return combined
     except Exception:
         pass
-    return ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS", "SBIN", "BHARTIARTL", "LT", "TATAMOTORS"]
+    return MAJOR_INDICES + ["RELIANCE", "INFY", "HDFCBANK", "ICICIBANK", "TCS", "SBIN", "BHARTIARTL", "LT", "TATAMOTORS"]
 
 
 class MarketIntelligenceOrchestrator:
@@ -369,7 +396,7 @@ class MarketIntelligenceOrchestrator:
         if sym:
             eval_symbols = [sym]
         elif intent == "bearish_fo":
-            eval_symbols = [s for s in get_fo_scan_universe(include_stocks=True) if s not in ("NIFTY", "BANKNIFTY", "FINNIFTY")][:12]
+            eval_symbols = [s for s in get_fo_scan_universe(include_stocks=True) if s not in MAJOR_INDICES][:12]
         elif universe:
             eval_symbols = universe
         else:
@@ -389,6 +416,15 @@ class MarketIntelligenceOrchestrator:
             scan_strategies = ["breakdown_intraday", "vwap_rejection", "orb_breakdown"]
         elif bias == "BULLISH":
             scan_strategies = ["breakout_intraday", "vwap_reclaim", "orb"]
+
+        # Broad market regime: computed once per sweep (not once per symbol -- that would mean
+        # re-fetching 5 indices' daily bars for every evaluated symbol). Non-blocking context,
+        # threaded into every signal below via analyze_symbol_for_options(broad_regime=...).
+        try:
+            broad_regime = scan.get_broad_market_regime(market="IN", now=now_utc).get("canonical_regime")
+        except Exception:
+            broad_regime = None
+        broad_regime = broad_regime or "UNCERTAIN"
 
         scan_errors = []
         try:
@@ -425,6 +461,7 @@ class MarketIntelligenceOrchestrator:
                     now_utc=now_utc,
                     portfolio_path=self.portfolio_path,
                     broker_state_path=self.broker_state_path,
+                    broad_regime=broad_regime,
                 )
                 if res.get("status") == "OPPORTUNITIES_IDENTIFIED":
                     sigs = res.get("signals", [])
@@ -492,10 +529,12 @@ class MarketIntelligenceOrchestrator:
             coverage_pct=coverage_pct,
             total_signals=len(actionable_signals),
             scan_errors=scan_errors,
+            broad_regime=broad_regime,
         )
 
         return {
             "query": query,
+            "broad_market_regime": broad_regime,
             "session_status": session_label,
             "total_eligible": total_eligible,
             "passed_to_scanner": passed_to_scanner,
@@ -512,6 +551,19 @@ class MarketIntelligenceOrchestrator:
             "report_markdown": report_text,
         }
 
+    @staticmethod
+    def _correlation_group(underlying: str) -> str:
+        """
+        Correlation bucket for concentration limiting. All 5 major indices move together as one
+        systemic market-risk bet (objectively true -- no data needed to assert this), so they
+        share one group. Individual stocks get their own symbol as their group: this system has
+        no verified per-stock sector classification data (checked trader-alerts/instruments.py --
+        no sector field exists), so sector-level correlation (e.g. two different banking stocks)
+        is NOT modeled here. Fabricating a sector map without real data would be exactly the kind
+        of guess this project has repeatedly committed to not making.
+        """
+        return "BROAD_INDEX_NIFTY_FAMILY" if underlying in MAJOR_INDICES else underlying
+
     def allocate_portfolio_across_shortlist(
         self,
         shortlist: List[Dict[str, Any]],
@@ -519,33 +571,48 @@ class MarketIntelligenceOrchestrator:
         available_capital: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        Allocate portfolio risk budget and capital across shortlisted candidates sequentially (N-4).
+        Allocate portfolio risk budget and capital across shortlisted candidates sequentially (N-4),
+        now also enforcing config's max_correlated_exposure_pct (previously declared but never
+        enforced anywhere in trader-options -- see _correlation_group()'s docstring for scope).
         If a candidate receives 0 lots, marks is_actionable=False, signal_state='SIGNAL REJECTED',
         and moves candidate from shortlist to rejected_signals.
         """
+        total_capital = available_capital if available_capital is not None else self.specialist.available_capital
         remaining_budget = budget
-        remaining_capital = available_capital if available_capital is not None else self.specialist.available_capital
+        remaining_capital = total_capital
+        max_corr_pct = float(self.specialist.config.get("max_correlated_exposure_pct") or 40.0)
+        group_cap_capital = total_capital * (max_corr_pct / 100.0)
+        group_allocated_capital: Dict[str, float] = {}
         final_shortlist = []
         newly_rejected = []
         for sig in shortlist:
             ps = sig.get("position_sizing", {})
             net_risk_1_lot = ps.get("net_risk_per_lot_inr", 0.0)
             cap_req_1_lot = ps.get("capital_required_per_lot", 0.0)
+            group = self._correlation_group(sig.get("underlying_instrument"))
+            group_used = group_allocated_capital.get(group, 0.0)
+            group_remaining = max(0.0, group_cap_capital - group_used)
+
             if net_risk_1_lot > 0:
                 port_lots_by_risk = int(remaining_budget // net_risk_1_lot)
             else:
                 port_lots_by_risk = 0
             if cap_req_1_lot > 0:
                 port_lots_by_cap = int(remaining_capital // cap_req_1_lot)
+                port_lots_by_corr = int(group_remaining // cap_req_1_lot)
             else:
                 port_lots_by_cap = 0
-            port_permitted_lots = max(0, min(port_lots_by_risk, port_lots_by_cap))
+                port_lots_by_corr = 0
+            port_permitted_lots = max(0, min(port_lots_by_risk, port_lots_by_cap, port_lots_by_corr))
             initial_lots = ps.get("final_permitted_lots", 0)
             allocated_lots = min(initial_lots, port_permitted_lots)
             ps["portfolio_permitted_lots"] = port_permitted_lots
             ps["final_permitted_lots"] = allocated_lots
             ps["lots"] = allocated_lots
             ps["total_quantity"] = allocated_lots * ps.get("lot_size", 1)
+            ps["correlation_group"] = group
+            ps["correlation_group_limit_pct"] = max_corr_pct
+            ps["correlation_group_capital_used_inr"] = round(group_used, 2)
 
             if allocated_lots <= 0:
                 sig["is_actionable"] = False
@@ -554,6 +621,12 @@ class MarketIntelligenceOrchestrator:
                 if port_lots_by_risk <= 0:
                     reasons.append(
                         f"ZERO_LOT_ALLOCATION: Remaining portfolio risk budget (Rs {remaining_budget:,.2f}) insufficient for 1 lot (Rs {net_risk_1_lot:,.2f})"
+                    )
+                elif port_lots_by_corr <= 0 and port_lots_by_cap > 0:
+                    reasons.append(
+                        f"MAX_CORRELATED_EXPOSURE_EXCEEDED: Correlated group '{group}' already has Rs {group_used:,.2f} "
+                        f"allocated against a {max_corr_pct:.0f}% of capital limit (Rs {group_cap_capital:,.2f}); "
+                        f"no room left for 1 more lot (Rs {cap_req_1_lot:,.2f}) in this same group"
                     )
                 elif port_lots_by_cap <= 0:
                     reasons.append(
@@ -568,6 +641,7 @@ class MarketIntelligenceOrchestrator:
                 allocated_cap = allocated_lots * cap_req_1_lot
                 remaining_budget = max(0.0, remaining_budget - allocated_risk)
                 remaining_capital = max(0.0, remaining_capital - allocated_cap)
+                group_allocated_capital[group] = group_used + allocated_cap
                 final_shortlist.append(sig)
 
         return final_shortlist, newly_rejected
@@ -588,12 +662,17 @@ class MarketIntelligenceOrchestrator:
         total_signals: int = 0,
         total_evaluated: Optional[int] = None,
         scan_errors: Optional[List[str]] = None,
+        broad_regime: Optional[str] = None,
     ) -> str:
         eval_count = total_evaluated if total_evaluated is not None else passed_to_scanner
         lines = [
             f"# INTRADAY TRADING INTELLIGENCE REPORT",
-            f"**Session**: {session_label} | **Query**: *\"{query}\"*",
-            f"**Execution Boundary**: Analytical decision-support only. Live broker order placement remains disabled.\n",
+            f"**Session**: {session_label} | **Query**: *\"{query}\"* | **Broad Market Regime**: {broad_regime or 'UNCERTAIN'}",
+            f"**Execution Boundary**: Analytical decision-support only. Live broker order placement remains disabled.",
+            f"**On \"Score\" / ranking**: the Score ranking candidates below is a disclosed composite of net reward-to-risk, "
+            f"risk structure (defined vs. undefined risk), and data freshness -- it is **not** a probability of profit. "
+            f"No historical win-rate or backtested probability exists for live options premiums in this system; the #1-ranked "
+            f"candidate is the one that best satisfies the stated risk rules today, not the one most likely to make money.\n",
             f"## 1. Market Overview & Universe Scanned",
             f"Evaluated **{eval_count}** key instruments (core scan universe out of {total_eligible} eligible F&O instruments, {(eval_count / total_eligible) * 100:.1f}% coverage). Discovered **{total_signals}** actionable options candidates.\n",
             f"- **Total Eligible F&O Universe**: {total_eligible} instruments",
@@ -655,11 +734,14 @@ class MarketIntelligenceOrchestrator:
                     f"  - Latest Available Candle: Spot ₹{trig.get('current_spot', 0):.2f} @ {trig.get('latest_candle_time', 'N/A')}",
                     f"  - Invalidation Level: Spot ₹{evidence.get('invalidation_level', 0):.2f} | Support/Resistance: Spot ₹{evidence.get('support_resistance_level', 0):.2f}",
                     f"  - Strike Selection Rationale: *{evidence.get('strike_selection_rationale')}*",
+                    f"- **Regime Context**: *{(sig.get('regime_context') or {}).get('regime_note', 'N/A')}*",
                     f"- **Execution Price Reconciliation ({exec_title})**:",
                     f"  - {prem_label}: **₹{sig['current_premium']:.2f}** {prem_note}",
                     f"  - Conservative Baseline: `{recon.get('baseline_quote_type')}` ₹{recon.get('baseline_quote_price', 0):.2f} | Slippage Applied: {recon.get('slippage_applied', 0):+.2f}",
                     f"  - Order Book Quotes: Bid: ₹{recon.get('bid', 0):.2f} | Ask: ₹{recon.get('ask', 0):.2f} (Spread: ₹{recon.get('spread_points', 0):.2f} / {recon.get('spread_pct', 0)}%)",
                     f"  - Quote Verifiability: *{recon.get('executable_note', '')}*",
+                    f"  - **VALID ENTRY RANGE: ₹{(sig.get('option_entry_range') or {}).get('min', 0):.2f} to ₹{(sig.get('option_entry_range') or {}).get('max', 0):.2f}** "
+                    f"(ideal ₹{(sig.get('option_entry_range') or {}).get('ideal', 0):.2f}) -- *{(sig.get('option_entry_range') or {}).get('instruction', '')}*",
                     f"- **Premium Exit Modeling & Net R:R**:",
                     f"  - Stop Loss: **₹{sig['stop_loss']:.2f}** | Target 1: ₹{sig['target_1']:.2f} | Target 2: ₹{sig['target_2']:.2f}",
                     f"  - Net Risk-to-Reward: **{sig['expected_risk_reward_after_charges']}:1** *(Net of STT, NSE charges, SEBI, Stamp Duty, GST, Brokerage)*",
@@ -680,6 +762,9 @@ class MarketIntelligenceOrchestrator:
                     f"Risk Budget Permitted: {ps.get('risk_budget_permitted_lots', ps['lots'])} lots, "
                     f"Capital Permitted: {ps.get('capital_permitted_lots', ps['lots'])} lots, "
                     f"Final Permitted: {ps.get('final_permitted_lots', ps['lots'])} lots]",
+                    f"  - Correlated Exposure: group `{ps.get('correlation_group', 'N/A')}` -- "
+                    f"₹{ps.get('correlation_group_capital_used_inr', 0):,.2f} already committed to this group "
+                    f"before this trade, capped at {ps.get('correlation_group_limit_pct', 40):.0f}% of capital",
                     f"  - Tail Risk Disclosure: *{m_details.get('tail_risk')}*",
                     f"- **Auditable Data Provenance**:",
                     f"  - Provider: `{prov.get('data_provider')}` | Provenance: `{prov.get('quote_provenance', 'UPSTOX_REST_SNAPSHOT')}` | Tier: `{prov.get('data_tier')}` | Session: `{prov.get('market_session_status')}`",
@@ -691,12 +776,34 @@ class MarketIntelligenceOrchestrator:
                 ])
 
         if rejected_signals:
-            lines.append("## 3. Filtered & Rejected Candidates (Diagnostic Audit)\n")
-            lines.append("| Underlying | Strategy | Strike | State | Reasons |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            for r_sig in rejected_signals[:10]:
-                r_reasons = "; ".join(r_sig.get("rejection_reasons", [])) or "Risk or liquidity criteria not met"
-                lines.append(f"| **{r_sig.get('underlying_instrument')}** | `{r_sig.get('strategy')}` | {r_sig.get('strike')} | `{r_sig.get('signal_state')}` | {r_reasons} |")
+            near_miss = [s for s in rejected_signals if _is_soft_rejection(s.get("rejection_reasons"))]
+            hard_blocked = [s for s in rejected_signals if s not in near_miss]
+
+            lines.append("## 3. Near-Miss Candidates (Diagnostic Audit)\n")
+            lines.append(
+                "Rejected only for budget, capital, or reward-to-risk reasons -- nothing structurally "
+                "wrong with the data or contract. These are the ones worth a second look if you can "
+                "flex budget or risk tolerance.\n"
+            )
+            if near_miss:
+                lines.append("| Underlying | Strategy | Strike | Regime | Reasons |")
+                lines.append("| :--- | :--- | :--- | :--- | :--- |")
+                for r_sig in near_miss[:10]:
+                    r_reasons = "; ".join(r_sig.get("rejection_reasons", []))
+                    rc = r_sig.get("regime_context") or {}
+                    regime_tag = "ALIGNED" if rc.get("regime_aligned") else ("MISALIGNED" if rc.get("regime_aligned") is False else "N/A")
+                    lines.append(f"| **{r_sig.get('underlying_instrument')}** | `{r_sig.get('strategy')}` | {r_sig.get('strike')} | {regime_tag} | {r_reasons} |")
+                if len(near_miss) > 10:
+                    lines.append(f"\n*(+{len(near_miss) - 10} more near-miss candidates not shown)*")
+            else:
+                lines.append("*(None -- every rejected candidate failed for a structural reason, not just budget/R:R.)*")
+
+            if hard_blocked:
+                lines.append(
+                    f"\n*{len(hard_blocked)} other candidate(s) rejected for structural reasons (missing/stale data, "
+                    f"naked-option prohibition, liquidity, expiry-day cutoff, etc.) -- not shown individually; "
+                    f"these would not become tradeable with more capital or risk tolerance.*"
+                )
             lines.append("")
             checklist_section_num = 4
         else:
@@ -719,12 +826,17 @@ def main(argv=None):
     ap.add_argument("query", nargs="*", default=["Scan the market for the best intraday opportunities."], help="Natural language request")
     ap.add_argument("--top", "-n", type=int, default=3, help="Number of ranked opportunities to return")
     ap.add_argument("--budget", type=float, default=DEFAULT_MAX_LOSS_INR, help="Max loss risk budget in INR")
+    ap.add_argument(
+        "--indexes-only", action="store_true",
+        help="Scan only the 5 major index derivatives (%s) instead of indexes + F&O stocks" % ", ".join(MAJOR_INDICES),
+    )
 
     args = ap.parse_args(argv)
     query_str = " ".join(args.query) if isinstance(args.query, list) else str(args.query)
+    universe = list(MAJOR_INDICES) if args.indexes_only else None
 
     with MarketIntelligenceOrchestrator() as orchestrator:
-        res = orchestrator.run_market_intelligence(query=query_str, top_n=args.top, budget=args.budget)
+        res = orchestrator.run_market_intelligence(query=query_str, universe=universe, top_n=args.top, budget=args.budget)
         print(res["report_markdown"])
     return 0
 

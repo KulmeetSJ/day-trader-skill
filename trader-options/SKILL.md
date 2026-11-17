@@ -42,8 +42,13 @@ Status key: **ACTIONABLE** = can reach `SIGNAL VALIDATED`/`is_actionable: true`.
    - **Bull Call Spread (Debit)**: Buy ATM CE + Sell OTM2 CE. Capped upside, strictly capped max loss. Note: the spread's reward/R:R is currently derived by scaling the primary leg's own modeled premium move rather than independently projecting both legs' Greeks -- an approximation, not a full two-leg model.
    - **Bear Put Spread (Debit)**: Buy ATM PE + Sell OTM2 PE. Capped downside profit, strictly capped max loss. Same single-leg-derived R:R approximation as above.
 
-6. **Credit Spreads and Iron Condor** -- NOT IMPLEMENTED:
-   - **Bear Call Credit Spread**, **Bull Put Credit Spread**, **Iron Condor**: these strategy constants exist in `options.py` (`STRATEGY_BEAR_CALL_SPREAD`, `STRATEGY_BULL_PUT_SPREAD`, `STRATEGY_IRON_CONDOR`) and their margin/charges math is written, but `analyze_symbol_for_options` never generates a signal for any of them. No contract will ever appear with these strategies today. `sell_ce_enabled`/`sell_pe_enabled` in config are reserved for gating these once implemented -- they currently have no effect on anything the engine actually produces.
+6. **Defined-Risk Credit Spreads** -- ACTIONABLE, but **OFF by default**:
+   - **Bear Call Credit Spread**: Sell OTM1 CE + Buy OTM2 CE. Gated by config `sell_ce_enabled` (default `false`). Not subject to `NAKED_OPTION_PROHIBITED` -- it has a genuine long protective leg, structurally validated (hedge must be a higher-strike call) before any signal is produced.
+   - **Bull Put Credit Spread**: Sell OTM1 PE + Buy OTM2 PE. Gated by config `sell_pe_enabled` (default `false`). Same structural validation, mirrored (hedge must be a lower-strike put).
+   - Margin for both is a **heuristic estimate** (`HEURISTIC_MARGIN_ESTIMATE`, `max_loss x 1.10`), same disclosure pattern as naked selling's margin estimate -- the margin shown here may not match what your broker actually requires. Turning these on means being comfortable with that estimate being approximate, not authoritative.
+
+7. **Iron Condor** -- NOT IMPLEMENTED:
+   - `STRATEGY_IRON_CONDOR` exists as a constant only. Building this properly needs two things this system doesn't have yet: a genuine 4-leg combined-margin/P&L model (simply showing the Bear Call + Bull Put spreads above side by side would understate the real position's margin efficiency, which is the whole point of combining them into one exchange position), and a non-directional/range-bound trigger condition -- today's scanner only detects directional (bullish/bearish) setups, never "sideways."
 
 ---
 
@@ -127,7 +132,7 @@ Every trade proposal evaluates the full schedule of Indian regulatory levies and
 - **Data Provenance & Freshness Gating**: Only real-time live quotes during open market hours can produce `SIGNAL VALIDATED`. Historical or closed-session quotes produce `HISTORICAL ANALYSIS` or `SIGNAL REJECTED`.
 - **Zero Fabrication**: No dummy setups are created if underlying chart data is missing. Missing chart returns `NO TRADE / MISSING_UNDERLYING_CHART`. Premium models never use arbitrary percentage stops/targets. When the Delta/Gamma model cannot produce a viable stop/target (`MODEL_UNAVAILABLE`), `stop_loss`/`target_1`/`target_2`/net R:R are reported as `None`/`N/A`, never as a fabricated `0.0` -- a `0.0` always means a genuinely computed value, never "unavailable."
 - **Naked Option Prohibition**: SELL CE and SELL PE are evaluated and fully disclosed (premium, margin, tail risk) for reference, but are unconditionally rejected (`NAKED_OPTION_PROHIBITED`) and can never reach `SIGNAL VALIDATED` -- this does not depend on margin data being authoritative.
-- **Policy Caps Honored**: `buy_ce_enabled` / `buy_pe_enabled` (config) suppress that strategy's generation entirely when `false`; `max_option_lots` (config, default 2) is enforced as a hard ceiling on `position_sizing.lots` regardless of what the risk-budget/capital/depth tiers alone would otherwise permit.
+- **Policy Caps Honored**: `buy_ce_enabled` / `buy_pe_enabled` / `sell_ce_enabled` / `sell_pe_enabled` (config) each suppress that strategy's generation entirely when `false` (the two sell_* flags default `false` -- credit spreads are opt-in); `max_option_lots` (config, default 2) is enforced as a hard ceiling on `position_sizing.lots` regardless of what the risk-budget/capital/depth tiers alone would otherwise permit; `max_correlated_exposure_pct` (config, default 40%) caps how much capital can go into the broad-index correlation group (all 5 major indices) across a single sweep, checked independently of overall capital.
 
 ---
 

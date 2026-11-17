@@ -2230,6 +2230,72 @@ def summarize_index_breadth(results):
     }
 
 
+def get_broad_market_regime(market="IN", now=None, indices=None, offline=None, config_path=None):
+    """
+    Classify the current broad market regime (STRONG_BULLISH/BULLISH/SIDEWAYS/BEARISH/
+    STRONG_BEARISH/HIGH_VOLATILITY/UNCERTAIN) from a basket of major index trends.
+
+    This is a standalone, read-only helper -- it does not touch cmd_indices or any of its
+    CLI-argument-parsing behavior. It exists so other skills (e.g. trader-options) can get
+    the same canonical regime classification STRATEGY_SPEC.md documents without needing to
+    fake an argparse namespace to call the CLI command handler.
+
+    Returns {"canonical_regime": ..., "breadth": <summarize_index_breadth() dict>,
+    "index_results": [...], "errors": [...]} -- never raises; a failed/unavailable index
+    fetch degrades that one index to "unavailable" rather than failing the whole call, and
+    if every index fails, canonical_regime is explicitly "UNCERTAIN" (never fabricated).
+    """
+    idx_list = list(indices) if indices else ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"]
+    # `now` may be a CLI-style string, an already-parsed datetime (most callers pass this), or
+    # None. parse_now() only accepts strings/None -- it raises AttributeError on a datetime.
+    if now is None or isinstance(now, str):
+        now_dt = parse_now(now, market=market)
+    else:
+        now_dt = now
+    cfg = read_json(config_path or "trader/config.json", "config", required=False) or {}
+
+    errors = []
+    try:
+        provider = (
+            data_in.OfflineMarketDataProvider(offline)
+            if offline
+            else data_in.get_provider(config=cfg)
+        )
+    except Exception as e:
+        return {
+            "canonical_regime": "UNCERTAIN",
+            "breadth": None,
+            "index_results": [],
+            "errors": ["Market data provider error: %s" % e],
+        }
+
+    results = []
+    for sym in idx_list:
+        idx_meta = symbols_in.get_index_metadata(sym) if symbols_in else None
+        exch = (idx_meta or {}).get("exchange") or (cfg.get("exchange") or "NSE")
+        try:
+            series = provider.get_historical_data(sym, range_str="3mo", interval="1d", exchange=exch, now=now)
+            analysis = analyze_index_series(sym, series, interval="1d", idx_meta=idx_meta)
+            results.append(analysis)
+        except Exception as e:
+            errors.append("%s: %s" % (sym, e))
+            results.append({
+                "symbol": sym,
+                "status": "unavailable",
+                "instrument_type": "INDEX",
+                "error": str(e),
+            })
+
+    breadth = summarize_index_breadth(results)
+    return {
+        "canonical_regime": breadth.get("canonical_regime", "UNCERTAIN"),
+        "breadth": breadth,
+        "index_results": results,
+        "errors": errors,
+        "evaluated_at": now_dt.isoformat() if hasattr(now_dt, "isoformat") else str(now_dt),
+    }
+
+
 def cmd_indices(a):
     t0 = time.time()
     cfg_path = getattr(a, "config", "trader/config.json") if a else "trader/config.json"

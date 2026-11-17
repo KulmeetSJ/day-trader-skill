@@ -11,9 +11,11 @@ is kept in sync with its code; this document is not.
    `trader-risk` -> `trader-broker`. Execution sizing is disabled end-to-end in this path regardless
    of strategy (see item 2 below), so even BUY CE never reaches a placeable order here.
 2. **`trader-options/` (`OptionsIntelligenceSpecialist`, `orchestrator.py`, `replay.py`)**: a separate,
-   standalone decision-support engine. It analytically evaluates BUY_CE, BUY_PE, SELL_CE, SELL_PE, and
-   two defined-risk debit spreads (Bull Call Spread, Bear Put Spread) -- see `trader-options/SKILL.md`
-   for exact status per strategy. It never writes to `trader/orders.json` and never calls
+   standalone decision-support engine. It analytically evaluates BUY_CE, BUY_PE, SELL_CE, SELL_PE, two
+   defined-risk debit spreads (Bull Call Spread, Bear Put Spread), and two defined-risk credit spreads
+   (Bear Call Credit Spread, Bull Put Credit Spread -- opt-in via `sell_ce_enabled`/`sell_pe_enabled`,
+   default off) -- see `trader-options/SKILL.md` for exact status per strategy. It never writes to
+   `trader/orders.json` and never calls
    `trader-budget/size.py`'s order-sizing path or `trader-risk/check.py`'s order validator -- it is
    terminal output for a human to read, not an input to the execution pipeline. Its own internal,
    unconditional `NAKED_OPTION_PROHIBITED` check (not `trader-risk/check.py`'s, which it never calls)
@@ -95,8 +97,8 @@ Every options analysis or proposal must resolve to one of seven explicit, unambi
 - **Risk**: Max loss strictly capped at premium paid $\times$ lot size.
 - **Stop**: Invalidation above breakdown level or premium stop.
 
-### C. Bear Call Credit Spread (SELL CE with Long Protective CE) [Unsupported for Execution]
-- **Status**: Specification only; multi-leg credit spread execution structure is currently unsupported. Naked short calls are prohibited.
+### C. Bear Call Credit Spread (SELL CE with Long Protective CE) [Unsupported for Execution in path 1; analytical signal in path 2]
+- **Status**: Specification only / unsupported in `trader-entry`+`trader-risk`'s order-execution pipeline (path 1 -- naked short calls remain prohibited there regardless). `trader-options/options.py` (path 2, analysis-only, never executes) implements this as a full defined-risk analytical signal, gated by config `sell_ce_enabled` (default `false`, opt-in). Structurally validated before any signal is produced (hedge must be a higher-strike call); not subject to the naked-option prohibition since it has a genuine protective leg. Margin is a heuristic estimate, not authoritative. See `trader-options/SKILL.md` §1.
 - **Outlook**: Bearish to Neutral.
 - **Structure**:
   - Sell Strike $K_1$ (lower strike, higher premium).
@@ -104,8 +106,8 @@ Every options analysis or proposal must resolve to one of seven explicit, unambi
 - **Max Loss**: $(K_2 - K_1 - \text{Net Credit}) \times \text{Lot Size} + \text{Charges}$.
 - **Safety Gate**: Long leg must be validated and executed simultaneously or prior to short leg.
 
-### D. Bull Put Credit Spread (SELL PE with Long Protective PE) [Unsupported for Execution]
-- **Status**: Specification only; multi-leg credit spread execution structure is currently unsupported. Naked short puts are prohibited.
+### D. Bull Put Credit Spread (SELL PE with Long Protective PE) [Unsupported for Execution in path 1; analytical signal in path 2]
+- **Status**: Specification only / unsupported in path 1 (naked short puts remain prohibited there). `trader-options/options.py` (path 2) implements this as a full defined-risk analytical signal, gated by config `sell_pe_enabled` (default `false`, opt-in), mirroring Bear Call Credit Spread above (hedge must be a lower-strike put). See `trader-options/SKILL.md` §1.
 - **Outlook**: Bullish to Neutral.
 - **Structure**:
   - Sell Strike $K_2$ (higher strike, higher premium).

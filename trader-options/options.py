@@ -49,6 +49,66 @@ STATE_HISTORICAL_ANALYSIS = "HISTORICAL ANALYSIS"
 STATE_SIGNAL_REJECTED = "SIGNAL REJECTED"
 STATE_INVALIDATED_EXPIRED = "INVALIDATED / EXPIRED"
 
+# Per-setup regime eligibility, transcribed from guides/STRATEGY_SPEC.md's "Eligible Regimes" /
+# "Ineligible Regimes" columns. This was previously documented but never consulted anywhere in
+# the codebase (scanner, entry, or options) -- the regime classification was computed and then
+# discarded. Disclosed here as non-blocking context on every signal (never a rejection reason):
+# a human who can flex budget or risk tolerance should see *why* regime looks unfavorable, not
+# have the candidate hidden or auto-rejected over it. Bearish setup names (breakdown_intraday,
+# orb_breakdown) aren't in the spec's table verbatim; they're the bearish mirror of breakout/orb
+# and are mapped to that pair's bearish-regime equivalents.
+SETUP_ELIGIBLE_REGIMES = {
+    "breakout": ("STRONG_BULLISH", "BULLISH"),
+    "breakout_intraday": ("STRONG_BULLISH", "BULLISH"),
+    "breakout_20d": ("STRONG_BULLISH", "BULLISH"),
+    "orb": ("STRONG_BULLISH", "BULLISH"),
+    "breakdown_intraday": ("STRONG_BEARISH", "BEARISH"),
+    "orb_breakdown": ("STRONG_BEARISH", "BEARISH"),
+    "vwap_reclaim": ("STRONG_BULLISH", "BULLISH", "SIDEWAYS"),
+    "vwap_rejection": ("STRONG_BEARISH", "BEARISH"),
+    "ema_alignment": ("STRONG_BULLISH", "BULLISH"),
+    "rsi_momentum": ("STRONG_BULLISH", "BULLISH"),
+    "trend_continuation": ("STRONG_BULLISH", "BULLISH"),
+    "trend": ("STRONG_BULLISH", "BULLISH"),
+    "pullback": ("STRONG_BULLISH", "BULLISH"),
+    "vwap_pullback": ("STRONG_BULLISH", "BULLISH"),
+    "reversal": ("BEARISH", "SIDEWAYS", "HIGH_VOLATILITY"),
+    "exhaustion_reversal": ("BEARISH", "SIDEWAYS", "HIGH_VOLATILITY"),
+}
+
+
+def _build_regime_context(setup_name: str, broad_regime: Optional[str]) -> Dict[str, Any]:
+    """Non-blocking regime disclosure: never a rejection reason, always an explained context."""
+    eligible = SETUP_ELIGIBLE_REGIMES.get(str(setup_name or "").lower())
+    regime = broad_regime or "UNCERTAIN"
+    if not eligible or regime == "UNCERTAIN":
+        return {
+            "broad_market_regime": regime,
+            "setup_eligible_regimes": list(eligible) if eligible else None,
+            "regime_aligned": None,
+            "regime_note": (
+                "Broad market regime could not be classified or this setup has no documented "
+                "regime-eligibility mapping; shown without regime context."
+            ),
+        }
+    aligned = regime in eligible
+    note = (
+        ("Broad market regime (%s) supports this '%s' setup." % (regime, setup_name))
+        if aligned else
+        (
+            "Broad market regime is %s; '%s' is historically eligible only in %s. Not blocked by "
+            "regime alone -- shown for your judgment, especially if you can flex budget or risk." %
+            (regime, setup_name, "/".join(eligible))
+        )
+    )
+    return {
+        "broad_market_regime": regime,
+        "setup_eligible_regimes": list(eligible),
+        "regime_aligned": aligned,
+        "regime_note": note,
+    }
+
+
 # Strategy Identifiers
 STRATEGY_BUY_CE = "BUY_CE"
 STRATEGY_BUY_PE = "BUY_PE"
@@ -1119,6 +1179,7 @@ class OptionsIntelligenceSpecialist:
         underlying_spot_quote: Optional[Dict[str, Any]] = None,
         allow_unverified_portfolio: bool = False,
         target_rr_gate: Optional[str] = None,
+        broad_regime: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Build and rigorously validate the 20-field signal contract.
@@ -1483,6 +1544,21 @@ class OptionsIntelligenceSpecialist:
                     rejection_reasons.append(
                         f"INVALID_SPREAD_STRUCTURE: Bear Put Spread requires hedge leg to be lower strike Put (got {spread_k} {hedge_type} vs {strike} PE)"
                     )
+            elif strategy == STRATEGY_BEAR_CALL_SPREAD:
+                # Credit spread: primary (strike) is the SOLD call; hedge must be a higher-strike
+                # long call for genuine protection (same strike ordering as Bull Call Spread, just
+                # with the sold/bought roles reversed).
+                if hedge_type != "CE" or spread_k <= strike:
+                    rejection_reasons.append(
+                        f"INVALID_SPREAD_STRUCTURE: Bear Call Credit Spread requires hedge leg to be higher strike Call (got {spread_k} {hedge_type} vs {strike} CE)"
+                    )
+            elif strategy == STRATEGY_BULL_PUT_SPREAD:
+                # Credit spread: primary (strike) is the SOLD put; hedge must be a lower-strike
+                # long put for genuine protection.
+                if hedge_type != "PE" or spread_k >= strike:
+                    rejection_reasons.append(
+                        f"INVALID_SPREAD_STRUCTURE: Bull Put Credit Spread requires hedge leg to be lower strike Put (got {spread_k} {hedge_type} vs {strike} PE)"
+                    )
 
             # 4. Hedge Live Quote Freshness
             hedge_raw_ts = spread_contract.get("quote_timestamp") or spread_contract.get("timestamp") or contract_data.get("quote_timestamp")
@@ -1597,7 +1673,12 @@ class OptionsIntelligenceSpecialist:
         spread_max_loss_1_lot = (
             None
             if unavailable_sizing
-            else (round((net_debit * lot_size) + charges_1_lot.get("statutory_charges_stop", 0.0), 2) if is_spread else net_risk_1_lot)
+            # risk_per_share already holds the correct per-share max loss for either spread type
+            # (net_debit for Bull Call/Bear Put, max(0, width - net_credit) for Bear Call/Bull Put
+            # credit spreads) -- it was a bug to reference net_debit directly here, since that
+            # name is only ever bound in the debit-spread branch above and raised
+            # UnboundLocalError the first time a credit spread actually reached this line.
+            else (round((risk_per_share * lot_size) + charges_1_lot.get("statutory_charges_stop", 0.0), 2) if is_spread else net_risk_1_lot)
         )
         if unavailable_sizing:
             # The premium model could not produce a validated stop/target, so no risk-per-lot or
@@ -1782,6 +1863,22 @@ class OptionsIntelligenceSpecialist:
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
 
+        # Expiry-day circuit breaker: mirrors trader-risk/check.py's rule for the order-execution
+        # pipeline ("new derivative entries on expiry day blocked after 14:30 IST to avoid physical
+        # delivery / gamma explosion"). trader-options had no equivalent -- it could recommend a
+        # 0-DTE contract right up to the close, exactly when pin/gamma risk is worst.
+        try:
+            now_ist = now_dt.astimezone(calendar_in.IST)
+            expiry_date = datetime.date.fromisoformat(str(expiry)[:10])
+            if now_ist.date() == expiry_date and now_ist.time() >= datetime.time(14, 30):
+                rejection_reasons.append(
+                    "EXPIRY_DAY_CUTOFF: New entries on contract expiry day (%s) are blocked after "
+                    "14:30 IST to avoid pin risk, gamma explosion, and illiquid expiry-day spreads"
+                    % expiry_date.isoformat()
+                )
+        except (ValueError, TypeError):
+            pass
+
         is_live_provenance, freshness_rejections, freshness_meta = self.validate_live_data_freshness(
             contract_data=contract_data,
             underlying_setup=underlying_setup,
@@ -1961,6 +2058,8 @@ class OptionsIntelligenceSpecialist:
         else:
             setup_validity = "CURRENT_SESSION_ACTIVE"
 
+        regime_context = _build_regime_context(underlying_setup.get("setup"), broad_regime)
+
         setup_evidence = {
             "setup_name": underlying_setup.get("setup") or "intraday_level",
             "directional_bias": direction,
@@ -2004,6 +2103,7 @@ class OptionsIntelligenceSpecialist:
             f"Evaluated {strategy} on {underlying} ({strike} {option_type}, Delta: {delta:+.2f}, IV: {iv:.1f}%). "
             f"Net R:R: {net_rr_display}. "
             + (f"Approved ({signal_state})." if is_approved else f"REJECTED: {'; '.join(rejection_reasons)}.")
+            + f" {regime_context['regime_note']}"
         )
 
         contract = {
@@ -2033,9 +2133,18 @@ class OptionsIntelligenceSpecialist:
                 "setup_validity_state": setup_validity,
             },
             "option_entry_range": {
-                "min": round_tick(prem_levels["entry_premium"] * 0.98, 0.05),
-                "max": round_tick(prem_levels["entry_premium"] * 1.02, 0.05),
+                # Band width: never tighter than 2%, but widened to the option's own observed
+                # bid/ask spread if that's wider -- a flat 2% band on an illiquid, wide-spread
+                # option would look "violated" by completely normal bid/ask noise, which isn't
+                # the signal this range is meant to catch (real price movement since generation).
+                "min": round_tick(prem_levels["entry_premium"] * (1.0 - max(2.0, spread_pct) / 100.0), 0.05),
+                "max": round_tick(prem_levels["entry_premium"] * (1.0 + max(2.0, spread_pct) / 100.0), 0.05),
                 "ideal": prem_levels["entry_premium"],
+                "band_pct": round(max(2.0, spread_pct), 2),
+                "instruction": (
+                    "If the live premium is outside this range when you're ready to act, skip "
+                    "this trade -- the setup has moved and this recommendation no longer applies."
+                ),
             },
             "stop_loss": prem_levels["stop_loss_premium"],
             "target_1": prem_levels["target_1_premium"],
@@ -2104,6 +2213,7 @@ class OptionsIntelligenceSpecialist:
             "freshness_details": freshness_meta,
             "signal_expiry": "15:15 IST (End of Intraday Session)",
             "selection_rationale": rationale,
+            "regime_context": regime_context,
             "signal_state": signal_state,
             "is_actionable": is_actionable,
             "rejection_reasons": rejection_reasons,
@@ -2333,6 +2443,7 @@ class OptionsIntelligenceSpecialist:
         min_reward_risk: Optional[float] = None,
         portfolio_path: Optional[str] = None,
         broker_state_path: Optional[str] = None,
+        broad_regime: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive dual-directional options analysis for a given symbol.
@@ -2340,12 +2451,25 @@ class OptionsIntelligenceSpecialist:
         Phase 2 Fix: Removed synthetic setup fabrication.
         If underlying_chart is None, fetches the real chart using entry.get_chart().
         If no real chart or no technical setup exists, returns NO TRADE.
+
+        broad_regime: precomputed canonical market regime (scan.get_broad_market_regime()),
+        passed in by callers (e.g. orchestrator.py) scanning multiple symbols so the 5-index
+        regime fetch happens once per sweep, not once per symbol. If not supplied, this method
+        computes it itself (single-symbol CLI usage) and degrades to "UNCERTAIN" on any failure
+        -- regime is disclosed context, never a reason by itself to fail this call.
         """
         now = now_utc or datetime.datetime.now(datetime.timezone.utc)
         budget = max_loss_budget if max_loss_budget is not None else self.max_loss_budget
         min_rr = min_reward_risk if min_reward_risk is not None else self.min_reward_risk
         p_path = portfolio_path or self.portfolio_path
         b_path = broker_state_path or self.broker_state_path
+
+        if broad_regime is None:
+            try:
+                broad_regime = scan.get_broad_market_regime(market="IN", now=now).get("canonical_regime")
+            except Exception:
+                broad_regime = None
+        broad_regime = broad_regime or "UNCERTAIN"
 
         meta_valid, meta, meta_err = self.validate_metadata(symbol)
         if not meta_valid:
@@ -2628,6 +2752,7 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_ce)
 
@@ -2652,8 +2777,60 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_sell_pe)
+
+            # BULL PUT CREDIT SPREAD (Sell OTM1 PE + Buy OTM2 PE for protection)
+            # Gated by sell_pe_enabled (default False) -- this is the defined-risk, hedged
+            # structure that config field was always documented as reserved for (see
+            # guides/CONFIGURATION_SPEC.md: "Enable Defined-risk Credit Put Spreads"), previously
+            # unimplemented. Unlike naked SELL_PE, this is NOT subject to NAKED_OPTION_PROHIBITED
+            # (it has a genuine long protective leg) -- it inherits the same margin-authority
+            # treatment as the existing BULL_CALL_SPREAD/BEAR_PUT_SPREAD debit spreads.
+            if self.config.get("sell_pe_enabled", False) and otm_pe_contract:
+                otm2_pe_strike_bps = chain.select_strike("OTM2", "PE")
+                otm2_pe_contract_bps = _enrich_contract(chain.get_contract(otm2_pe_strike_bps, "PE")) if otm2_pe_strike_bps else None
+                if otm2_pe_contract_bps:
+                    l1, _, _ = self.validate_liquidity(otm_pe_contract)
+                    l2, _, _ = self.validate_liquidity(otm2_pe_contract_bps)
+                    if l1 and l2:
+                        sig_bps_credit = self.generate_signal_contract(
+                            underlying=symbol,
+                            direction="BULLISH_OR_SIDEWAYS",
+                            strategy=STRATEGY_BULL_PUT_SPREAD,
+                            option_type="SPREAD",
+                            strike=otm_pe_strike,
+                            contract_data=otm_pe_contract,
+                            underlying_setup=found_bull_setup,
+                            meta=meta,
+                            spread_contract={
+                                "strike": otm2_pe_strike_bps,
+                                "symbol": otm2_pe_contract_bps.get("symbol"),
+                                "last_price": otm2_pe_contract_bps.get("last_price"),
+                                "bid": otm2_pe_contract_bps.get("bid"),
+                                "ask": otm2_pe_contract_bps.get("ask"),
+                                "bid_qty": otm2_pe_contract_bps.get("bid_qty"),
+                                "ask_qty": otm2_pe_contract_bps.get("ask_qty"),
+                                "quote_timestamp": otm2_pe_contract_bps.get("quote_timestamp"),
+                                "retrieval_timestamp": otm2_pe_contract_bps.get("retrieval_timestamp"),
+                                "expiry": otm2_pe_contract_bps.get("expiry") or meta.get("expiry"),
+                                "underlying": symbol,
+                                "option_type": "PE",
+                                "is_live": otm2_pe_contract_bps.get("is_live", True),
+                                "tier": otm2_pe_contract_bps.get("tier", "REAL_TIME"),
+                                "delta": (otm2_pe_contract_bps.get("greeks") or {}).get("delta"),
+                                "iv": otm2_pe_contract_bps.get("iv"),
+                            },
+                            max_loss_budget=budget,
+                            min_reward_risk=min_rr,
+                            now_utc=now,
+                            portfolio_path=p_path,
+                            broker_state_path=b_path,
+                            underlying_spot_quote=underlying_spot_quote,
+                            broad_regime=broad_regime,
+                        )
+                        signals.append(sig_bps_credit)
 
             # BULL CALL SPREAD
             otm2_ce_strike = chain.select_strike("OTM2", "CE")
@@ -2695,6 +2872,7 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_bcs)
 
@@ -2722,6 +2900,7 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_pe)
 
@@ -2746,8 +2925,56 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_sell_ce)
+
+            # BEAR CALL CREDIT SPREAD (Sell OTM1 CE + Buy OTM2 CE for protection)
+            # Gated by sell_ce_enabled (default False) -- mirrors the Bull Put Credit Spread
+            # above. Not subject to NAKED_OPTION_PROHIBITED (genuine protective long leg).
+            if self.config.get("sell_ce_enabled", False) and otm_ce_contract:
+                otm2_ce_strike_bcs = chain.select_strike("OTM2", "CE")
+                otm2_ce_contract_bcs = _enrich_contract(chain.get_contract(otm2_ce_strike_bcs, "CE")) if otm2_ce_strike_bcs else None
+                if otm2_ce_contract_bcs:
+                    l1, _, _ = self.validate_liquidity(otm_ce_contract)
+                    l2, _, _ = self.validate_liquidity(otm2_ce_contract_bcs)
+                    if l1 and l2:
+                        sig_bcs_credit = self.generate_signal_contract(
+                            underlying=symbol,
+                            direction="BEARISH_OR_SIDEWAYS",
+                            strategy=STRATEGY_BEAR_CALL_SPREAD,
+                            option_type="SPREAD",
+                            strike=otm_ce_strike,
+                            contract_data=otm_ce_contract,
+                            underlying_setup=found_bear_setup,
+                            meta=meta,
+                            spread_contract={
+                                "strike": otm2_ce_strike_bcs,
+                                "symbol": otm2_ce_contract_bcs.get("symbol"),
+                                "last_price": otm2_ce_contract_bcs.get("last_price"),
+                                "bid": otm2_ce_contract_bcs.get("bid"),
+                                "ask": otm2_ce_contract_bcs.get("ask"),
+                                "bid_qty": otm2_ce_contract_bcs.get("bid_qty"),
+                                "ask_qty": otm2_ce_contract_bcs.get("ask_qty"),
+                                "quote_timestamp": otm2_ce_contract_bcs.get("quote_timestamp"),
+                                "retrieval_timestamp": otm2_ce_contract_bcs.get("retrieval_timestamp"),
+                                "expiry": otm2_ce_contract_bcs.get("expiry") or meta.get("expiry"),
+                                "underlying": symbol,
+                                "option_type": "CE",
+                                "is_live": otm2_ce_contract_bcs.get("is_live", True),
+                                "tier": otm2_ce_contract_bcs.get("tier", "REAL_TIME"),
+                                "delta": (otm2_ce_contract_bcs.get("greeks") or {}).get("delta"),
+                                "iv": otm2_ce_contract_bcs.get("iv"),
+                            },
+                            max_loss_budget=budget,
+                            min_reward_risk=min_rr,
+                            now_utc=now,
+                            portfolio_path=p_path,
+                            broker_state_path=b_path,
+                            underlying_spot_quote=underlying_spot_quote,
+                            broad_regime=broad_regime,
+                        )
+                        signals.append(sig_bcs_credit)
 
             # BEAR PUT SPREAD
             otm2_pe_strike = chain.select_strike("OTM2", "PE")
@@ -2789,6 +3016,7 @@ class OptionsIntelligenceSpecialist:
                         portfolio_path=p_path,
                         broker_state_path=b_path,
                         underlying_spot_quote=underlying_spot_quote,
+                        broad_regime=broad_regime,
                     )
                     signals.append(sig_bps)
 
@@ -2928,6 +3156,9 @@ def cmd_analyze(args, specialist: OptionsIntelligenceSpecialist):
 
         # 2. Execution price reconciliation
         print(f"Execution Entry: Rs {sig['current_premium']:.2f} (Conservative {recon.get('baseline_quote_type')}: Rs {recon.get('baseline_quote_price'):.2f}, Slippage: {recon.get('slippage_applied', 0):+.2f} | Bid: Rs {recon.get('bid', 0):.2f}, Ask: Rs {recon.get('ask', 0):.2f}, Spread: {recon.get('spread_pct', 0)}%)")
+        entry_range = sig.get("option_entry_range") or {}
+        print(f"VALID ENTRY RANGE: Rs {entry_range.get('min', 0):.2f} to Rs {entry_range.get('max', 0):.2f} (ideal Rs {entry_range.get('ideal', 0):.2f})")
+        print(f"  -> {entry_range.get('instruction', '')}")
 
         # 3. Dynamic exits & net R:R
         # Zero Fabrication Policy: a premium level that the Delta/Gamma model could not validate

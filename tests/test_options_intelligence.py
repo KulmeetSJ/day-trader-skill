@@ -2495,7 +2495,9 @@ def test_phase5_orchestrator_shortlist_and_diagnostic_table(orchestrator):
         },
         "selection_rationale": "High quality breakout setup",
     }
-    sig_bad = {
+    # Hard-blocked: a structural reason (naked-option margin unavailable) -- more capital or risk
+    # tolerance would never fix this, so it's summarized by count, not shown in per-reason detail.
+    sig_hard_blocked = {
         "underlying_instrument": "BANKNIFTY",
         "strategy": "SELL_PE",
         "strike": 52000.0,
@@ -2505,19 +2507,36 @@ def test_phase5_orchestrator_shortlist_and_diagnostic_table(orchestrator):
         "ranking_score": 10.0,
         "direction": "BULLISH_OR_SIDEWAYS",
     }
+    # Near-miss: rejected only for budget/R:R -- exactly the case a human with more capital or
+    # risk tolerance could act on, so it's shown in full detail in its own section.
+    sig_near_miss = {
+        "underlying_instrument": "FINNIFTY",
+        "strategy": "BUY_PE",
+        "strike": 23000.0,
+        "signal_state": "SIGNAL REJECTED",
+        "is_actionable": False,
+        "rejection_reasons": ["RR_BELOW_MINIMUM: Net R:R (1.6:1) below configured minimum (2.0:1)"],
+        "ranking_score": 40.0,
+        "direction": "BEARISH",
+    }
 
     report = orchestrator._format_report(
         query="NIFTY and BANKNIFTY",
         session_label="LIVE SESSION",
         underlying_summaries={},
         shortlist=[sig_good],
-        rejected_signals=[sig_bad],
+        rejected_signals=[sig_hard_blocked, sig_near_miss],
         total_eligible=230,
         passed_to_scanner=2,
         successfully_scanned=2,
     )
-    assert "Filtered & Rejected Candidates (Diagnostic Audit)" in report
-    assert "AUTHORITATIVE_MARGIN_UNAVAILABLE" in report
+    assert "Near-Miss Candidates (Diagnostic Audit)" in report
+    # Hard-blocked candidate is summarized by count, not shown with its specific reason text.
+    assert "AUTHORITATIVE_MARGIN_UNAVAILABLE" not in report
+    assert "1 other candidate(s) rejected for structural reasons" in report
+    # Near-miss candidate is shown in full, since budget/R:R alone caused the rejection.
+    assert "RR_BELOW_MINIMUM" in report
+    assert "FINNIFTY" in report
     assert "Evaluated **2** key instruments (core scan universe out of 230" in report
 
 

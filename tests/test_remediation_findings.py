@@ -371,6 +371,11 @@ def test_n3_missing_portfolio_state_fails_closed_without_override(tmp_path):
 def test_n4_zero_lot_allocation_excluded_from_shortlist():
     """N-4: Candidate receiving 0 lots during sequential allocation is moved to rejected signals."""
     orch = MarketIntelligenceOrchestrator()
+    # This test is specifically about overall-capital exhaustion ordering, not correlated-group
+    # exposure limiting (a separate, later feature -- see test_options_stage2_safety_gates.py).
+    # NIFTY and BANKNIFTY share a correlation group by design; loosen the cap here so that new,
+    # orthogonal feature doesn't change what this test is isolating.
+    orch.specialist.config["max_correlated_exposure_pct"] = 100.0
     candidates = [
         {
             "underlying_instrument": "NIFTY",
