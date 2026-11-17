@@ -38,6 +38,7 @@ for path in [
         sys.path.insert(0, path)
 
 import _load
+from _options_offline import offline_options_market  # noqa: F401  (autouse: no live data)
 import calendar_in
 import data_in
 import instruments
@@ -377,7 +378,10 @@ def test_acceptance_criteria_k_ranking_and_deduplication(specialist):
 def test_options_timemachine_historical_validation(specialist):
     """Verifies strategy-specific historical replay for actual implemented options logic."""
     rep = OptionsTimeMachineReplay(specialist=specialist)
-    chain = specialist.fetch_normalized_chain("NIFTY")
+    # Pin the chain's spot to the session below (~25100). Without it the simulated chain
+    # prices off a live Yahoo NIFTY quote, so the 25100 strike drifts ITM/OTM with the real
+    # market and the replay's risk-per-lot sizing flips this test pass/fail day to day.
+    chain = specialist.fetch_normalized_chain("NIFTY", spot_price=25110.0)
     meta = instruments.resolve_underlying_derivatives_meta("NIFTY")
 
     # Sample session bars
@@ -659,7 +663,8 @@ def test_phase5_selling_heuristic_margin_and_two_leg_spread(specialist):
 def test_phase6_synthetic_replay_disclosures_and_sizing(specialist):
     """Phase 6: Replay is labeled SYNTHETIC OPTIONS SIMULATION and never forces 1 lot."""
     rep = OptionsTimeMachineReplay(specialist=specialist)
-    chain = specialist.fetch_normalized_chain("NIFTY")
+    # Pin spot to the session below so the chain never prices off a live Yahoo NIFTY quote.
+    chain = specialist.fetch_normalized_chain("NIFTY", spot_price=25110.0)
     meta = instruments.resolve_underlying_derivatives_meta("NIFTY")
 
     bars = [
@@ -1480,7 +1485,16 @@ def test_risk_reporting_stop_loss_vs_maximum_loss_distinction(specialist):
 
 def test_underlying_setup_candle_provenance_and_validity_state(specialist):
     """Forensic Audit 9: Trace breakdown_intraday evidence back to actual underlying candles and determine validity state."""
-    res = specialist.analyze_symbol_for_options("NIFTY")
+    # Frozen 2026-11-13 NIFTY session (originally captured live). Pinning chart, chain spot,
+    # clock and regime keeps this test independent of whatever NIFTY is doing today.
+    with open(os.path.join(_load.FIX, "trader-options", "nifty_5m_20261113.json"), encoding="utf-8") as f:
+        chart = json.load(f)
+    real_fetch = specialist.fetch_normalized_chain
+    specialist.fetch_normalized_chain = lambda sym, **kw: real_fetch(sym, **dict(kw, spot_price=25144.30))
+    saturday_off_hours = datetime.datetime(2026, 11, 14, 5, 0, tzinfo=datetime.timezone.utc)
+    res = specialist.analyze_symbol_for_options(
+        "NIFTY", underlying_chart=chart, now_utc=saturday_off_hours, broad_regime="UNCERTAIN"
+    )
     assert res["status"] == "OPPORTUNITIES_IDENTIFIED"
     pe_sigs = [s for s in res["signals"] if s["strategy"] == STRATEGY_BUY_PE]
     assert len(pe_sigs) >= 1
