@@ -2,8 +2,9 @@
 """Market Watch -- background opportunity watcher for the Indian session (paper only).
 
 Every 5-minute candle close (plus a short settle delay) during the IN session it:
-  1. Runs `trader-scanner/scan.py intraday` (unchanged CLI) over the morning's daily
-     setups (trader/daily_scan.json by default).
+  1. Runs `trader-scanner/scan.py intraday` (unchanged CLI) over the full NIFTY 200
+     (trader/universe_nifty200.txt, built with `scan.py universe` if missing) from the
+     first post-open candle, so early movers outside the daily-setup list are not missed.
   2. For each ENTRY CONFIRMED, actionable, long equity hit, builds a plan from the
      scanner's OWN computed entry/stop/2R target and runs it through
      `trader-budget/size.py: size_trade()` -- the same function, same config, same
@@ -53,6 +54,8 @@ FIRST_CHECK = datetime.time(9, 20)
 SETTLE_SECONDS = 25
 HEARTBEAT_MINUTES = 30
 ERROR_REPEAT_SECONDS = 3600
+MAX_POPUPS_PER_CYCLE = 3
+DEFAULT_UNIVERSE = os.path.join("trader", "universe_nifty200.txt")
 
 
 def now_ist():
@@ -98,6 +101,7 @@ class Watcher(object):
         self.cycles = 0
         self.confirmed_rejected = 0
         self.opportunities = 0
+        self.alerts_this_cycle = 0
         self.last_heartbeat = time.time()
         self.events_path = os.path.join(BASE_DIR, "trader", "state", "watch_events.jsonl")
 
@@ -118,6 +122,9 @@ class Watcher(object):
         except Exception as e:
             self.error("event log", e)
         emit("OPPORTUNITY " + summary)
+        self.alerts_this_cycle += 1
+        if self.alerts_this_cycle > MAX_POPUPS_PER_CYCLE:
+            return  # logged above; don't stack voice/pop-ups (flood backstop)
         sym = (payload.get("hit") or {}).get("symbol") or ""
         notify("Trade opportunity (paper)", summary,
                spoken="Trade opportunity. %s %s." % (kind, sym) if sym else "Trade opportunity. %s." % kind)
@@ -137,7 +144,7 @@ class Watcher(object):
     def scan_equities(self):
         cmd = [sys.executable, os.path.join(BASE_DIR, "trader-scanner", "scan.py"), "intraday",
                "--market", "IN"] + (["--universe", self.args.universe] if self.args.universe
-                                    else ["--watchlist", self.args.watchlist]) + ["--setups", SETUPS,
+                                    else ["--watchlist", self.args.watchlist]) + ["--setups", self.args.setups,
                "--interval", "5m", "--state", os.path.join("trader", "state", "watch_scan.json"),
                "--no-write", "--json"]
         out = subprocess.run(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -146,6 +153,31 @@ class Watcher(object):
             raise RuntimeError(out.stderr or out.stdout or "scan.py exit %d" % out.returncode)
         doc = json.loads(out.stdout[out.stdout.index("{"):])
         return doc
+
+    def trigger_age_minutes(self, close_time):
+        try:
+            hh, mm = [int(x) for x in str(close_time).split(":")[:2]]
+        except Exception:
+            return None
+        now = now_ist()
+        trig = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return (now - trig).total_seconds() / 60.0
+
+    def exit_plan(self, sym, entry, entry_time, stop_arg):
+        cmd = [sys.executable, os.path.join(BASE_DIR, "trader-exit", "exit.py"), "plan",
+               "--symbol", sym, "--entry", str(entry), "--interval", "5m", "--market", "IN",
+               "--exchange", "NSE", "--instruments", self.args.instruments,
+               "--stop", stop_arg, "--target", "%sR" % self.args.target_r, "--json"]
+        if entry_time:
+            cmd[cmd.index("--interval"):cmd.index("--interval")] = ["--time", str(entry_time)]
+        try:
+            out = subprocess.run(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("exit.py plan timed out after 60s")
+        if out.returncode != 0 or "{" not in out.stdout:
+            raise RuntimeError((out.stderr or out.stdout or "exit.py exit %d" % out.returncode).strip())
+        return json.loads(out.stdout[out.stdout.index("{"):])
 
     def check_equities(self):
         doc = self.scan_equities()
@@ -164,19 +196,38 @@ class Watcher(object):
             key = "EQ|%s|%s|%s|%s" % (today, h.get("symbol"), h.get("setup"), trig.get("close_time"))
             if key in self.seen:
                 continue
-            entry = d.get("entry_reference")
-            stop = d.get("stop_loss")
-            target = d.get("target_2_2r") or (d.get("targets") or {}).get("t2_2r")
-            if entry is None or stop is None or target is None:
+            # Freshness: only a trigger from the latest candle(s) is an opportunity. The scanner keeps
+            # an old trigger "ENTRY CONFIRMED" whenever price drifts back into its zone; alerting on
+            # those (e.g. a 09:30 trigger at 13:52) is a late entry -- a different trade.
+            age = self.trigger_age_minutes(trig.get("close_time"))
+            if age is None or age > self.args.max_trigger_age:
+                self.seen.add(key)
                 continue
+            entry = d.get("entry_reference")
+            if entry is None or d.get("stop_loss") is None:
+                continue
+            # Stop/target come from the real trader-exit CLI (exit.compute), with the same
+            # --stop/--target flags you'd use in the pipeline -- the watcher computes nothing.
+            stop_arg = ("price:%s" % d.get("stop_loss")) if self.args.stop == "scanner" else self.args.stop
+            try:
+                ex = self.exit_plan(h.get("symbol"), entry, trig.get("close_time"), stop_arg)
+            except Exception as e:
+                self.seen.add(key)
+                self.confirmed_rejected += 1
+                if "timed out" in str(e).lower():
+                    self.error("exit plan %s" % h.get("symbol"), e)
+                continue
+            stop, target = ex.get("stop"), ex.get("target")
             plan = {
                 "symbol": h.get("symbol"), "side": "buy", "setup": h.get("setup"),
-                "entry": entry, "stop": stop, "target": target,
+                "entry": ex.get("entry", entry), "stop": stop, "target": target,
                 "asset_type": "EQUITY", "trading_style": "intraday", "market": "IN",
                 "exchange": "NSE", "currency": "INR", "interval": h.get("interval"),
                 "provider": h.get("provider") or provider, "data_status": h.get("data_status"),
                 "is_live_signal": h.get("is_live_signal"),
+                "exit_cmd": "exit.py plan --stop %s --target %sR" % (stop_arg, self.args.target_r),
             }
+            entry = plan["entry"]
             try:
                 s = size.size_trade(plan, self.cfg, cash=cash, today=today, market="IN",
                                     instruments_path=self.args.instruments,
@@ -205,18 +256,25 @@ class Watcher(object):
     def check_options(self):
         if not self.args.options:
             return
-        from options import OptionsIntelligenceSpecialist, STATE_SIGNAL_VALIDATED
-        spec = OptionsIntelligenceSpecialist()
         today = now_ist().date()
         for sym in self.args.options:
+            # Each index runs in its own subprocess with a hard timeout: an in-process options
+            # call hung the watcher silently once (2026-11-17 ~11:22), so isolate it.
+            cmd = [sys.executable, os.path.abspath(__file__), "--options-worker", sym,
+                   "--budget", str(self.args.budget)]
             try:
-                res = spec.analyze_symbol_for_options(sym, max_loss_budget=self.args.budget)
+                out = subprocess.run(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, timeout=90)
+                if out.returncode != 0:
+                    raise RuntimeError(out.stderr or "worker exit %d" % out.returncode)
+                signals = json.loads(out.stdout[out.stdout.index("["):])
+            except subprocess.TimeoutExpired:
+                self.error("options %s" % sym, "timed out after 90s (skipped this cycle)")
+                continue
             except Exception as e:
                 self.error("options %s" % sym, e)
                 continue
-            for sig in res.get("signals") or []:
-                if sig.get("signal_state") != STATE_SIGNAL_VALIDATED or not sig.get("is_actionable"):
-                    continue
+            for sig in signals:
                 key = "OPT|%s|%s|%s|%s" % (today, sig.get("contract"), sig.get("strategy"),
                                            (sig.get("underlying_trigger") or {}).get("time")
                                            if isinstance(sig.get("underlying_trigger"), dict) else sig.get("underlying_trigger"))
@@ -235,6 +293,7 @@ class Watcher(object):
     # ------------------------------------------------------------------ loop
     def cycle(self):
         self.cycles += 1
+        self.alerts_this_cycle = 0
         try:
             self.check_equities()
         except Exception as e:
@@ -257,9 +316,10 @@ class Watcher(object):
         return nxt + datetime.timedelta(seconds=SETTLE_SECONDS)
 
     def run(self):
-        emit("WATCH start: equities from %s, options %s, budget Rs %.0f, min net R:R %.2f, cutoff %s IST. "
-             "Paper only; never places orders."
-             % (self.args.universe or self.args.watchlist, ",".join(self.args.options) or "off", self.args.budget,
+        emit("WATCH start: equities from %s (plan: stop %s, target %sR via trader-exit), options %s, "
+             "budget Rs %.0f, min net R:R %.2f, cutoff %s IST. Paper only; never places orders."
+             % (self.args.universe or self.args.watchlist, self.args.stop, self.args.target_r,
+                ",".join(self.args.options) or "off", self.args.budget,
                 self.min_rr, self.cutoff.strftime("%H:%M")))
         if self.args.once:
             self.cycle()
@@ -280,20 +340,58 @@ class Watcher(object):
             time.sleep(max(1.0, (wake - now_ist()).total_seconds()))
 
 
+def build_universe(path):
+    """Write the NIFTY 200 universe file with the scanner's own `universe` command."""
+    emit("WATCH building %s from the NIFTY200 index (scan.py universe)" % path)
+    subprocess.run([sys.executable, os.path.join("trader-scanner", "scan.py"), "universe", "--market", "IN",
+                    "--index", "NIFTY200", "--exchange", "NSE", "--out", path],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=300, check=True)
+    if not os.path.exists(path):
+        raise SystemExit("could not build %s; pass --universe or --watchlist" % path)
+
+
+def options_worker(sym, budget):
+    """Child-process mode: print validated + actionable options signals for one symbol as JSON."""
+    os.chdir(BASE_DIR)
+    from options import OptionsIntelligenceSpecialist, STATE_SIGNAL_VALIDATED
+    res = OptionsIntelligenceSpecialist().analyze_symbol_for_options(sym, max_loss_budget=budget)
+    keep = [s for s in (res.get("signals") or [])
+            if s.get("signal_state") == STATE_SIGNAL_VALIDATED and s.get("is_actionable")]
+    sys.stdout.write(json.dumps(keep, default=str))
+    sys.stdout.flush()
+    os._exit(0)  # don't wait on any lingering feed threads
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--watchlist", default=os.path.join("trader", "daily_scan.json"))
-    ap.add_argument("--universe", default=None,
-                    help="SYMBOL|Name universe file (e.g. trader/universe_nifty200.txt); overrides --watchlist")
+    ap.add_argument("--watchlist", default=None,
+                    help="scan a watchlist JSON instead of the universe (e.g. trader/daily_scan.json)")
+    ap.add_argument("--universe", default=DEFAULT_UNIVERSE,
+                    help="SYMBOL|Name universe file (default %(default)s; built from NIFTY200 if missing)")
     ap.add_argument("--options", default="NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX",
                     help="comma-separated index/F&O symbols for trader-options ('' to disable)")
     ap.add_argument("--budget", type=float, default=2000.0, help="options max-loss budget (INR)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--instruments", default=os.path.join("trader", "state", "instruments.json"))
+    ap.add_argument("--stop", default="atr:1.5",
+                    help="trader-exit stop rule for the plan: 'scanner' (scanner's invalidation level), "
+                         "atr:K, or pct:X (default atr:1.5)")
+    ap.add_argument("--target-r", type=float, default=3.0, help="target in R for trader-exit (default 3)")
+    ap.add_argument("--max-trigger-age", type=float, default=10.0,
+                    help="only alert on triggers whose candle closed within this many minutes (default 10)")
+    ap.add_argument("--setups", default=SETUPS,
+                    help="scanner setups to watch (default: %s)" % SETUPS)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--options-worker", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
+    if a.options_worker:
+        return options_worker(a.options_worker, a.budget)
     a.options = [s.strip().upper() for s in a.options.split(",") if s.strip()]
     os.chdir(BASE_DIR)
+    if a.watchlist:
+        a.universe = None
+    elif not os.path.exists(a.universe):
+        build_universe(a.universe)
     return Watcher(a).run()
 
 
