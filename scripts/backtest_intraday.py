@@ -245,16 +245,53 @@ FILTERS = {
     "trend": lambda s, ctx: bool(s.get("vwap") and s.get("ema21") and s["entry"] > s["vwap"] and s["entry"] > s["ema21"]
                                 and (s.get("ema9") or 0) > s["ema21"]),
     "nifty_up": lambda s, ctx: bool(ctx["nifty"]),
+    # Follow-through: the candle AFTER the trigger closed at/above the trigger's entry. Only usable
+    # with entry_mode="next" (you can only know it one candle later -- no look-ahead).
+    "followthrough": lambda s, ctx: ctx.get("next_close") is not None and ctx["next_close"] >= s["entry"],
+    # Trigger-bar volume vs the prior 20 bars (trader-entry's _rolling_avg_vol definition).
+    "vol1": lambda s, ctx: ctx.get("vx") is not None and ctx["vx"] >= 1.0,
 }
 
 
-def run_variant(sigs, ctx_of, D_of, size_mod, cfg, stop_rule, target_r, filters, breakeven_r=None, cash=100000.0):
+def vol_x(flat, sym, date, slot, lookback=20):
+    """Trigger-bar volume / mean of the prior `lookback` non-zero bars (crossing sessions)."""
+    vols, index = flat[sym]
+    i = index.get((date, slot))
+    if i is None:
+        return None
+    prev = [v for v in vols[max(0, i - lookback):i] if v > 0]
+    return (vols[i] / (sum(prev) / len(prev))) if prev and vols[i] else None
+
+
+def flat_volumes(S):
+    out = {}
+    for sym, days in S.items():
+        vols, index = [], {}
+        for d in sorted(days):
+            for sl in sorted(days[d]):
+                index[(d, sl)] = len(vols)
+                vols.append(days[d][sl]["v"] or 0)
+        out[sym] = (vols, index)
+    return out
+
+
+def run_variant(sigs, ctx_of, D_of, size_mod, cfg, stop_rule, target_r, filters, breakeven_r=None, cash=100000.0,
+                entry_mode="trigger"):
+    """entry_mode "trigger": fill at the trigger bar's close (an on-time alert).
+    entry_mode "next": fill at the NEXT bar's close -- what you get when the alert arrives one
+    candle late, as the live watcher's were on 2026-11-18; stop is recomputed at that bar."""
     trades = []
     for s in sigs:
-        ctx = ctx_of(s)
+        D = D_of(s)
+        ctx = dict(ctx_of(s))
+        nb = D.get(s["slot"] + 1)
+        ctx["next_close"] = nb["c"] if nb else None
         if not all(FILTERS[f](s, ctx) for f in filters):
             continue
-        D = D_of(s)
+        if entry_mode == "next":
+            if nb is None:
+                continue
+            s = dict(s, entry=nb["c"], slot=s["slot"] + 1)
         st = stop_for(stop_rule, s, D)
         if st is None:
             continue
@@ -371,18 +408,33 @@ VARIANTS = [
     ("swing 2.2R +BE1R", "swing", 2.2, (), 1.0),
     ("swing 2.2R +trend", "swing", 2.2, ("trend",), None),
     ("atr3 2.5R", "atr3", 2.5, (), None),
+    # Alert timing / follow-through (2026-11-18): live alerts arrived one candle late.
+    ("swing 2.2R +vol1", "swing", 2.2, ("vol1",), None),
+    ("swing 2.2R LATE (next-bar entry)", "swing", 2.2, (), None, "next"),
+    ("swing 2.2R LATE +followthrough", "swing", 2.2, ("followthrough",), None, "next"),
+    ("swing 2.2R LATE +followthrough+vol1", "swing", 2.2, ("followthrough", "vol1"), None, "next"),
+    ("swing 2.2R LATE +vol1", "swing", 2.2, ("vol1",), None, "next"),
 ]
 
 
 def _variant_job(args):
-    name, stop_rule, target_r, filters, be = args
+    name, stop_rule, target_r, filters, be = args[:5]
+    entry_mode = args[5] if len(args) > 5 else "trigger"
     import size
     _memo_instruments()
     S, nifty, sigs, cut = _W["S"], _W["nifty"], _W["sigs"], _W["cut"]
     cfg = size.load_config(None, market="IN")
-    ctx_of = lambda s: {"nifty": nifty_up(nifty, s["date"], s["slot"])} if "nifty_up" in filters else {}
+    flat = _W.setdefault("flat", flat_volumes(S)) if "vol1" in filters else None
+
+    def ctx_of(s):
+        c = {}
+        if "nifty_up" in filters:
+            c["nifty"] = nifty_up(nifty, s["date"], s["slot"])
+        if flat is not None:
+            c["vx"] = vol_x(flat, s["sym"], s["date"], s["slot"])
+        return c
     D_of = lambda s: S[s["sym"]][s["date"]]
-    tr = run_variant(sigs, ctx_of, D_of, size, cfg, stop_rule, target_r, filters, be)
+    tr = run_variant(sigs, ctx_of, D_of, size, cfg, stop_rule, target_r, filters, be, entry_mode=entry_mode)
     out = {"name": name}
     for part, sel in (("design", lambda t: t["date"] < cut), ("holdout", lambda t: t["date"] >= cut)):
         ts = [t for t in tr if sel(t)]
@@ -409,7 +461,7 @@ def cmd_report(a):
     print("%d signals over %d sessions; design %s..%s, holdout %s..%s"
           % (len(sigs), len(dates), dates[0], [d for d in dates if d < cut][-1], cut, dates[-1]))
     with multiprocessing.Pool(a.workers, _report_init, (a.bars, a.signals)) as pool:
-        res = pool.map(_variant_job, VARIANTS)
+        res = pool.map(_variant_job, [v for v in VARIANTS if not a.only or any(o in v[0] for o in a.only.split(","))])
     for r in res:
         print("\n== %s" % r["name"])
         for part in ("design", "holdout", "design_portfolio", "holdout_portfolio"):
@@ -560,6 +612,7 @@ def main(argv=None):
     r.add_argument("--signals", default=SIGNALS)
     r.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     r.add_argument("--json", default=None)
+    r.add_argument("--only", default=None, help="comma-separated substrings of variant names to run")
     c = sub.add_parser("calibrate")
     c.add_argument("--bars", default=BARS)
     c.add_argument("--signals", default=SIGNALS)

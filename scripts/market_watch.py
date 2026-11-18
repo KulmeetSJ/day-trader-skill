@@ -46,22 +46,37 @@ for _d in ("trader-alerts", "trader-entry", "trader-scanner", "trader-budget", "
         sys.path.insert(0, _p)
 
 import size  # noqa: E402  (trader-budget/size.py)
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
+import probability  # noqa: E402  (scripts/probability.py: backtest odds for a call)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SETUPS = "breakout_intraday,vwap_reclaim,ema_alignment,rsi_momentum"
+# Bearish setups are scanned for ANALYSIS ONLY: equity execution is long-only (non-negotiable), so
+# these are never alerted as trades -- they go to rejected.csv as "SHORT (not tradable)" so you can
+# see what the bearish side would have done.
+SHORT_SETUPS = "breakdown_intraday,vwap_rejection"
 SESSION_OPEN = datetime.time(9, 15)
 FIRST_CHECK = datetime.time(9, 20)
 SETTLE_SECONDS = 25
 HEARTBEAT_MINUTES = 30
 ERROR_REPEAT_SECONDS = 3600
-MAX_POPUPS_PER_CYCLE = 3
+MAX_POPUPS_PER_CYCLE = 5
 DEFAULT_UNIVERSE = os.path.join("trader", "universe_nifty200.txt")
 EXIT_SETUPS = ("breakout_intraday", "vwap_reclaim", "ema_alignment", "rsi_momentum")
 # Default exit rule, chosen on a 37-session NIFTY200 backtest (scripts/backtest_intraday.py, 2026-11-17):
 # swing-low stop + 2.2R cut stop-outs from ~64% to ~14-22% vs 1.5xATR + 3R and lifted net expectancy
 # from about -0.2R to about break-even. Re-run the backtest before changing these.
 DEFAULT_STOP = "swing"
+# Setups still scanned and scored in rejected.csv, but never alerted. ema_alignment: worst setup in the
+# 37-session backtest (stopped 60-66%, about -0.26R raw) and the two biggest losers live on 2026-11-18.
+ANALYSIS_ONLY_SETUPS = "ema_alignment"
 DEFAULT_TARGET_R = 2.2
+REJECT_FIELDS = ("date", "time", "kind", "direction", "symbol", "setup", "trigger_time", "underlying_price",
+                 "entry", "stop", "target", "qty_or_lots", "net_rr", "reasons",
+                 "p_target", "p_stop", "p_green", "odds_n")
+CSV_FIELDS = ("date", "alert_time", "kind", "action", "symbol", "setup", "trigger_time", "trigger_price",
+              "alert_delay_min", "last_close_at_alert", "entry", "stop", "target", "qty", "lots",
+              "risk_inr_incl_costs", "net_rr", "provider", "p_target", "p_stop", "p_green", "odds_n")
 
 
 def now_ist():
@@ -88,6 +103,42 @@ def notify(title, message, spoken="Trade opportunity"):
          % (json.dumps(message), json.dumps(title))])
 
 
+def _last_line(exc):
+    text = str(exc).strip()
+    return (text.splitlines()[-1] if text else type(exc).__name__)[:200]
+
+
+def append_row(path, fields, row):
+    """Append a CSV row. If the file's header is older (fewer columns), rewrite it once with the
+    new header first so old rows keep their values and new columns line up."""
+    import csv
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", newline="") as fh:
+            header = next(csv.reader(fh), None)
+        if header and tuple(header) != tuple(fields):
+            with open(path, encoding="utf-8", newline="") as fh:
+                old = list(csv.DictReader(fh))
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(old)
+            os.replace(tmp, path)
+    new = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def odds_fields(o):
+    if not o:
+        return {}
+    return {"p_target": round(o["p"]["target"], 3), "p_stop": round(o["p"]["stop"], 3),
+            "p_green": round(o["p_green"], 3), "odds_n": o["n"]}
+
+
 def parse_hhmm(text, default):
     try:
         h, m = str(text).split(":")[:2]
@@ -110,8 +161,89 @@ class Watcher(object):
         self.alerts_this_cycle = 0
         self.last_heartbeat = time.time()
         self.events_path = os.path.join(BASE_DIR, "trader", "state", "watch_events.jsonl")
+        self.csv_path = os.path.join(BASE_DIR, "trader", "state", "opportunities.csv")
+        self.rejected_path = os.path.join(BASE_DIR, "trader", "state", "rejected.csv")
+        self.rejected = 0
+        self.active_short = {}
+        # symbol -> today's last equity call {entry, stop, target, time}. A new hit whose entry is still
+        # inside that call's stop..target range is the same trade (another setup or a few points off),
+        # so it is logged as a repeat, not alerted again. Seeded from the CSV so a restart remembers.
+        self.active = self.load_active_calls()
+        # Daily-loss stop: once today's alerted equity calls (marked to market by scripts/scoreboard.py,
+        # after est. charges) are down max_daily_loss_inr, no more calls are alerted today. Latched for
+        # the day in daily_halt.json so a restart or a bounce doesn't re-open it.
+        self.max_daily_loss = float(self.cfg.get("max_daily_loss_inr") or 5000.0)
+        self.day_path = os.path.join(BASE_DIR, "trader", "state", "scoreboard_day.json")
+        self.halt_path = os.path.join(BASE_DIR, "trader", "state", "daily_halt.json")
+        self.halted = self.load_halt()
+        # Odds table from scripts/probability.py (backtest base rates). Missing -> "odds n/a", never invented.
+        self.prob_model = probability.load_model(os.path.join(BASE_DIR, probability.MODEL_PATH))
+        self.loss_unknown = None
+
+    def load_active_calls(self):
+        import csv
+        out = {}
+        today = now_ist().strftime("%Y-%m-%d")
+        try:
+            with open(self.csv_path, encoding="utf-8", newline="") as fh:
+                for r in csv.DictReader(fh):
+                    if r.get("date") == today and r.get("kind") == "equity":
+                        out[r["symbol"]] = {"entry": float(r["entry"]), "stop": float(r["stop"]),
+                                            "target": float(r["target"]), "time": r.get("alert_time", "")[:5]}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return out
 
     # ------------------------------------------------------------------ helpers
+    def load_halt(self):
+        try:
+            with open(self.halt_path, encoding="utf-8") as fh:
+                h = json.load(fh)
+            return h if h.get("date") == now_ist().strftime("%Y-%m-%d") else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def update_daily_loss(self):
+        """Read scoreboard_day.json; latch the halt when the day's net P&L reaches -max_daily_loss.
+        If the total can't be read while calls are open today, block alerts this cycle (fail closed)."""
+        self.loss_unknown = None
+        if self.halted:
+            return
+        today = now_ist().strftime("%Y-%m-%d")
+        try:
+            with open(self.day_path, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if d.get("date") != today:
+                raise ValueError("scoreboard total is for %s, not today" % d.get("date"))
+            as_of = datetime.datetime.strptime(d["as_of"], "%Y-%m-%d %H:%M")
+            age = (now_ist().replace(tzinfo=None) - as_of).total_seconds() / 60.0
+            if age > 15:
+                raise ValueError("scoreboard total is %.0f min old" % age)
+            net = float(d["net_inr_worst_case"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            if self.active:   # calls exist today but their P&L is unknown
+                self.loss_unknown = "DAILY_LOSS_UNKNOWN: can't read today's P&L (%s); no new calls until it can" % e
+            return
+        if net <= -self.max_daily_loss + 1e-9:
+            self.halted = {"date": today, "at": now_ist().strftime("%H:%M"), "net_inr": net,
+                           "limit_inr": self.max_daily_loss}
+            try:
+                with open(self.halt_path, "w", encoding="utf-8") as fh:
+                    json.dump(self.halted, fh)
+            except OSError as e:
+                self.error("daily halt file", e)
+            msg = ("Daily loss limit hit: today's calls are at Rs %.0f (limit Rs %.0f). No more calls today; "
+                   "still logging to rejected.csv." % (net, self.max_daily_loss))
+            emit("WATCH HALT: " + msg)
+            notify("STOP - daily loss limit (paper)", msg, spoken="Daily loss limit hit. No more trades today.")
+
+    def loss_block(self):
+        """Reason string if new calls must not be alerted, else None."""
+        if self.halted:
+            return ("DAILY_LOSS: today's calls reached Rs %.0f at %s (limit Rs %.0f); no new calls today"
+                    % (self.halted["net_inr"], self.halted["at"], self.halted["limit_inr"]))
+        return self.loss_unknown
+
     def error(self, where, exc):
         msg = "%s: %s" % (where, str(exc).strip().splitlines()[-1][:300] if str(exc).strip() else type(exc).__name__)
         last = self.last_error.get(msg)
@@ -119,21 +251,47 @@ class Watcher(object):
             self.last_error[msg] = time.time()
             emit("WATCH ERROR " + msg)
 
-    def record(self, kind, payload, summary):
+    def append_csv(self, row):
+        """One human-readable row per opportunity (open in Numbers/Excel) -- survives dismissing the pop-up."""
+        try:
+            append_row(self.csv_path, CSV_FIELDS, row)
+        except Exception as e:
+            self.error("csv log", e)
+
+    def setup_block(self, setup):
+        off = [x.strip() for x in str(getattr(self.args, "analysis_only_setups", ANALYSIS_ONLY_SETUPS) or "").split(",")
+               if x.strip()]
+        if setup in off:
+            return "SETUP_OFF: %s is analysis-only (no edge in backtest); logged for scoring, not alerted" % setup
+        return None
+
+    def reject(self, row):
+        """A call that was found but NOT alerted -- with why -- so it can be scored later
+        (scripts/scoreboard.py). Never a pop-up."""
+        self.rejected += 1
+        now = now_ist()
+        row = dict(row, date=now.strftime("%Y-%m-%d"), time=now.strftime("%H:%M:%S"))
+        try:
+            append_row(self.rejected_path, REJECT_FIELDS, row)
+        except Exception as e:
+            self.error("rejected log", e)
+
+    def record(self, kind, payload, summary, title, spoken, row):
         self.opportunities += 1
-        payload = dict(payload, kind=kind, detected_at=now_ist().isoformat(), summary=summary)
+        detected = now_ist()
+        payload = dict(payload, kind=kind, detected_at=detected.isoformat(), summary=summary)
         try:
             with open(self.events_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, default=str) + "\n")
         except Exception as e:
             self.error("event log", e)
+        self.append_csv(dict(row, date=detected.strftime("%Y-%m-%d"), alert_time=detected.strftime("%H:%M:%S"),
+                             kind=kind))
         emit("OPPORTUNITY " + summary)
         self.alerts_this_cycle += 1
         if self.alerts_this_cycle > MAX_POPUPS_PER_CYCLE:
             return  # logged above; don't stack voice/pop-ups (flood backstop)
-        sym = (payload.get("hit") or {}).get("symbol") or ""
-        notify("Trade opportunity (paper)", summary,
-               spoken="Trade opportunity. %s %s." % (kind, sym) if sym else "Trade opportunity. %s." % kind)
+        notify(title, summary + "\n\nSaved to trader/state/opportunities.csv", spoken=spoken)
 
     def portfolio_cash(self):
         path = os.path.join(BASE_DIR, "trader", "portfolio.json")
@@ -150,7 +308,7 @@ class Watcher(object):
     def scan_equities(self):
         cmd = [sys.executable, os.path.join(BASE_DIR, "trader-scanner", "scan.py"), "intraday",
                "--market", "IN"] + (["--universe", self.args.universe] if self.args.universe
-                                    else ["--watchlist", self.args.watchlist]) + ["--setups", self.args.setups,
+                                    else ["--watchlist", self.args.watchlist]) + ["--setups", self.scan_setups(),
                "--interval", "5m", "--state", os.path.join("trader", "state", "watch_scan.json"),
                "--no-write", "--json"]
         out = subprocess.run(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -159,6 +317,9 @@ class Watcher(object):
             raise RuntimeError(out.stderr or out.stdout or "scan.py exit %d" % out.returncode)
         doc = json.loads(out.stdout[out.stdout.index("{"):])
         return doc
+
+    def scan_setups(self):
+        return self.args.setups + ("" if self.args.no_short_signals else "," + SHORT_SETUPS)
 
     def trigger_age_minutes(self, close_time):
         try:
@@ -198,6 +359,7 @@ class Watcher(object):
             if h.get("analytical_only") or not h.get("is_tradable_equity", True):
                 continue
             if str(h.get("side") or "buy").lower() not in ("buy", "long"):
+                self.log_short(h, today)
                 continue
             d = h.get("decision") or {}
             trig = h.get("trigger") or {}
@@ -214,9 +376,18 @@ class Watcher(object):
             entry = d.get("entry_reference")
             if entry is None or d.get("stop_loss") is None:
                 continue
+            prev = self.active.get(h.get("symbol"))
+            if prev and prev["stop"] < float(entry) < prev["target"]:
+                self.seen.add(key)
+                emit("WATCH repeat (no alert): %s %s @ %.2f is inside the %s call's range %.2f-%.2f"
+                     % (h.get("symbol"), h.get("setup"), float(entry), prev["time"], prev["stop"], prev["target"]))
+                continue
             # Stop/target come from the real trader-exit CLI (exit.compute), with the same
             # --stop/--target flags you'd use in the pipeline -- the watcher computes nothing.
             stop_arg = ("price:%s" % d.get("stop_loss")) if self.args.stop == "scanner" else self.args.stop
+            base_row = {"kind": "equity", "direction": "LONG", "symbol": h.get("symbol"), "setup": h.get("setup"),
+                        "trigger_time": trig.get("close_time"), "underlying_price": trig.get("close"),
+                        "entry": entry}
             try:
                 ex = self.exit_plan(h.get("symbol"), entry, trig.get("close_time"), stop_arg, h.get("setup"))
             except Exception as e:
@@ -224,8 +395,12 @@ class Watcher(object):
                 self.confirmed_rejected += 1
                 if "timed out" in str(e).lower():
                     self.error("exit plan %s" % h.get("symbol"), e)
+                self.reject(dict(base_row, reasons="EXIT_PLAN: " + _last_line(e)))
                 continue
             stop, target = ex.get("stop"), ex.get("target")
+            odds = probability.odds_for(self.prob_model, trig.get("close_time"), ex.get("entry", entry), target,
+                                        ex.get("atr"))
+            base_row = dict(base_row, **odds_fields(odds))
             plan = {
                 "symbol": h.get("symbol"), "side": "buy", "setup": h.get("setup"),
                 "entry": ex.get("entry", entry), "stop": stop, "target": target,
@@ -243,22 +418,80 @@ class Watcher(object):
             except Exception as e:  # SizeError and friends: a refusal, not a crash
                 self.seen.add(key)
                 self.confirmed_rejected += 1
+                self.reject(dict(base_row, entry=entry, stop=stop, target=target, reasons="BUDGET: " + _last_line(e)))
                 continue
             self.seen.add(key)
             net_rr = s.get("net_reward_risk")
             if s.get("refusal") or not s.get("qty") or net_rr is None or net_rr < self.min_rr - 1e-9:
                 self.confirmed_rejected += 1
+                why = ("BUDGET: %s" % s.get("refusal")) if s.get("refusal") else (
+                    "BUDGET: qty 0" if not s.get("qty") else "NET_RR: %.2f after charges < %.2f" % (net_rr or 0, self.min_rr))
+                self.reject(dict(base_row, entry=entry, stop=stop, target=target, qty_or_lots=s.get("qty"),
+                                 net_rr=round(net_rr, 2) if net_rr is not None else "", reasons=why))
+                continue
+            blocked = self.setup_block(h.get("setup")) or self.loss_block()
+            if blocked:
+                self.reject(dict(base_row, entry=entry, stop=stop, target=target, qty_or_lots=s.get("qty"),
+                                 net_rr=round(net_rr, 2), reasons=blocked))
                 continue
             costs = (s.get("transaction_costs") or {}).get("total")
-            summary = ("EQUITY %s %s | trigger %s @ %.2f | entry %.2f stop %.2f target %.2f | qty %s | "
-                       "net R:R %.2f after charges (est. charges %s) | %s %s"
-                       % (h.get("symbol"), h.get("setup"), trig.get("close_time"), float(trig.get("close") or entry),
+            # Latest COMPLETED 5m close the scanner saw (reported, not computed): if it is already
+            # below the entry, the breakout has not followed through by the time you read this.
+            last_close = ((h.get("candle_context") or {}).get("completed_candle") or {}).get("close")
+            age_now = self.trigger_age_minutes(trig.get("close_time"))
+            if last_close is not None:
+                vs = (float(last_close) - float(entry)) / float(entry) * 100.0
+                follow = "last 5m close %.2f (%+.2f%% vs entry%s)" % (
+                    float(last_close), vs, ", BELOW ENTRY" if float(last_close) < float(entry) else "")
+            else:
+                follow = "last 5m close n/a"
+            sym = h.get("symbol")
+            summary = ("BUY EQUITY SHARES (long, not an option) %s %s | trigger %s @ %.2f | alerted %.0f min later, %s | "
+                       "entry %.2f stop %.2f target %.2f | qty %s | net R:R %.2f after charges (est. charges %s) | %s %s"
+                       % (sym, h.get("setup"), trig.get("close_time"), float(trig.get("close") or entry),
+                          age_now or 0, follow,
                           float(entry), float(stop), float(target), s.get("qty"), net_rr,
                           ("%.2f" % costs) if costs is not None else "n/a",
                           plan["provider"], plan["data_status"]))
+            summary += " | " + probability.odds_text(odds, self.prob_model)
+            row = {"action": "BUY shares (long equity)", "symbol": sym, "setup": h.get("setup"),
+                   "trigger_time": trig.get("close_time"), "trigger_price": trig.get("close"),
+                   "alert_delay_min": ("%.1f" % age_now) if age_now is not None else "",
+                   "last_close_at_alert": last_close, "entry": entry, "stop": stop, "target": target,
+                   "qty": s.get("qty"), "risk_inr_incl_costs": s.get("net_risk_including_costs"),
+                   "net_rr": round(net_rr, 2), "provider": plan["provider"]}
+            row.update(odds_fields(odds))
             self.record("equity", {"hit": h, "sizing": {k: s.get(k) for k in
                         ("qty", "entry", "stop", "target", "net_reward_risk", "net_reward_after_costs",
-                         "net_risk_including_costs", "bound_by", "max_loss_per_trade")}}, summary)
+                         "net_risk_including_costs", "bound_by", "max_loss_per_trade")}}, summary,
+                        title="BUY %s shares - equity, not an option (paper)%s" % (
+                            sym, (" - target odds %.0f%%" % (100 * odds["p"]["target"])) if odds else ""),
+                        spoken="Buy %s shares. Equity, not an option." % sym, row=row)
+            self.active[sym] = {"entry": float(entry), "stop": float(stop), "target": float(target),
+                                "time": now_ist().strftime("%H:%M")}
+
+    def log_short(self, h, today):
+        """Bearish equity setup: analysis only (long-only execution). Uses the scanner's own
+        entry/stop/2R target; fresh triggers only; one row per symbol while price is in range."""
+        d = h.get("decision") or {}
+        trig = h.get("trigger") or {}
+        key = "SHORT|%s|%s|%s|%s" % (today, h.get("symbol"), h.get("setup"), trig.get("close_time"))
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        age = self.trigger_age_minutes(trig.get("close_time"))
+        entry, stop = d.get("entry_reference"), d.get("stop_loss")
+        target = (d.get("targets") or {}).get("t2_2r") or d.get("target_2_2r")
+        if age is None or age > self.args.max_trigger_age or None in (entry, stop, target):
+            return
+        prev = self.active_short.get(h.get("symbol"))
+        if prev and prev["target"] < float(entry) < prev["stop"]:
+            return
+        self.active_short[h.get("symbol")] = {"stop": float(stop), "target": float(target)}
+        self.reject({"kind": "equity_short", "direction": "SHORT", "symbol": h.get("symbol"), "setup": h.get("setup"),
+                     "trigger_time": trig.get("close_time"), "underlying_price": trig.get("close"),
+                     "entry": entry, "stop": stop, "target": target,
+                     "reasons": "LONG_ONLY: short side is analysis only, never executed"})
 
     # ------------------------------------------------------------------ options
     def check_options(self):
@@ -290,32 +523,77 @@ class Watcher(object):
                     continue
                 self.seen.add(key)
                 ps = sig.get("position_sizing") or {}
-                summary = ("OPTIONS %s %s %s | premium %s | stop %s T1 %s | net R:R %s | lots %s | max loss %s "
+                strat = str(sig.get("strategy") or "")
+                _ut = sig.get("underlying_trigger") if isinstance(sig.get("underlying_trigger"), dict) else {}
+                blocked = (self.setup_block(_ut.get("setup")) or self.loss_block()) if sig.get("_validated") else None
+                if not sig.get("_validated") or blocked:
+                    ut = sig.get("underlying_trigger") if isinstance(sig.get("underlying_trigger"), dict) else {}
+                    self.reject({"kind": "options", "direction": sig.get("direction") or "",
+                                 "symbol": sig.get("contract") or sym, "setup": "%s (%s)" % (strat, ut.get("setup") or "?"),
+                                 "trigger_time": ut.get("time"), "underlying_price": ut.get("current_spot") or ut.get("price"),
+                                 "entry": sig.get("current_premium"), "stop": sig.get("stop_loss"),
+                                 "target": sig.get("target_1"), "qty_or_lots": ps.get("lots"),
+                                 "net_rr": sig.get("expected_risk_reward_after_charges"),
+                                 "reasons": blocked or "; ".join(str(r)[:120] for r in (sig.get("rejection_reasons") or []))
+                                 or sig.get("signal_state")})
+                    continue
+                summary = ("OPTION %s %s %s | premium %s | stop %s T1 %s | net R:R %s | lots %s | max loss %s "
                            "(decision-support only; options are never executed by this system)"
-                           % (sym, sig.get("strategy"), sig.get("contract"), sig.get("current_premium"),
+                           % (strat, sym, sig.get("contract"), sig.get("current_premium"),
                               sig.get("stop_loss"), sig.get("target_1"),
                               sig.get("expected_risk_reward_after_charges"), ps.get("lots"),
                               sig.get("maximum_loss")))
-                self.record("options", {"signal": sig}, summary)
+                row = {"action": "OPTION %s" % strat, "symbol": sig.get("contract") or sym, "setup": strat,
+                       "trigger_time": (sig.get("underlying_trigger") or {}).get("time")
+                       if isinstance(sig.get("underlying_trigger"), dict) else sig.get("underlying_trigger"),
+                       "entry": sig.get("current_premium"), "stop": sig.get("stop_loss"),
+                       "target": sig.get("target_1"), "lots": ps.get("lots"),
+                       "risk_inr_incl_costs": sig.get("maximum_loss"),
+                       "net_rr": sig.get("expected_risk_reward_after_charges")}
+                self.record("options", {"signal": sig}, summary,
+                            title="OPTION %s %s (decision-support only)" % (strat.replace("_", " "), sym),
+                            spoken="Option signal. %s %s." % (sym, strat.replace("_", " ")), row=row)
 
     # ------------------------------------------------------------------ loop
     def cycle(self):
         self.cycles += 1
         self.alerts_this_cycle = 0
+        t0 = time.time()
+        # Scoreboard first: it writes today's P&L total that the daily-loss stop reads.
+        self.refresh_scoreboard()
+        self.update_daily_loss()
         try:
             self.check_equities()
         except Exception as e:
             self.error("equity scan", e)
+        t_eq = time.time() - t0
         try:
             self.check_options()
         except Exception as e:
             self.error("options scan", e)
+        took = time.time() - t0
+        if took > 300 - SETTLE_SECONDS:
+            emit("WATCH SLOW: cycle took %.0fs (equities %.0fs, options %.0fs) -- the next 5m candle's "
+                 "check is skipped, so alerts run late" % (took, t_eq, took - t_eq))
 
     def heartbeat(self, force=False):
         if force or time.time() - self.last_heartbeat >= HEARTBEAT_MINUTES * 60:
             self.last_heartbeat = time.time()
-            emit("WATCH alive: %d cycles, %d opportunities, %d confirmed setups refused by budget/net R:R"
-                 % (self.cycles, self.opportunities, self.confirmed_rejected))
+            emit("WATCH alive: %d cycles, %d opportunities, %d confirmed setups refused by budget/net R:R, "
+                 "%d rejected/short calls logged to trader/state/rejected.csv%s"
+                 % (self.cycles, self.opportunities, self.confirmed_rejected, self.rejected,
+                    " | HALTED for the day (daily loss limit)" if self.halted else ""))
+
+    def refresh_scoreboard(self):
+        """Rewrite trader/state/scoreboard.txt (scripts/scoreboard.py) in its own process."""
+        try:
+            out = subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts", "scoreboard.py")],
+                                 cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True, timeout=60)
+            if out.returncode != 0:
+                raise RuntimeError(out.stderr or "scoreboard exit %d" % out.returncode)
+        except Exception as e:
+            self.error("scoreboard", e)
 
     def next_wake(self, now):
         base = now.replace(second=0, microsecond=0)
@@ -359,13 +637,32 @@ def build_universe(path):
 
 
 def options_worker(sym, budget):
-    """Child-process mode: print validated + actionable options signals for one symbol as JSON."""
+    """Child-process mode: print every options signal for one symbol as JSON, each flagged
+    `_validated` (SIGNAL VALIDATED and actionable) or not, so the parent can alert the first
+    kind and log the second with its rejection reasons.
+
+    Uses the same MarketIntelligenceOrchestrator + Upstox WebSocket streamer lifecycle as
+    `options.py analyze`: the streamer supplies the exchange timestamps the engine's freshness
+    checks require (the REST option chain carries none, so without it every signal fails closed
+    with UNDERLYING_SPOT_UNVERIFIED / MISSING_QUOTE_TIMESTAMP). If the streamer can't connect,
+    analysis still runs and fails closed exactly as before -- the checks are never relaxed."""
     os.chdir(BASE_DIR)
-    from options import OptionsIntelligenceSpecialist, STATE_SIGNAL_VALIDATED
-    res = OptionsIntelligenceSpecialist().analyze_symbol_for_options(sym, max_loss_budget=budget)
-    keep = [s for s in (res.get("signals") or [])
-            if s.get("signal_state") == STATE_SIGNAL_VALIDATED and s.get("is_actionable")]
-    sys.stdout.write(json.dumps(keep, default=str))
+    from options import STATE_SIGNAL_VALIDATED
+    from orchestrator import MarketIntelligenceOrchestrator
+    with MarketIntelligenceOrchestrator() as orch:
+        if orch.streamer is not None and not getattr(orch.streamer, "is_connected", False):
+            try:
+                orch.streamer.connect()
+            except Exception as e:
+                sys.stderr.write("options streamer connect failed: %s\n" % _last_line(e))
+        if orch.streamer is not None and getattr(orch.specialist, "streamer", None) is None:
+            orch.specialist.streamer = orch.streamer
+        res = orch.specialist.analyze_symbol_for_options(sym, max_loss_budget=budget)
+    out = []
+    for s in res.get("signals") or []:
+        s = dict(s, _validated=bool(s.get("signal_state") == STATE_SIGNAL_VALIDATED and s.get("is_actionable")))
+        out.append(s)
+    sys.stdout.write(json.dumps(out, default=str))
     sys.stdout.flush()
     os._exit(0)  # don't wait on any lingering feed threads
 
@@ -390,7 +687,12 @@ def main(argv=None):
                     help="only alert on triggers whose candle closed within this many minutes (default 10)")
     ap.add_argument("--setups", default=SETUPS,
                     help="scanner setups to watch (default: %s)" % SETUPS)
+    ap.add_argument("--analysis-only-setups", default=ANALYSIS_ONLY_SETUPS,
+                    help="setups scanned and logged to rejected.csv but never alerted, comma-separated; "
+                         "'' alerts all (default: %(default)s)")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--no-short-signals", action="store_true",
+                    help="don't scan bearish setups for rejected.csv (they are never alerted either way)")
     ap.add_argument("--options-worker", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if a.options_worker:
