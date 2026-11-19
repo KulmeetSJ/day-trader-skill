@@ -13,6 +13,9 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location("market_watch", os.path.join(BASE, "scripts", "market_watch.py"))
 mw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mw)
+# Tests must never pop up real notifications or speak (a failing test once showed a fake option
+# alert on the desktop during market hours).
+mw.notify = lambda *a, **k: None
 
 
 class Args(object):
@@ -32,6 +35,7 @@ def make_watcher():
     w.day_path = os.path.join(d, "day.json")
     w.halt_path = os.path.join(d, "halt.json")
     w.halted, w.loss_unknown = None, None
+    w.market_ctx = {}
     return w
 
 
@@ -152,7 +156,8 @@ class TestDailyLossStop(unittest.TestCase):
         w.args.budget = 2000.0
         w.halted = {"date": "x", "at": "13:40", "net_inr": -5005.0, "limit_inr": 5000.0}
         sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
-               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "vwap_reclaim"}}
+               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "vwap_reclaim"},
+               "current_premium": 160.5, "stop_loss": 143.3, "target_1": 175.9}
 
         class R(object):
             returncode, stderr, stdout = 0, "", _json.dumps([sig])
@@ -167,11 +172,16 @@ class TestDailyLossStop(unittest.TestCase):
 
 
 class TestAnalysisOnlySetups(unittest.TestCase):
-    def test_ema_alignment_is_off_by_default(self):
+    def test_listed_setup_is_analysis_only(self):
         w = make_watcher()
-        self.assertTrue(w.setup_block("ema_alignment").startswith("SETUP_OFF:"))
-        self.assertIsNone(w.setup_block("vwap_reclaim"))
-        self.assertIn("ema_alignment", w.scan_setups())   # still scanned, so it keeps being scored
+        self.assertIsNone(w.setup_block("ema_alignment"))   # default: every setup alerts
+        w.args.analysis_only_setups = "ema_alignment"
+        try:
+            self.assertTrue(w.setup_block("ema_alignment").startswith("SETUP_OFF:"))
+            self.assertIsNone(w.setup_block("vwap_reclaim"))
+            self.assertIn("ema_alignment", w.scan_setups())   # still scanned, so it keeps being scored
+        finally:
+            del w.args.analysis_only_setups
 
     def test_empty_list_alerts_all(self):
         w = make_watcher()
@@ -186,8 +196,10 @@ class TestAnalysisOnlySetups(unittest.TestCase):
         w = make_watcher()
         w.args.options = ["NIFTY"]
         w.args.budget = 2000.0
+        w.args.analysis_only_setups = "ema_alignment"
         sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
-               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "ema_alignment"}}
+               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "ema_alignment"},
+               "current_premium": 160.5, "stop_loss": 143.3, "target_1": 175.9}
 
         class R(object):
             returncode, stderr, stdout = 0, "", _json.dumps([sig])
@@ -199,6 +211,43 @@ class TestAnalysisOnlySetups(unittest.TestCase):
             mw.subprocess.run = orig
         self.assertEqual(rows(w.csv_path), [])
         self.assertTrue(rows(w.rejected_path)[0]["reasons"].startswith("SETUP_OFF:"))
+        del w.args.analysis_only_setups
+
+
+class TestIncompleteOptionSignal(unittest.TestCase):
+    def test_validated_signal_without_numbers_is_rejected_not_alerted(self):
+        import json as _json
+        w = make_watcher()
+        w.args.options = ["NIFTY"]
+        w.args.budget = 2000.0
+        sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
+               "_validated": True, "underlying_trigger": {"time": "09:20", "setup": "vwap_reclaim"}}
+
+        class R(object):
+            returncode, stderr, stdout = 0, "", _json.dumps([sig])
+        orig = mw.subprocess.run
+        mw.subprocess.run = lambda *a, **k: R()
+        try:
+            w.check_options()
+        finally:
+            mw.subprocess.run = orig
+        self.assertEqual(rows(w.csv_path), [])
+        self.assertTrue(rows(w.rejected_path)[0]["reasons"].startswith("INCOMPLETE_SIGNAL:"))
+
+
+class TestMarketContextLogged(unittest.TestCase):
+    def test_rejected_row_carries_vix_and_nifty(self):
+        w = make_watcher()
+        w.market_ctx = {"india_vix": 15.57, "nifty_chg_pct": -0.16, "nifty_vs_open_pct": 0.2}
+        w.reject({"kind": "equity", "symbol": "X", "reasons": "BUDGET: test"})
+        r = rows(w.rejected_path)[0]
+        self.assertEqual((r["india_vix"], r["nifty_chg_pct"], r["nifty_vs_open_pct"]), ("15.57", "-0.16", "0.2"))
+
+    def test_context_failure_never_blocks(self):
+        w = make_watcher()
+        w.market_ctx = {}
+        w.reject({"kind": "equity", "symbol": "X", "reasons": "BUDGET: test"})
+        self.assertEqual(rows(w.rejected_path)[0]["india_vix"], "")
 
 
 class TestScoreboardTotals(unittest.TestCase):

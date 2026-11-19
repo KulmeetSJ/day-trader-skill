@@ -112,6 +112,26 @@ def _build_regime_context(setup_name: str, broad_regime: Optional[str]) -> Dict[
 # Strategy Identifiers
 STRATEGY_BUY_CE = "BUY_CE"
 STRATEGY_BUY_PE = "BUY_PE"
+
+
+def resolve_direction_conflict(bull, bear):
+    """(bull, bear, note) when a bullish AND a bearish underlying setup both qualify.
+    Only a setup whose trigger actually fired (status "triggered") can win; if both fired, the one
+    on the later completed candle wins; otherwise neither does (no decisive trigger)."""
+    def fired(x):
+        return (x or {}).get("status") == "triggered"
+
+    def when(x):
+        return str(((x or {}).get("trigger") or {}).get("close_time") or "")
+    bn, rn = (bull or {}).get("setup", "bullish"), (bear or {}).get("setup", "bearish")
+    if fired(bull) and not fired(bear):
+        return bull, None, "%s triggered; %s only %s" % (bn, rn, (bear or {}).get("status"))
+    if fired(bear) and not fired(bull):
+        return None, bear, "%s triggered; %s only %s" % (rn, bn, (bull or {}).get("status"))
+    if fired(bull) and fired(bear) and when(bull) != when(bear):
+        return (bull, None, "%s fired later" % bn) if when(bull) > when(bear) else (None, bear, "%s fired later" % rn)
+    return None, None, "%s (%s) and %s (%s) with no decisive trigger" % (
+        bn, (bull or {}).get("status"), rn, (bear or {}).get("status"))
 STRATEGY_SELL_CE = "SELL_CE"
 STRATEGY_SELL_PE = "SELL_PE"
 STRATEGY_BULL_CALL_SPREAD = "BULL_CALL_SPREAD"
@@ -2642,6 +2662,23 @@ class OptionsIntelligenceSpecialist:
             if valid_bears:
                 valid_bears.sort(key=lambda x: 0 if x.get("status") == "triggered" else 1)
                 found_bear_setup = valid_bears[0]
+
+        # One trigger, one direction. A bullish and a bearish setup can both "qualify" at once (e.g.
+        # the index sitting on VWAP: vwap_reclaim and vwap_rejection both waiting) -- that produced
+        # mirror-image BUY_CE + BUY_PE pairs, a coin flip by construction (2026-11-18 logs). A PE is
+        # fine on a bullish day, but it must come from a bearish trigger that actually fired.
+        conflict_note = None
+        if found_bull_setup and found_bear_setup:
+            found_bull_setup, found_bear_setup, conflict_note = resolve_direction_conflict(
+                found_bull_setup, found_bear_setup)
+            if not found_bull_setup and not found_bear_setup:
+                return {
+                    "symbol": symbol,
+                    "status": "NO_TRADE",
+                    "reason": "CONFLICTING_DIRECTION: " + conflict_note,
+                    "signals": [],
+                    "session_status": session_status,
+                }
 
         # If neither bullish nor bearish setups qualify on real chart
         if not found_bull_setup and not found_bear_setup:

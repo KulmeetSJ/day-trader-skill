@@ -67,16 +67,18 @@ EXIT_SETUPS = ("breakout_intraday", "vwap_reclaim", "ema_alignment", "rsi_moment
 # swing-low stop + 2.2R cut stop-outs from ~64% to ~14-22% vs 1.5xATR + 3R and lifted net expectancy
 # from about -0.2R to about break-even. Re-run the backtest before changing these.
 DEFAULT_STOP = "swing"
-# Setups still scanned and scored in rejected.csv, but never alerted. ema_alignment: worst setup in the
-# 37-session backtest (stopped 60-66%, about -0.26R raw) and the two biggest losers live on 2026-11-18.
-ANALYSIS_ONLY_SETUPS = "ema_alignment"
+# Setups still scanned and scored in rejected.csv, but never alerted (comma-separated). Empty: none.
+# (ema_alignment was here for a day; among calls that pass the budget gate it was no worse than the
+# other setups in the 37-session backtest -- 2026-11-19 diagnosis -- so it is alerted again.)
+ANALYSIS_ONLY_SETUPS = ""
 DEFAULT_TARGET_R = 2.2
 REJECT_FIELDS = ("date", "time", "kind", "direction", "symbol", "setup", "trigger_time", "underlying_price",
                  "entry", "stop", "target", "qty_or_lots", "net_rr", "reasons",
-                 "p_target", "p_stop", "p_green", "odds_n")
+                 "p_target", "p_stop", "p_green", "odds_n", "india_vix", "nifty_chg_pct", "nifty_vs_open_pct")
 CSV_FIELDS = ("date", "alert_time", "kind", "action", "symbol", "setup", "trigger_time", "trigger_price",
               "alert_delay_min", "last_close_at_alert", "entry", "stop", "target", "qty", "lots",
-              "risk_inr_incl_costs", "net_rr", "provider", "p_target", "p_stop", "p_green", "odds_n")
+              "risk_inr_incl_costs", "net_rr", "provider", "p_target", "p_stop", "p_green", "odds_n",
+              "india_vix", "nifty_chg_pct", "nifty_vs_open_pct")
 
 
 def option_key(day, contract, strategy, trigger_time):
@@ -175,6 +177,9 @@ class Watcher(object):
         self.active = self.load_active_calls()
         # Options signals already alerted or rejected today: a restart must not alert them again.
         self.seen.update(self.load_seen_options())
+        # India VIX and NIFTY at the time of each call, logged with it (refreshed once a cycle) so the
+        # VIX / market-regime leads from the 2026-11-19 diagnosis can be tested on new days.
+        self.market_ctx = {}
         # Daily-loss stop: once today's alerted equity calls (marked to market by scripts/scoreboard.py,
         # after est. charges) are down max_daily_loss_inr, no more calls are alerted today. Latched for
         # the day in daily_halt.json so a restart or a bounce doesn't re-open it.
@@ -199,6 +204,26 @@ class Watcher(object):
         except (OSError, ValueError, KeyError, TypeError):
             pass
         return out
+
+    def refresh_market_ctx(self):
+        """{india_vix, nifty_chg_pct, nifty_vs_open_pct} from live quotes; blank on any failure
+        (context for later analysis only -- never gates a call)."""
+        ctx = {}
+        try:
+            import data_in
+            p = data_in.get_provider()
+            v = p.get_quote("INDIA VIX") or {}
+            if v.get("price") is not None:
+                ctx["india_vix"] = round(float(v["price"]), 2)
+            n = p.get_quote("NIFTY") or {}
+            px, prev, opn = n.get("price"), n.get("prev_close"), n.get("open")
+            if px is not None and prev:
+                ctx["nifty_chg_pct"] = round((float(px) - float(prev)) / float(prev) * 100, 2)
+            if px is not None and opn:
+                ctx["nifty_vs_open_pct"] = round((float(px) - float(opn)) / float(opn) * 100, 2)
+        except Exception as e:
+            self.error("market context", e)
+        self.market_ctx = ctx
 
     def load_seen_options(self):
         """Today's options dedupe keys (same format as check_options) rebuilt from both CSVs."""
@@ -293,6 +318,7 @@ class Watcher(object):
         (scripts/scoreboard.py). Never a pop-up."""
         self.rejected += 1
         now = now_ist()
+        row = dict(self.market_ctx, **row)
         row = dict(row, date=now.strftime("%Y-%m-%d"), time=now.strftime("%H:%M:%S"))
         try:
             append_row(self.rejected_path, REJECT_FIELDS, row)
@@ -308,8 +334,8 @@ class Watcher(object):
                 fh.write(json.dumps(payload, default=str) + "\n")
         except Exception as e:
             self.error("event log", e)
-        self.append_csv(dict(row, date=detected.strftime("%Y-%m-%d"), alert_time=detected.strftime("%H:%M:%S"),
-                             kind=kind))
+        self.append_csv(dict(self.market_ctx, **dict(row, date=detected.strftime("%Y-%m-%d"),
+                                                     alert_time=detected.strftime("%H:%M:%S"), kind=kind)))
         emit("OPPORTUNITY " + summary)
         self.alerts_this_cycle += 1
         if self.alerts_this_cycle > MAX_POPUPS_PER_CYCLE:
@@ -548,7 +574,11 @@ class Watcher(object):
                 ps = sig.get("position_sizing") or {}
                 strat = str(sig.get("strategy") or "")
                 _ut = sig.get("underlying_trigger") if isinstance(sig.get("underlying_trigger"), dict) else {}
-                blocked = (self.setup_block(_ut.get("setup")) or self.loss_block()) if sig.get("_validated") else None
+                missing = [k for k in ("current_premium", "stop_loss", "target_1") if sig.get(k) is None]
+                if sig.get("_validated") and missing:   # fail closed: never alert a call with no numbers
+                    blocked = "INCOMPLETE_SIGNAL: validated but missing %s; not alerted" % ", ".join(missing)
+                else:
+                    blocked = (self.setup_block(_ut.get("setup")) or self.loss_block()) if sig.get("_validated") else None
                 if not sig.get("_validated") or blocked:
                     ut = sig.get("underlying_trigger") if isinstance(sig.get("underlying_trigger"), dict) else {}
                     self.reject({"kind": "options", "direction": sig.get("direction") or "",
@@ -585,6 +615,7 @@ class Watcher(object):
         # Scoreboard first: it writes today's P&L total that the daily-loss stop reads.
         self.refresh_scoreboard()
         self.update_daily_loss()
+        self.refresh_market_ctx()
         try:
             self.check_equities()
         except Exception as e:

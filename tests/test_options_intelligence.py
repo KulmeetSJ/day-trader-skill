@@ -68,7 +68,15 @@ def orchestrator():
 
 
 # ---------------------------------------------------------------- Test A: Bullish NIFTY -> BUY CE
-def test_acceptance_criteria_a_bullish_nifty_buy_ce(specialist):
+
+@pytest.fixture
+def bullish_scenario(monkeypatch):
+    """The offline chart has a breakout (09:50) AND a later breakdown (11:50); under the
+    one-direction rule the later breakdown wins. Tests of the bullish strategies pin the bullish side."""
+    import options as _opts
+    monkeypatch.setattr(_opts, "resolve_direction_conflict", lambda b, r: (b, None, "test: bullish scenario"))
+
+def test_acceptance_criteria_a_bullish_nifty_buy_ce(specialist, bullish_scenario):
     """A. Bullish NIFTY setup resulting in a validated BUY CE signal."""
     res = specialist.analyze_symbol_for_options("NIFTY")
     assert res["status"] == "OPPORTUNITIES_IDENTIFIED"
@@ -201,7 +209,7 @@ def test_acceptance_criteria_c_bearish_sideways_sell_ce(specialist):
 
 
 # ---------------------------------------------------------------- Test D: Bullish/Sideways -> SELL PE
-def test_acceptance_criteria_d_bullish_sideways_sell_pe(specialist):
+def test_acceptance_criteria_d_bullish_sideways_sell_pe(specialist, bullish_scenario):
     """D. Bullish/sideways setup resulting in a SELL PE evaluation."""
     res = specialist.analyze_symbol_for_options("NIFTY")
     assert res["status"] == "OPPORTUNITIES_IDENTIFIED"
@@ -219,7 +227,7 @@ def test_acceptance_criteria_d_bullish_sideways_sell_pe(specialist):
 
 
 # ---------------------------------------------------------------- Test E: Defined-Risk Spread
-def test_acceptance_criteria_e_defined_risk_spread(specialist):
+def test_acceptance_criteria_e_defined_risk_spread(specialist, bullish_scenario):
     """E. Defined-risk spread evaluation."""
     res = specialist.analyze_symbol_for_options("NIFTY")
     assert res["status"] == "OPPORTUNITIES_IDENTIFIED"
@@ -3595,3 +3603,27 @@ def test_scan_lock_exception_cleanup(tmp_path):
 
 
 
+
+
+# ---------------------------------------------------------------- one trigger, one direction
+def _st(setup, status, t=None):
+    return {"setup": setup, "status": status, "trigger": {"close_time": t} if t else None}
+
+
+def test_direction_conflict_only_a_fired_trigger_wins():
+    from options import resolve_direction_conflict as r
+    b, s, _ = r(_st("vwap_reclaim", "waiting"), _st("vwap_rejection", "waiting"))
+    assert (b, s) == (None, None)                       # index on VWAP: no mirror CE + PE pair
+    b, s, _ = r(_st("breakout_intraday", "waiting"), _st("breakdown_intraday", "triggered", "11:50"))
+    assert b is None and s["setup"] == "breakdown_intraday"   # a PE on a bullish day is fine if it fired
+    b, s, _ = r(_st("breakout_intraday", "triggered", "09:50"), _st("breakdown_intraday", "triggered", "11:50"))
+    assert b is None and s["setup"] == "breakdown_intraday"   # the later trigger supersedes
+    b, s, _ = r(_st("breakout_intraday", "triggered", "12:05"), _st("breakdown_intraday", "triggered", "11:50"))
+    assert s is None and b["setup"] == "breakout_intraday"
+
+
+def test_offline_chart_with_later_breakdown_gives_no_buy_ce(specialist):
+    res = specialist.analyze_symbol_for_options("NIFTY")
+    strats = {s["strategy"] for s in res.get("signals") or []}
+    assert STRATEGY_BUY_CE not in strats
+    assert not ({STRATEGY_BUY_CE, STRATEGY_BUY_PE} <= strats)

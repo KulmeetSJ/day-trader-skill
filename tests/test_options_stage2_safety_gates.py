@@ -100,6 +100,14 @@ def _sell_ce_signal(specialist):
 
 # ---------------------------------------------------------------- 1. Naked option prohibition
 
+
+@pytest.fixture
+def bullish_scenario(monkeypatch):
+    """The offline chart has a breakout (09:50) AND a later breakdown (11:50); under the
+    one-direction rule the later breakdown wins. Tests of the bullish strategies pin the bullish side."""
+    import options as _opts
+    monkeypatch.setattr(_opts, "resolve_direction_conflict", lambda b, r: (b, None, "test: bullish scenario"))
+
 def test_naked_sell_ce_rejected_unconditionally(specialist):
     sig = _sell_ce_signal(specialist)
     assert any(r.startswith("NAKED_OPTION_PROHIBITED") for r in sig["rejection_reasons"])
@@ -134,7 +142,7 @@ def test_buy_ce_disabled_suppresses_buy_ce_signal(specialist):
     assert not any(s["strategy"] == STRATEGY_BUY_CE for s in res["signals"])
 
 
-def test_buy_ce_enabled_default_still_produces_buy_ce_signal(specialist):
+def test_buy_ce_enabled_default_still_produces_buy_ce_signal(specialist, bullish_scenario):
     res = specialist.analyze_symbol_for_options("NIFTY")
     assert res["status"] == "OPPORTUNITIES_IDENTIFIED"
     assert any(s["strategy"] == STRATEGY_BUY_CE for s in res["signals"])
@@ -552,7 +560,7 @@ def test_credit_spreads_off_by_default(specialist):
     assert "BULL_PUT_SPREAD" not in strategies
 
 
-def test_bull_put_credit_spread_generated_when_enabled_with_correct_leg_structure(specialist):
+def test_bull_put_credit_spread_generated_when_enabled_with_correct_leg_structure(specialist, bullish_scenario):
     specialist.config["sell_pe_enabled"] = True
     res = specialist.analyze_symbol_for_options("NIFTY")
     bps = [s for s in res["signals"] if s["strategy"] == STRATEGY_BULL_PUT_SPREAD]
