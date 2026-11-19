@@ -211,5 +211,29 @@ class TestScoreboardTotals(unittest.TestCase):
         self.assertEqual(t["unscored"], ["Y"])
 
 
+class TestOptionsDedupeAcrossRestart(unittest.TestCase):
+    def test_restart_does_not_realert_logged_option(self):
+        import json as _json
+        w = make_watcher()
+        w.args.options = ["NIFTY"]
+        w.args.budget = 2000.0
+        sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
+               "_validated": False, "underlying_trigger": {"time": "10:05", "setup": "vwap_reclaim"}}
+
+        class R(object):
+            returncode, stderr, stdout = 0, "", _json.dumps([sig])
+        orig = mw.subprocess.run
+        mw.subprocess.run = lambda *a, **k: R()
+        try:
+            w.check_options()
+            self.assertEqual(len(rows(w.rejected_path)), 1)
+            w.seen = set()                              # a restart: in-memory dedupe is gone ...
+            w.seen.update(w.load_seen_options())        # ... and rebuilt from the CSVs
+            w.check_options()
+        finally:
+            mw.subprocess.run = orig
+        self.assertEqual(len(rows(w.rejected_path)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

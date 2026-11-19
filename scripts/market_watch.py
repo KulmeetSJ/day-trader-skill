@@ -79,6 +79,10 @@ CSV_FIELDS = ("date", "alert_time", "kind", "action", "symbol", "setup", "trigge
               "risk_inr_incl_costs", "net_rr", "provider", "p_target", "p_stop", "p_green", "odds_n")
 
 
+def option_key(day, contract, strategy, trigger_time):
+    return "OPT|%s|%s|%s|%s" % (day, contract, strategy, trigger_time)
+
+
 def now_ist():
     return datetime.datetime.now(IST)
 
@@ -169,6 +173,8 @@ class Watcher(object):
         # inside that call's stop..target range is the same trade (another setup or a few points off),
         # so it is logged as a repeat, not alerted again. Seeded from the CSV so a restart remembers.
         self.active = self.load_active_calls()
+        # Options signals already alerted or rejected today: a restart must not alert them again.
+        self.seen.update(self.load_seen_options())
         # Daily-loss stop: once today's alerted equity calls (marked to market by scripts/scoreboard.py,
         # after est. charges) are down max_daily_loss_inr, no more calls are alerted today. Latched for
         # the day in daily_halt.json so a restart or a bounce doesn't re-open it.
@@ -193,6 +199,23 @@ class Watcher(object):
         except (OSError, ValueError, KeyError, TypeError):
             pass
         return out
+
+    def load_seen_options(self):
+        """Today's options dedupe keys (same format as check_options) rebuilt from both CSVs."""
+        import csv
+        keys = set()
+        today = now_ist().strftime("%Y-%m-%d")
+        for path in (self.csv_path, self.rejected_path):
+            try:
+                with open(path, encoding="utf-8", newline="") as fh:
+                    for r in csv.DictReader(fh):
+                        if r.get("date") != today or r.get("kind") != "options":
+                            continue
+                        strat = (r.get("setup") or "").split(" ")[0]
+                        keys.add(option_key(today, r.get("symbol"), strat, r.get("trigger_time") or None))
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        return keys
 
     # ------------------------------------------------------------------ helpers
     def load_halt(self):
@@ -516,9 +539,9 @@ class Watcher(object):
                 self.error("options %s" % sym, e)
                 continue
             for sig in signals:
-                key = "OPT|%s|%s|%s|%s" % (today, sig.get("contract"), sig.get("strategy"),
-                                           (sig.get("underlying_trigger") or {}).get("time")
-                                           if isinstance(sig.get("underlying_trigger"), dict) else sig.get("underlying_trigger"))
+                key = option_key(today, sig.get("contract"), sig.get("strategy"),
+                                 (sig.get("underlying_trigger") or {}).get("time")
+                                 if isinstance(sig.get("underlying_trigger"), dict) else sig.get("underlying_trigger"))
                 if key in self.seen:
                     continue
                 self.seen.add(key)
@@ -589,7 +612,7 @@ class Watcher(object):
         try:
             out = subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts", "scoreboard.py")],
                                  cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 universal_newlines=True, timeout=60)
+                                 universal_newlines=True, timeout=150)
             if out.returncode != 0:
                 raise RuntimeError(out.stderr or "scoreboard exit %d" % out.returncode)
         except Exception as e:

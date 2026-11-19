@@ -34,6 +34,12 @@ OUT_PATH = os.path.join(BASE_DIR, "trader", "state", "scoreboard.txt")
 DAY_PATH = os.path.join(BASE_DIR, "trader", "state", "scoreboard_day.json")
 OPEN_MIN = 9 * 60 + 15
 FLAT_BY = "15:20"
+# Paper fills: you can't buy at the trigger candle's close -- the alert lands minutes later. So a call
+# is filled at the OPEN of the first 5m bar starting at/after the alert, plus slippage; a stop that is
+# gapped through fills at that bar's open; every market exit pays slippage. The target is a resting
+# limit, so it fills at the target. 1R stays the PLANNED risk (entry - stop), so R is comparable.
+TICK = 0.05
+SLIP_TICKS = 1
 
 
 def slot(hhmm):
@@ -78,25 +84,51 @@ def load_charges(date, path=EVENTS_PATH):
     return out
 
 
-def score(call, bars, now_slot, side="buy"):
-    """(status, exit_or_last_price, R, gross_pnl) for one call from today's {slot: bar}.
+def fill_slot(call):
+    """First 5m bar that starts at/after the alert (never before the bar after the trigger)."""
+    start = slot(call["trigger_time"])            # trigger bar closes at trigger_time -> next bar starts here
+    at = call.get("alert_time") or call.get("time")
+    if at:
+        h, m = [int(x) for x in str(at).split(":")[:2]]
+        mins = h * 60 + m - OPEN_MIN
+        if len(str(at).split(":")) > 2 and int(str(at).split(":")[2]) > 0:
+            mins += 1                             # 09:37:20 -> the 09:40 bar, never the one already running
+        start = max(start, -(-mins // 5))
+    return start
+
+
+def score(call, bars, now_slot, side="buy", slip_ticks=None):
+    """(status, exit_or_last_price, R, gross_pnl) for one call from today's {slot: bar}, with
+    realistic paper fills (see TICK / SLIP_TICKS). Exit price is net of slippage.
     side "sell" scores a short (stop above entry, target below) -- analysis rows only."""
     import timemachine
     e, s, t = float(call["entry"]), float(call["stop"]), float(call["target"])
     qty = int(float(call.get("qty") or 0))
-    start = slot(call["trigger_time"])            # trigger bar closes at trigger_time -> next bar starts here
+    slip = (SLIP_TICKS if slip_ticks is None else slip_ticks) * TICK
+    long = side == "buy"
+    sign = 1.0 if long else -1.0
+    start = fill_slot(call)
     flat = slot(FLAT_BY) - 1                       # last bar that closes by 15:20
     last = min(now_slot, flat)
     while last >= start and last not in bars:
         last -= 1
-    if last < start:
+    first = start
+    while first <= last and first not in bars:
+        first += 1
+    if last < start or first > last:
         return "WAITING", None, None, None
-    oc, px, _ = timemachine.simulate_exit(bars, start, last, e, s, t, side)
+    fill = float(bars[first].get("o", e)) + sign * slip
+    oc, px, i = timemachine.simulate_exit(bars, first, last, fill, s, t, side)
     status = {"stop": "STOP HIT", "target": "TARGET HIT"}.get(oc)
-    if status is None:
+    if status == "STOP HIT":
+        o = bars[i].get("o")
+        if o is not None and ((o < s) if long else (o > s)):
+            px = float(o)                          # gapped through the stop: out at the open
+        px -= sign * slip
+    elif status is None:
         status = "CLOSED 15:20" if last == flat else "OPEN"
-    sign = 1.0 if side == "buy" else -1.0
-    return status, px, sign * (px - e) / abs(e - s), sign * qty * (px - e)
+        px -= sign * slip
+    return status, px, sign * (px - fill) / abs(e - s), sign * qty * (px - fill)
 
 
 def load_rejected(date, path=REJECTED_PATH):
@@ -166,9 +198,11 @@ def score_rejected(r, bars_for, now_slot):
     return ("RIGHT" if mv > 0 else "WRONG"), now_px, None, "direction only %+.2f" % mv
 
 
-def build(date=None, provider=None, totals=None):
+def build(date=None, provider=None, totals=None, on_totals=None):
     """Return the board text. If `totals` is a dict it is filled with the day's equity-call total
-    (see day_totals) for the watcher's daily-loss stop."""
+    (see day_totals) for the watcher's daily-loss stop. `on_totals(totals)` is called as soon as the
+    alerted calls are scored -- before the slow rejected section -- so the daily-loss total is saved
+    even if the rejected scoring is cut short by a timeout."""
     today = datetime.datetime.now(IST)
     date = date or today.strftime("%Y-%m-%d")
     calls = load_calls(date)
@@ -223,6 +257,8 @@ def build(date=None, provider=None, totals=None):
             worst_case -= abs(risk)
     if totals is not None:
         totals.update(day_totals(date, today, len(calls), n, tot_net, worst_case, unscored))
+        if on_totals is not None:
+            on_totals(totals)
     lines += ["", "%d calls scored: total %+.2fR | gross %+.0f Rs | net %+.0f Rs after est. charges"
               % (n, tot_r, tot_pnl, tot_net),
               "R = move / (entry - stop); 1R = the loss if the stop is hit. Stop is checked before target in",
@@ -315,17 +351,21 @@ def main(argv=None):
     a = ap.parse_args(argv)
     os.chdir(BASE_DIR)
     totals = {}
-    text = build(a.date, totals=totals)
+    save = write_day if (a.date is None and not a.no_write) else None
+    text = build(a.date, totals=totals, on_totals=save)
     print(text)
     if not a.no_write:
         write(text)
-        if a.date is None:
-            import json
-            tmp = DAY_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(totals, fh, indent=1)
-            os.replace(tmp, DAY_PATH)
     return 0
+
+
+def write_day(totals, path=None):
+    import json
+    path = path or DAY_PATH
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(totals, fh, indent=1)
+    os.replace(tmp, path)
 
 
 if __name__ == "__main__":
