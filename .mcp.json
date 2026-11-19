@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "day-trader": {
+      "command": "python3",
+      "args": ["trader-mcp/server.py"]
+    }
+  }
+}

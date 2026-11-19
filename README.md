@@ -74,6 +74,7 @@ The tools need Python 3.8 or newer. Nothing to pip install. Standard library onl
 | `/trader-analyst` | Earnings Analyst | Reads corporate filings and financial reports and sums up what changed. |
 | `/trader-pelosi` | Smart Money / Disclosures | Reads institutional, insider and regulatory trading disclosures. |
 | `/trader-options` | Options Intelligence | Evaluates, models, and ranks directional and non-directional options setups (BUY CE, BUY PE, SELL CE, SELL PE, Spreads) for Indian indices and F&O equities. |
+| `/trader-mcp` | AI Trader (MCP) | An MCP server that lets Claude research and paper-trade on its own: two separate ₹1,00,000 pools (intraday trading, multi-day investing), every trade sized by trader-budget and gated by trader-risk, rationale required, automatic exits. Paper only. |
 
 ## How to use it
 

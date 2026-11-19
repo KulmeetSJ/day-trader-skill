@@ -13,7 +13,7 @@ from _load import ROOT
 # v2, the day-trading pack: the skill folders in the repo
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
-          "trader-pelosi", "trader-options"]
+          "trader-pelosi", "trader-options", "trader-mcp"]
 ABOUT = ("11 Claude skills for day trading: scan thousands of charts, track breaking news, time every "
          "entry and exit, and replay every outcome before you risk a dollar.")
 # skills on the way to an order carry the safety block
@@ -85,7 +85,8 @@ class Repo(unittest.TestCase):
                 ".claude", "CLAUDE.md",
             )
         )
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "config", "guides", "scripts", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", ".mcp.json", "LICENSE", "README.md", "config", "guides", "scripts",
+                                       "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
