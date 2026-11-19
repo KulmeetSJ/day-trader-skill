@@ -47,7 +47,15 @@ Status key: **ACTIONABLE** = can reach `SIGNAL VALIDATED`/`is_actionable: true`.
    - **Bull Put Credit Spread**: Sell OTM1 PE + Buy OTM2 PE. Gated by config `sell_pe_enabled` (default `false`). Same structural validation, mirrored (hedge must be a lower-strike put).
    - Margin for both is a **heuristic estimate** (`HEURISTIC_MARGIN_ESTIMATE`, `max_loss x 1.10`), same disclosure pattern as naked selling's margin estimate -- the margin shown here may not match what your broker actually requires. Turning these on means being comfortable with that estimate being approximate, not authoritative.
 
-7. **Iron Condor** -- NOT IMPLEMENTED:
+7. **Positional credit spreads held to expiry** -- `trader-options/positional.py` + `scripts/options_watch.py` (added 2026-11-19):
+   - Separate from the intraday engine above: builds ONE Bull Put / Bear Call spread from the live chain on a rule's entry day and holds it to expiry. Decision support + paper ledger (`trader/state/options_ledger.csv`) only; never routes an order.
+   - Rules (`positional.RULES`) are the only variants that passed `scripts/backtest_spreads.py` under both time assumptions: NIFTY monthly Bear Call (5 trading days before expiry, ~0.20 delta, 2 strikes wide) and BANKNIFTY monthly trend spread (10 days before, ~0.20 delta, 2 strikes; Bull Put above the 20-day average, else Bear Call).
+   - That backtest prices options with a **model** (Black-Scholes on India VIX), so every alert is labelled `MODEL-VALIDATED (paper)` and tracked at real chain prices to expiry.
+   - Fail-closed: no live bid/ask or delta, a leg wider than 12 % of mid, no credit, hedge on the wrong side, a non-live chain, or max loss over the spread budget all reject the call.
+   - Risk: spread budget Rs 6,000 max loss per lot (user-approved for spreads only); one open spread at a time. `NAKED_OPTION_PROHIBITED` is unchanged -- every spread carries its hedge.
+   - `python3 scripts/options_watch.py show | preview | check | track | run`.
+
+8. **Iron Condor** -- NOT IMPLEMENTED:
    - `STRATEGY_IRON_CONDOR` exists as a constant only. Building this properly needs two things this system doesn't have yet: a genuine 4-leg combined-margin/P&L model (simply showing the Bear Call + Bull Put spreads above side by side would understate the real position's margin efficiency, which is the whole point of combining them into one exchange position), and a non-directional/range-bound trigger condition -- today's scanner only detects directional (bullish/bearish) setups, never "sideways."
 
 ---
