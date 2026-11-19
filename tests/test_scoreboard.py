@@ -147,6 +147,48 @@ class TestRejected(unittest.TestCase):
         self.assertEqual((v[0], v[3]), ("WRONG", "STOP HIT"))
 
 
+class TestPendingFill(unittest.TestCase):
+    CALL = dict(CALL, trigger_time="09:30", alert_time="09:32:37")   # fill bar = 09:35 (slot 4)
+
+    def test_waiting_for_fill_bar_is_pending(self):
+        self.assertTrue(scoreboard.pending_fill(self.CALL, {3: obar(100, 101, 99, 100)}, now_slot=4))
+
+    def test_no_price_data_is_not_pending(self):
+        self.assertFalse(scoreboard.pending_fill(self.CALL, {}, now_slot=4))   # fail closed
+
+    def test_fill_bar_long_past_is_not_pending(self):
+        self.assertFalse(scoreboard.pending_fill(self.CALL, {3: obar(100, 101, 99, 100)}, now_slot=9))
+
+    def test_day_total_ignores_unfilled_calls(self):
+        orig_calls, orig_rej = scoreboard.load_calls, scoreboard.rejected_section
+
+        class P(object):
+            def get_intraday_data(self, sym, interval="5m", range_str="1d"):
+                return {"bars": [{"date": "2026-11-19", "start": "09:30", "o": 100, "h": 101,
+                                  "l": 99, "c": 100}]}
+        call = dict(self.CALL, symbol="X", date="2026-11-19", setup="s", risk_inr_incl_costs="1700")
+        scoreboard.load_calls = lambda date: [call]
+        scoreboard.rejected_section = lambda *a, **k: []
+        orig_slot, orig_start = scoreboard.slot, None
+        totals = {}
+        try:
+            import datetime as _dt
+            real_now = scoreboard.datetime.datetime
+            class FakeDT(real_now):
+                @classmethod
+                def now(cls, tz=None):
+                    return real_now(2026, 11, 19, 9, 35, 25, tzinfo=tz)
+            scoreboard.datetime.datetime = FakeDT
+            try:
+                scoreboard.build("2026-11-19", provider=P(), totals=totals)
+            finally:
+                scoreboard.datetime.datetime = real_now
+        finally:
+            scoreboard.load_calls, scoreboard.rejected_section = orig_calls, orig_rej
+        self.assertEqual(totals["net_inr_worst_case"], 0.0)
+        self.assertEqual(totals["unscored"], [])
+
+
 class TestDayTotalsSavedEarly(unittest.TestCase):
     def test_totals_written_before_rejected_section(self):
         import json, tempfile

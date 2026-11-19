@@ -617,7 +617,8 @@ class Watcher(object):
         self.update_daily_loss()
         self.refresh_market_ctx()
         try:
-            self.check_equities()
+            if getattr(self.args, "equities", False):
+                self.check_equities()
         except Exception as e:
             self.error("equity scan", e)
         t_eq = time.time() - t0
@@ -656,9 +657,10 @@ class Watcher(object):
         return nxt + datetime.timedelta(seconds=SETTLE_SECONDS)
 
     def run(self):
-        emit("WATCH start: equities from %s (plan: stop %s, target %sR via trader-exit), options %s, "
+        emit("WATCH start: equities %s (plan: stop %s, target %sR via trader-exit), options %s, "
              "budget Rs %.0f, min net R:R %.2f, cutoff %s IST. Paper only; never places orders."
-             % (self.args.universe or self.args.watchlist, self.args.stop, self.args.target_r,
+             % (("from %s" % (self.args.universe or self.args.watchlist)) if getattr(self.args, "equities", False)
+                else "OFF (intraday equity alerts retired 2026-11-19; --equities to re-enable)", self.args.stop, self.args.target_r,
                 ",".join(self.args.options) or "off", self.args.budget,
                 self.min_rr, self.cutoff.strftime("%H:%M")))
         if self.args.once:
@@ -744,6 +746,9 @@ def main(argv=None):
     ap.add_argument("--analysis-only-setups", default=ANALYSIS_ONLY_SETUPS,
                     help="setups scanned and logged to rejected.csv but never alerted, comma-separated; "
                          "'' alerts all (default: %(default)s)")
+    ap.add_argument("--equities", action="store_true",
+                    help="also scan NIFTY200 for INTRADAY equity alerts (retired by default 2026-11-19: no edge "
+                         "in the 37-session backtest; multi-day equity calls live in scripts/equity_calls.py)")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--no-short-signals", action="store_true",
                     help="don't scan bearish setups for rejected.csv (they are never alerted either way)")

@@ -97,6 +97,16 @@ def fill_slot(call):
     return start
 
 
+def pending_fill(call, bars, now_slot):
+    """True when the call's fill bar is the current (or a later) bar and the price feed is otherwise
+    working -- the call simply hasn't been filled yet. An empty feed is NOT pending: that's missing
+    data, which the daily-loss total treats as a full stop-out."""
+    try:
+        return bool(bars) and fill_slot(call) >= now_slot
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
 def score(call, bars, now_slot, side="buy", slip_ticks=None):
     """(status, exit_or_last_price, R, gross_pnl) for one call from today's {slot: bar}, with
     realistic paper fills (see TICK / SLIP_TICKS). Exit price is net of slippage.
@@ -246,6 +256,8 @@ def build(date=None, provider=None, totals=None, on_totals=None):
             tot_r, tot_pnl, n = tot_r + r, tot_pnl + pnl, n + 1
             tot_net += net if net is not None else pnl
             worst_case += net if net is not None else pnl
+        elif pending_fill(c, bars_for(c["symbol"]), now_slot):
+            pass   # alerted, but its fill bar hasn't printed yet: not in the trade, nothing lost
         else:
             # Can't price it: fail closed for the daily-loss total -- count it as a full stop-out
             # (trader-budget's own risk figure incl. charges for that call).
