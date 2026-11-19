@@ -18,9 +18,9 @@ def b(date, o, h, l, c):
     return {"date": date, "o": o, "h": h, "l": l, "c": c, "v": 1000}
 
 
-def idea(sym, risk, label="RESEARCH"):
+def idea(sym, risk, label="RESEARCH", qty=10, entry_ref=100.0):
     return {"scan_date": "2026-11-18", "symbol": sym, "setup": "bull_flag", "label": label, "stop": 95.0,
-            "target": 112.5, "qty": 10, "max_loss_inr": risk, "hold_days": 60}
+            "target": 112.5, "qty": qty, "entry_ref": entry_ref, "max_loss_inr": risk, "hold_days": 60}
 
 
 class TestNews(unittest.TestCase):
@@ -57,6 +57,15 @@ class TestLedger(unittest.TestCase):
         ec.add_to_ledger(ledger, ideas, cap=5000)
         self.assertEqual([i["ledger"] for i in ideas], ["ALREADY_OPEN", "ADDED", "OPEN_RISK"])
         self.assertEqual(ec.open_risk(ledger), 4000)
+
+    def test_capital_cap_takes_ideas_only_while_they_fit(self):
+        # Rs 1,00,000 cap with Rs 30,000 already tied up elsewhere -> Rs 70,000 free.
+        ideas = [idea("A", 1000, qty=400, entry_ref=100.0),    # Rs 40,000: fits (30,000 left)
+                 idea("B", 1000, qty=500, entry_ref=100.0),    # Rs 50,000: doesn't fit
+                 idea("C", 1000, qty=250, entry_ref=100.0)]    # Rs 25,000: fits (5,000 left)
+        ledger = ec.add_to_ledger([], ideas, cap=5000, capital_free=70000.0)
+        self.assertEqual([i["ledger"] for i in ideas], ["ADDED", "CAPITAL_CAP", "ADDED"])
+        self.assertEqual([r["entry_ref"] for r in ledger], [100.0, 100.0])   # capital is countable before the fill
 
     def row(self):
         return {"id": "x", "symbol": "X", "setup": "s", "label": "RESEARCH", "signal_date": "2026-11-18",

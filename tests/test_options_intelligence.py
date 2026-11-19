@@ -497,6 +497,7 @@ def test_phase1_audit_sample_rejection_low_rr(specialist):
         meta={"lot_size": 65, "expiry": "2026-11-17"},
         max_loss_budget=10000.0,  # Adequate budget
         min_reward_risk=2.0,       # 2.0R required
+        target_rr_gate="T1",       # gate on the 1R level explicitly (the default is now T2)
     )
     # Target in underlying setup yields ~1.86R, which is below 2.0R
     assert sig["signal_state"] == "SIGNAL REJECTED"

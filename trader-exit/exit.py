@@ -1012,7 +1012,9 @@ def build_plan(a, now_utc=None):
         elif instruments and inst_path and os.path.exists(inst_path):
             instr_err = instruments.InstrumentMetadataError
             try:
-                cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=info.get("date"))
+                # Judge freshness on the plan's date; with --now that is the replayed day, not today.
+                ref_day = info.get("date") or (to_local(now_utc, market=market).date().isoformat() if explicit_now else None)
+                cache = instruments.load_instrument_cache(inst_path, max_age_days=30, as_of_date=ref_day)
                 rec = instruments.resolve_instrument(
                     raw_symbol,
                     cache,

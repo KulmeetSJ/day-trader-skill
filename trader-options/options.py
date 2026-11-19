@@ -491,7 +491,7 @@ class OptionsIntelligenceSpecialist:
         t2_prem: Optional[float] = None,
         spread_strike: Optional[float] = None,
         spread_entry_prem: Optional[float] = None,
-        target_rr_gate: str = "T1",
+        target_rr_gate: str = "T2",
         primary_delta: Optional[float] = None,
         spread_delta: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -1648,7 +1648,9 @@ class OptionsIntelligenceSpecialist:
             prem_risk_per_share = abs(prem_levels["entry_premium"] - prem_levels["stop_loss_premium"])
             risk_per_lot = round(prem_risk_per_share * lot_size, 2)
 
-        rr_gate = target_rr_gate or underlying_setup.get("target_rr_gate") or self.config.get("target_rr_gate") or "T1"
+        # Gate on T2 (the underlying's 2R target). T1 is the 1R level: a 1R underlying move can never pay
+        # 2R net on the option (same delta both ways, minus charges), so a T1 gate refused every buy.
+        rr_gate = target_rr_gate or underlying_setup.get("target_rr_gate") or self.config.get("target_rr_gate") or "T2"
         hedge_delta_val = float(spread_contract.get("delta")) if (spread_contract and spread_contract.get("delta") is not None) else None
 
         # Position Sizing Logic (4-Tier Position Sizing)

@@ -1252,7 +1252,7 @@ def ticket_json(order, idx, cfg, risk, state, today, market="US", doc=None,
 
 # ---------------------------------------------------------------- fills -> portfolio
 
-def _assert_tradable_instrument(symbol, doc=None):
+def _assert_tradable_instrument(symbol, doc=None, as_of_date=None):
     """Refuse direct equity/broker execution or paper fills on spot benchmark indices."""
     raw = str(symbol or "").strip().upper()
     norm = symbols_in.normalize_symbol(raw) if symbols_in else raw
@@ -1274,7 +1274,8 @@ def _assert_tradable_instrument(symbol, doc=None):
             raise TicketError("authoritative instrument master is required for derivative tickets")
         expected = (doc or {}).get("option_contract") if isinstance(doc, dict) else None
         try:
-            instruments.validate_listed_derivative_contract(raw, exchange=(doc or {}).get("exchange"), expected=expected)
+            instruments.validate_listed_derivative_contract(raw, exchange=(doc or {}).get("exchange"), expected=expected,
+                                                            as_of_date=as_of_date)
         except Exception as exc:
             raise TicketError("derivative ticket validation failed: %s" % exc)
 
@@ -1282,7 +1283,7 @@ def _assert_tradable_instrument(symbol, doc=None):
 def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, market=None):
     """Record a filled order in trader/portfolio.json: cash and shares, with a
     cost-basis lot per buy (oldest lots are relieved first on a sell)."""
-    _assert_tradable_instrument(symbol)
+    _assert_tradable_instrument(symbol, as_of_date=date)
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
         budget = cfg.get("budget")

@@ -48,6 +48,7 @@ for _d in ("trader-alerts", "trader-entry", "trader-scanner", "trader-budget", "
 import size  # noqa: E402  (trader-budget/size.py)
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 import probability  # noqa: E402  (scripts/probability.py: backtest odds for a call)
+import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SETUPS = "breakout_intraday,vwap_reclaim,ema_alignment,rsi_momentum"
@@ -190,6 +191,11 @@ class Watcher(object):
         # Odds table from scripts/probability.py (backtest base rates). Missing -> "odds n/a", never invented.
         self.prob_model = probability.load_model(os.path.join(BASE_DIR, probability.MODEL_PATH))
         self.loss_unknown = None
+        # TRADING-pool hard cap (config budget, Rs 1,00,000; investing has its own): today's alerted
+        # calls + open option spreads + the AI trading book may never exceed it together. scripts/capital.py.
+        self.capital_cap = capital.cap_inr(self.cfg, "trading")
+        self.equity_ledger_path = capital.EQUITY_LEDGER_CSV
+        self.options_ledger_path = capital.OPTIONS_LEDGER_CSV
 
     def load_active_calls(self):
         import csv
@@ -267,12 +273,23 @@ class Watcher(object):
             age = (now_ist().replace(tzinfo=None) - as_of).total_seconds() / 60.0
             if age > 15:
                 raise ValueError("scoreboard total is %.0f min old" % age)
-            net = float(d["net_inr_worst_case"])
+            worst = float(d["net_inr_worst_case"])
+            net = float(d.get("net_inr", worst))
         except (OSError, ValueError, KeyError, TypeError) as e:
             if self.active:   # calls exist today but their P&L is unknown
                 self.loss_unknown = "DAILY_LOSS_UNKNOWN: can't read today's P&L (%s); no new calls until it can" % e
             return
-        if net <= -self.max_daily_loss + 1e-9:
+        limit = -self.max_daily_loss + 1e-9
+        if net > limit and worst <= limit:
+            # Only unpriced calls (counted as full stop-outs) push the day over the limit. Block this
+            # cycle (fail closed) but don't latch the whole day on a missing price -- it re-checks
+            # every cycle and latches only once PRICED losses reach the limit. (A latched halt on
+            # unpriced calls stopped the watcher for the day on 2026-11-19 09:36.)
+            self.loss_unknown = ("DAILY_LOSS_UNPRICED: Rs %.0f if unpriced calls %s are full stop-outs (limit Rs %.0f); "
+                                 "no new calls until they are priced" % (worst, ",".join(d.get("unscored") or []) or "?",
+                                                                         self.max_daily_loss))
+            return
+        if net <= limit:
             self.halted = {"date": today, "at": now_ist().strftime("%H:%M"), "net_inr": net,
                            "limit_inr": self.max_daily_loss}
             try:
@@ -341,6 +358,20 @@ class Watcher(object):
         if self.alerts_this_cycle > MAX_POPUPS_PER_CYCLE:
             return  # logged above; don't stack voice/pop-ups (flood backstop)
         notify(title, summary + "\n\nSaved to trader/state/opportunities.csv", spoken=spoken)
+
+    def capital_room(self):
+        """(free_inr, committed_inr) under the total-capital cap. Unreadable state -> no room (fail closed)."""
+        try:
+            used, _ = capital.committed("trading", self.capital_cap, today=now_ist().strftime("%Y-%m-%d"),
+                                        opportunities=self.csv_path, options_ledger=self.options_ledger_path)
+        except Exception as e:
+            self.error("capital cap", e)
+            return 0.0, self.capital_cap
+        return max(0.0, self.capital_cap - used), used
+
+    def capital_block_text(self, need, free, used):
+        return ("CAPITAL_CAP: needs Rs %.0f but only Rs %.0f of the Rs %.0f trading cap is free (Rs %.0f already committed today/open)"
+                % (need, free, self.capital_cap, used))
 
     def portfolio_cash(self):
         path = os.path.join(BASE_DIR, "trader", "portfolio.json")
@@ -460,14 +491,27 @@ class Watcher(object):
                 "exit_cmd": "exit.py plan --stop %s --target %sR" % (stop_arg, self.args.target_r),
             }
             entry = plan["entry"]
+            # Size inside the capital still free under the Rs 1,00,000 total cap: the budget engine gets
+            # it as cash, so its own buffer / position cap / max order decide the quantity.
+            free, used = self.capital_room()
+            room_cash = free if cash is None else min(cash, free)
+            if room_cash <= 0:
+                self.seen.add(key)
+                self.confirmed_rejected += 1
+                self.reject(dict(base_row, entry=entry, stop=stop, target=target,
+                                 reasons=self.capital_block_text(0, free, used).replace("needs Rs 0 but ", "")))
+                continue
             try:
-                s = size.size_trade(plan, self.cfg, cash=cash, today=today, market="IN",
+                s = size.size_trade(plan, self.cfg, cash=room_cash, today=today, market="IN",
                                     instruments_path=self.args.instruments,
                                     trading_style="intraday", exchange="NSE")
             except Exception as e:  # SizeError and friends: a refusal, not a crash
                 self.seen.add(key)
                 self.confirmed_rejected += 1
-                self.reject(dict(base_row, entry=entry, stop=stop, target=target, reasons="BUDGET: " + _last_line(e)))
+                cap_note = (" (sized within Rs %.0f free of the Rs %.0f capital cap)" % (free, self.capital_cap)
+                            if free < self.capital_cap - 1e-6 else "")
+                self.reject(dict(base_row, entry=entry, stop=stop, target=target,
+                                 reasons="BUDGET: " + _last_line(e) + cap_note))
                 continue
             self.seen.add(key)
             net_rr = s.get("net_reward_risk")
@@ -475,6 +519,8 @@ class Watcher(object):
                 self.confirmed_rejected += 1
                 why = ("BUDGET: %s" % s.get("refusal")) if s.get("refusal") else (
                     "BUDGET: qty 0" if not s.get("qty") else "NET_RR: %.2f after charges < %.2f" % (net_rr or 0, self.min_rr))
+                if free < self.capital_cap - 1e-6:
+                    why += " (sized within Rs %.0f free of the Rs %.0f capital cap)" % (free, self.capital_cap)
                 self.reject(dict(base_row, entry=entry, stop=stop, target=target, qty_or_lots=s.get("qty"),
                                  net_rr=round(net_rr, 2) if net_rr is not None else "", reasons=why))
                 continue
@@ -579,6 +625,13 @@ class Watcher(object):
                     blocked = "INCOMPLETE_SIGNAL: validated but missing %s; not alerted" % ", ".join(missing)
                 else:
                     blocked = (self.setup_block(_ut.get("setup")) or self.loss_block()) if sig.get("_validated") else None
+                need = sig.get("capital_margin_requirement")
+                if sig.get("_validated") and not blocked:
+                    free, used = self.capital_room()
+                    if need is None:
+                        blocked = "CAPITAL_CAP: no capital requirement in the signal; not alerted (fail closed)"
+                    elif float(need) > free + 1e-6:
+                        blocked = self.capital_block_text(float(need), free, used)
                 if not sig.get("_validated") or blocked:
                     ut = sig.get("underlying_trigger") if isinstance(sig.get("underlying_trigger"), dict) else {}
                     self.reject({"kind": "options", "direction": sig.get("direction") or "",
@@ -600,7 +653,7 @@ class Watcher(object):
                        "trigger_time": (sig.get("underlying_trigger") or {}).get("time")
                        if isinstance(sig.get("underlying_trigger"), dict) else sig.get("underlying_trigger"),
                        "entry": sig.get("current_premium"), "stop": sig.get("stop_loss"),
-                       "target": sig.get("target_1"), "lots": ps.get("lots"),
+                       "target": sig.get("target_1"), "lots": ps.get("lots"), "qty": ps.get("total_quantity"),
                        "risk_inr_incl_costs": sig.get("maximum_loss"),
                        "net_rr": sig.get("expected_risk_reward_after_charges")}
                 self.record("options", {"signal": sig}, summary,
@@ -658,11 +711,11 @@ class Watcher(object):
 
     def run(self):
         emit("WATCH start: equities %s (plan: stop %s, target %sR via trader-exit), options %s, "
-             "budget Rs %.0f, min net R:R %.2f, cutoff %s IST. Paper only; never places orders."
+             "budget Rs %.0f, min net R:R %.2f, capital cap Rs %.0f total, cutoff %s IST. Paper only; never places orders."
              % (("from %s" % (self.args.universe or self.args.watchlist)) if getattr(self.args, "equities", False)
                 else "OFF (intraday equity alerts retired 2026-11-19; --equities to re-enable)", self.args.stop, self.args.target_r,
                 ",".join(self.args.options) or "off", self.args.budget,
-                self.min_rr, self.cutoff.strftime("%H:%M")))
+                self.min_rr, self.capital_cap, self.cutoff.strftime("%H:%M")))
         if self.args.once:
             self.cycle()
             self.heartbeat(force=True)

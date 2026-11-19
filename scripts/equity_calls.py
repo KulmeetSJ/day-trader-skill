@@ -21,8 +21,9 @@ What a line means
   * News (last 30 days) and the latest results are shown for context. They are NOT part of the
     odds -- they can't be backtested -- and never upgrade a label.
   * The paper ledger takes each new idea at the next open, as long as the open ideas' total
-    worst-case loss stays within Rs 5,000 (OPEN_RISK otherwise), and follows it to target / stop /
-    60 sessions.
+    worst-case loss stays within Rs 5,000 (OPEN_RISK otherwise) AND the INVESTING pool's capital stays
+    within its own Rs 1,00,000 hard cap (separate from trading; CAPITAL_CAP otherwise -- see
+    scripts/capital.py), and follows it to target / stop / 60 sessions.
 """
 
 import argparse
@@ -41,6 +42,7 @@ for _d in ("trader-alerts", "trader-scanner", "trader-budget", "trader-exit", "t
         sys.path.insert(0, _p)
 
 import swing_signals as sig  # noqa: E402
+import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 STATE = os.path.join(BASE_DIR, "trader", "state")
@@ -58,7 +60,7 @@ CONTEXT_TOP = 15            # news/results are fetched for the top N ideas only 
 CALL_FIELDS = ("scan_date", "symbol", "setup", "label", "close", "entry_ref", "stop", "target", "qty",
                "max_loss_inr", "net_rr", "hold_days", "p_target", "p_stop", "p_green", "avgR", "edge_vs_random",
                "odds_n", "regime_up", "ledger", "news", "results")
-LEDGER_FIELDS = ("id", "symbol", "setup", "label", "signal_date", "status", "entry_date", "entry", "stop", "target",
+LEDGER_FIELDS = ("id", "symbol", "setup", "label", "signal_date", "status", "entry_date", "entry_ref", "entry", "stop", "target",
                  "qty", "max_loss_inr", "max_hold", "exit_date", "exit_price", "net_inr", "R")
 
 
@@ -177,7 +179,7 @@ def size_it(sym, p, date, size_mod, cfg):
         r = size_mod.size_trade({"symbol": sym, "side": "buy", "entry": p["entry"], "stop": p["stop"],
                                  "target": p["target"], "asset_type": "EQUITY", "trading_style": "positional",
                                  "market": "IN", "exchange": "NSE", "currency": "INR", "flat_by": "positional"},
-                                cfg, cash=100000.0, today=date, market="IN", instruments_path=INSTRUMENTS,
+                                cfg, cash=capital.cap_inr(cfg, "investing"), today=date, market="IN", instruments_path=INSTRUMENTS,
                                 trading_style="positional", exchange="NSE")
     except Exception as e:
         return None, "BUDGET: %s" % str(e).strip().splitlines()[-1][:120]
@@ -294,9 +296,15 @@ def open_risk(ledger):
     return sum(float(r.get("max_loss_inr") or 0) for r in ledger if r.get("status") in ("PENDING", "OPEN"))
 
 
-def add_to_ledger(ledger, ideas, cap=OPEN_RISK_CAP):
-    """Take ideas in rank order while the open worst-case loss stays within `cap`; one per stock.
-    Marks each idea's 'ledger' field: ADDED / ALREADY_OPEN / OPEN_RISK."""
+def idea_capital(i):
+    return float(i["qty"]) * float(i["entry_ref"])
+
+
+def add_to_ledger(ledger, ideas, cap=OPEN_RISK_CAP, capital_free=None):
+    """Take ideas in rank order while the open worst-case loss stays within `cap` and (when given) the
+    idea's capital (qty x entry_ref) fits in `capital_free` -- the room left under the total-capital
+    hard cap (scripts/capital.py); one per stock.
+    Marks each idea's 'ledger' field: ADDED / ALREADY_OPEN / OPEN_RISK / CAPITAL_CAP."""
     held = {r["symbol"] for r in ledger if r.get("status") in ("PENDING", "OPEN")}
     risk = open_risk(ledger)
     for i in ideas:
@@ -306,12 +314,19 @@ def add_to_ledger(ledger, ideas, cap=OPEN_RISK_CAP):
         if risk + i["max_loss_inr"] > cap:
             i["ledger"] = "OPEN_RISK"
             continue
+        need = idea_capital(i) if capital_free is not None else 0.0
+        if capital_free is not None and need > capital_free + 1e-6:
+            i["ledger"] = "CAPITAL_CAP"
+            continue
         ledger.append({"id": "%s-%s-%s" % (i["scan_date"], i["symbol"], i["setup"]), "symbol": i["symbol"],
                        "setup": i["setup"], "label": i["label"], "signal_date": i["scan_date"], "status": "PENDING",
+                       "entry_ref": i["entry_ref"],
                        "stop": i["stop"], "target": i["target"], "qty": i["qty"], "max_loss_inr": i["max_loss_inr"],
                        "max_hold": i["hold_days"]})
         held.add(i["symbol"])
         risk += i["max_loss_inr"]
+        if capital_free is not None:
+            capital_free -= need
         i["ledger"] = "ADDED"
     return ledger
 
@@ -361,16 +376,18 @@ def report_text(ideas, refused, scan_date, ledger):
     L = ["EQUITY IDEAS -- multi-day, long only, paper (scan of %s's close; generated %s IST)"
          % (scan_date, now_ist().strftime("%Y-%m-%d %H:%M")),
          "CALL = setup passed the 10-year backtest on unseen years. RESEARCH = it did not: your judgement, not a call.",
-         "Odds = that setup's 2023+ backtest at the hold shown. News/results are context only (not in the odds).", ""]
+         "Odds = that setup's 2023+ backtest at the hold shown. News/results are context only (not in the odds).",
+         "Each idea is sized on its own (Rs 2,000 max loss). The investing pool is hard-capped at Rs 1,00,000:",
+         "you can hold only the few that fit together -- the paper ledger takes them in rank order until the cap.", ""]
     if not ideas:
         L.append("No setups on the last completed bar.")
     for n, i in enumerate(ideas[:CONTEXT_TOP], 1):
         L.append("%d. [%s] %s  %s  close %.2f%s" % (n, i["label"], i["symbol"], i["setup"], i["close"],
                                                      "" if i.get("regime_up") else "  (NIFTY below its 200-day average)"))
-        L.append("   Plan: buy next open (ref %.2f) | stop %.2f | target %.2f (2.5R) | qty %s | max loss Rs %.0f | "
-                 "net R:R %.2f | hold up to %d sessions | paper ledger: %s"
-                 % (i["entry_ref"], i["stop"], i["target"], i["qty"], i["max_loss_inr"], i["net_rr"], i["hold_days"],
-                    i.get("ledger", "-")))
+        L.append("   Plan: buy next open (ref %.2f) | stop %.2f | target %.2f (2.5R) | qty %s | capital Rs %.0f | "
+                 "max loss Rs %.0f | net R:R %.2f | hold up to %d sessions | paper ledger: %s"
+                 % (i["entry_ref"], i["stop"], i["target"], i["qty"], idea_capital(i), i["max_loss_inr"], i["net_rr"],
+                    i["hold_days"], i.get("ledger", "-")))
         if i.get("odds_n"):
             L.append("   Backtest odds (2023+, n=%d): target %.0f%% | stop %.0f%% | ends green %.0f%% | avg %+.2fR | "
                      "vs random entries %+.2fR" % (i["odds_n"], i["p_target"], i["p_stop"], i["p_green"], i["avgR"],
@@ -400,8 +417,9 @@ def ledger_text(ledger):
     op = [r for r in ledger if r.get("status") in ("PENDING", "OPEN")]
     done = [r for r in ledger if r.get("status") in ("TARGET", "STOP", "TIME")]
     net = sum(float(r.get("net_inr") or 0) for r in done)
-    L = ["PAPER LEDGER: %d open (worst-case Rs %.0f of Rs %.0f cap), %d closed, closed net Rs %+.0f"
-         % (len(op), open_risk(ledger), OPEN_RISK_CAP, len(done), net)]
+    cap_used = sum(float(r.get("qty") or 0) * float(r.get("entry") or r.get("entry_ref") or 0) for r in op)
+    L = ["PAPER LEDGER: %d open (capital Rs %.0f, worst-case Rs %.0f of Rs %.0f cap), %d closed, closed net Rs %+.0f"
+         % (len(op), cap_used, open_risk(ledger), OPEN_RISK_CAP, len(done), net)]
     for r in op:
         L.append("  %-7s %-11s %-18s since %-10s entry %-8s stop %-8s target %-8s qty %s"
                  % (r["status"], r["symbol"], r["setup"], r.get("entry_date") or r["signal_date"], r.get("entry") or "next open",
@@ -438,7 +456,11 @@ def cmd_scan(a):
         i["results"] = results_line(i["symbol"])
     ledger = read_csv(LEDGER_CSV)
     if not a.no_ledger:
-        ledger = add_to_ledger(ledger, ideas)
+        # Room in the INVESTING pool (its own Rs 1,00,000, separate from trading).
+        import size as size_mod
+        cap = capital.cap_inr(size_mod.load_config(None, market="IN"), "investing")
+        free = capital.room("investing", cap)
+        ledger = add_to_ledger(ledger, ideas, capital_free=free)
         write_csv(LEDGER_CSV, LEDGER_FIELDS, ledger)
     prev = [r for r in read_csv(CALLS_CSV) if r.get("scan_date") != scan_date]
     rows = prev + [dict(i, news=" || ".join(i.get("news") or []), results=i.get("results") or "") for i in ideas]

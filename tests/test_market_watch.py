@@ -23,6 +23,9 @@ class Args(object):
     max_trigger_age = 10.0
     setups = mw.SETUPS
     no_short_signals = False
+    stop = "swing"
+    target_r = 2.2
+    instruments = None
 
 
 def make_watcher():
@@ -36,7 +39,15 @@ def make_watcher():
     w.halt_path = os.path.join(d, "halt.json")
     w.halted, w.loss_unknown = None, None
     w.market_ctx = {}
+    w.equity_ledger_path = os.path.join(d, "eq_ledger.csv")
+    w.options_ledger_path = os.path.join(d, "opt_ledger.csv")
     return w
+
+
+def seed_today_call(w, qty, entry, sym="OLD"):
+    """An equity call already alerted today (it ties up qty x entry of the capital cap)."""
+    mw.append_row(w.csv_path, mw.CSV_FIELDS, {"date": mw.now_ist().strftime("%Y-%m-%d"), "kind": "equity",
+                                               "symbol": sym, "qty": qty, "entry": entry})
 
 
 def rows(path):
@@ -108,12 +119,48 @@ class TestWatcherLogging(unittest.TestCase):
 
 
 class TestDailyLossStop(unittest.TestCase):
-    def write_day(self, w, net, minutes_ago=0):
+    def write_day(self, w, net, minutes_ago=0, priced=None, unscored=()):
         import json
         now = mw.now_ist().replace(tzinfo=None) - datetime.timedelta(minutes=minutes_ago)
+        d = {"date": now.strftime("%Y-%m-%d"), "as_of": now.strftime("%Y-%m-%d %H:%M"),
+             "net_inr_worst_case": net, "unscored": list(unscored)}
+        if priced is not None:
+            d["net_inr"] = priced
         with open(w.day_path, "w") as fh:
-            json.dump({"date": now.strftime("%Y-%m-%d"), "as_of": now.strftime("%Y-%m-%d %H:%M"),
-                       "net_inr_worst_case": net}, fh)
+            json.dump(d, fh)
+
+    def test_unpriced_worst_case_blocks_but_does_not_latch(self):
+        # 2026-11-19 09:36: five fresh calls had no price yet, each counted as a full stop-out
+        # (-7838 worst case) while the priced total was 0. That must not halt the whole day.
+        w = make_watcher()
+        w.active = {"X": {}}
+        self.write_day(w, -7838.0, priced=0.0, unscored=["COLPAL", "DABUR"])
+        orig = mw.notify
+        mw.notify = lambda *a, **k: self.fail("must not notify a halt")
+        try:
+            w.update_daily_loss()
+        finally:
+            mw.notify = orig
+        self.assertIsNone(w.halted)
+        self.assertFalse(os.path.exists(w.halt_path))
+        self.assertTrue(w.loss_block().startswith("DAILY_LOSS_UNPRICED"))   # still fail closed this cycle
+        self.assertIn("COLPAL", w.loss_block())
+        self.write_day(w, 9377.0, priced=9377.0)    # priced next cycle: calls re-open
+        w.update_daily_loss()
+        self.assertIsNone(w.loss_block())
+
+    def test_priced_loss_over_limit_still_latches(self):
+        w = make_watcher()
+        w.active = {"X": {}}
+        self.write_day(w, -7000.0, priced=-5200.0, unscored=["Y"])
+        orig = mw.notify
+        mw.notify = lambda *a, **k: None
+        try:
+            w.update_daily_loss()
+        finally:
+            mw.notify = orig
+        self.assertTrue(w.loss_block().startswith("DAILY_LOSS:"))
+        self.assertTrue(w.load_halt())
 
     def test_under_limit_allows_calls(self):
         w = make_watcher()
@@ -169,6 +216,79 @@ class TestDailyLossStop(unittest.TestCase):
             mw.subprocess.run = orig
         self.assertEqual(rows(w.csv_path), [])
         self.assertTrue(rows(w.rejected_path)[0]["reasons"].startswith("DAILY_LOSS:"))
+
+
+class TestCapitalCap(unittest.TestCase):
+    """Rs 1,00,000 is the TOTAL capital at once (config budget), not per trade (user rule 2026-11-19)."""
+
+    def test_cap_is_config_budget(self):
+        self.assertEqual(make_watcher().capital_cap, 100000.0)
+
+    def test_option_that_does_not_fit_is_rejected(self):
+        import json as _json
+        w = make_watcher()
+        seed_today_call(w, 950, 100.0)                  # Rs 95,000 already committed today
+        w.args.options = ["NIFTY"]
+        w.args.budget = 2000.0
+        sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
+               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "vwap_reclaim"},
+               "current_premium": 160.5, "stop_loss": 143.3, "target_1": 175.9,
+               "capital_margin_requirement": 12037.5, "position_sizing": {"lots": 1, "total_quantity": 75}}
+
+        class R(object):
+            returncode, stderr, stdout = 0, "", _json.dumps([sig])
+        orig = mw.subprocess.run
+        mw.subprocess.run = lambda *a, **k: R()
+        try:
+            w.check_options()
+        finally:
+            mw.subprocess.run = orig
+        self.assertEqual([r["kind"] for r in rows(w.csv_path)], ["equity"])     # only the seeded call
+        why = rows(w.rejected_path)[0]["reasons"]
+        self.assertTrue(why.startswith("CAPITAL_CAP:"), why)
+        self.assertIn("5000", why)
+
+    def test_equity_is_sized_inside_the_free_capital(self):
+        w = make_watcher()
+        w.args.equities = True
+        seed_today_call(w, 700, 100.0)                  # Rs 70,000 committed -> Rs 30,000 free
+        now = mw.now_ist().strftime("%H:%M")
+        hit = {"symbol": "NEW", "setup": "vwap_reclaim", "side": "buy", "decision_state": "ENTRY CONFIRMED",
+               "actionable": True, "trigger": {"close_time": now, "close": 200.0},
+               "decision": {"entry_reference": 200.0, "stop_loss": 196.0}}
+        seen = {}
+
+        def fake_size(plan, cfg, cash=None, **k):
+            seen["cash"] = cash
+            return {"qty": 0, "refusal": "too small for the test", "net_reward_risk": None}
+        origs = (w.scan_equities, w.exit_plan, mw.size.size_trade, w.portfolio_cash)
+        w.scan_equities = lambda: {"hits": [hit]}
+        w.exit_plan = lambda *a, **k: {"entry": 200.0, "stop": 196.0, "target": 208.8}
+        w.portfolio_cash = lambda: None
+        mw.size.size_trade = fake_size
+        try:
+            w.check_equities()
+        finally:
+            w.scan_equities, w.exit_plan, mw.size.size_trade, w.portfolio_cash = origs
+        self.assertAlmostEqual(seen["cash"], 30000.0)
+        self.assertIn("30000 free of the Rs 100000 capital cap", rows(w.rejected_path)[0]["reasons"])
+
+    def test_no_free_capital_rejects_before_sizing(self):
+        w = make_watcher()
+        seed_today_call(w, 1000, 100.0)                 # the whole Rs 1,00,000 is committed
+        now = mw.now_ist().strftime("%H:%M")
+        hit = {"symbol": "NEW", "setup": "vwap_reclaim", "side": "buy", "decision_state": "ENTRY CONFIRMED",
+               "actionable": True, "trigger": {"close_time": now, "close": 200.0},
+               "decision": {"entry_reference": 200.0, "stop_loss": 196.0}}
+        origs = (w.scan_equities, w.exit_plan, mw.size.size_trade)
+        w.scan_equities = lambda: {"hits": [hit]}
+        w.exit_plan = lambda *a, **k: {"entry": 200.0, "stop": 196.0, "target": 208.8}
+        mw.size.size_trade = lambda *a, **k: self.fail("must not size with no free capital")
+        try:
+            w.check_equities()
+        finally:
+            w.scan_equities, w.exit_plan, mw.size.size_trade = origs
+        self.assertTrue(rows(w.rejected_path)[0]["reasons"].startswith("CAPITAL_CAP:"))
 
 
 class TestAnalysisOnlySetups(unittest.TestCase):

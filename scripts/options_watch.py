@@ -37,6 +37,7 @@ for _d in ("trader-alerts", "trader-budget", "trader-options", "config", "script
         sys.path.insert(0, _p)
 
 import positional as pos  # noqa: E402  (trader-options/positional.py)
+import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 STATE = os.path.join(BASE_DIR, "trader", "state")
@@ -172,6 +173,18 @@ def open_rows(ledger):
     return [r for r in ledger if r.get("status") == "OPEN"]
 
 
+def capital_free():
+    """(free_inr, cap_inr) in the TRADING pool's hard cap. Today's intraday calls are left out: the
+    spread is held past today's 15:20 square-off. Unreadable config/state -> (0, cap) (fail closed)."""
+    import size
+    cap = capital.cap_inr(size.load_config(None, market="IN"), "trading")
+    try:
+        used = capital.committed("trading", cap, opportunities=None, options_ledger=LEDGER_CSV)[0]
+    except Exception:
+        return 0.0, cap
+    return max(0.0, cap - used), cap
+
+
 def check(preview=False, today=None):
     today = today or now_ist().date()
     ledger = read_csv(LEDGER_CSV)
@@ -201,6 +214,11 @@ def check(preview=False, today=None):
             status, reason = "DUPLICATE", "already in the ledger"
         elif len(open_rows(ledger)) >= MAX_OPEN:
             status, reason = "OPEN_RISK", "one spread already open (one worst case exceeds the Rs 5,000 daily limit)"
+        else:
+            free, cap = capital_free()
+            if float(sp["max_loss_inr"]) > free + 1e-6:
+                status, reason = "CAPITAL_CAP", ("needs Rs %.0f (max loss ~ blocked margin) but only Rs %.0f of the "
+                                                 "Rs %.0f capital cap is free" % (float(sp["max_loss_inr"]), free, cap))
         append_call({"time": now_ist().strftime("%Y-%m-%d %H:%M"), "rule": rule["name"], "symbol": rule["symbol"],
                      "strategy": sp["strategy"], "expiry": expiry, "short": "SELL %s" % sp["short"]["symbol"],
                      "long": "BUY %s" % sp["long"]["symbol"], "credit": sp["credit"], "max_profit_inr": sp["max_profit_inr"],

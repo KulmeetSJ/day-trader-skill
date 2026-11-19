@@ -591,8 +591,9 @@ def test_bear_call_credit_spread_generated_when_enabled_with_correct_leg_structu
     assert not any(r.startswith("NAKED_OPTION_PROHIBITED") for r in sig["rejection_reasons"])
 
 
-def test_credit_spread_max_loss_and_max_profit_are_internally_consistent(specialist):
-    """max_loss + max_profit must equal strike width x lot size (the defined-risk property)."""
+def test_credit_spread_max_loss_and_max_profit_are_internally_consistent(specialist, bullish_scenario):
+    """max_loss + max_profit must equal strike width x lot size x lots (the defined-risk property).
+    margin_details' max_loss/max_profit are totals for the sized lots (capital_per_lot is per lot)."""
     specialist.config["sell_pe_enabled"] = True
     res = specialist.analyze_symbol_for_options("NIFTY")
     bps = [s for s in res["signals"] if s["strategy"] == STRATEGY_BULL_PUT_SPREAD]
@@ -603,7 +604,9 @@ def test_credit_spread_max_loss_and_max_profit_are_internally_consistent(special
     lot_size = sig["legs"][0]["lot_size"]
     max_loss_val = float(md["max_loss"].replace("Rs ", "").replace(",", ""))
     max_profit_val = float(md["max_profit"].replace("Rs ", "").replace(",", ""))
-    assert abs((max_loss_val + max_profit_val) - (width * lot_size)) < 0.01
+    lots = max(1, int(sig["position_sizing"]["lots"] or 0))
+    assert abs((max_loss_val + max_profit_val) - (width * lot_size * lots)) < 0.01
+    assert abs(float(md["capital_per_lot"]) * lots - max_loss_val) < 0.01
 
 
 # ---------------------------------------------------------------- 10. Entry-range band (chase protection)

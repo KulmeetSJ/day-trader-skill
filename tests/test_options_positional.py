@@ -102,11 +102,14 @@ class TestWatchLedger(unittest.TestCase):
         ow.LEDGER_CSV, ow.CALLS_CSV = os.path.join(d, "l.csv"), os.path.join(d, "c.csv")
         ow.notify = lambda *a, **k: None
         ow.provider = lambda: None
+        self.orig_cf = ow.capital_free
+        ow.capital_free = lambda: (100000.0, 100000.0)
         sp = pos.build_spread(chain(), "CE", 0.20, 2, 65, 50, 6000)
         ow.evaluate = lambda rule, expiry, p=None, as_of=None: (dict(sp, expiry=expiry.isoformat()), None)
 
     def tearDown(self):
         ow.LEDGER_CSV, ow.CALLS_CSV, ow.evaluate, ow.notify, ow.provider = self.orig
+        ow.capital_free = self.orig_cf
 
     def test_one_open_spread_at_a_time(self):
         nifty, bank = pos.RULES
@@ -118,6 +121,17 @@ class TestWatchLedger(unittest.TestCase):
         self.assertEqual(len(led), 1)
         calls = ow.read_csv(ow.CALLS_CSV)
         self.assertEqual([c["status"] for c in calls], ["CALL", "OPEN_RISK"])
+
+    def test_capital_cap_blocks_spread_that_does_not_fit(self):
+        orig = ow.capital_free
+        ow.capital_free = lambda: (1000.0, 100000.0)     # Rs 99,000 already committed elsewhere
+        try:
+            _, e2 = pos.entry_expiry(datetime.date(2026, 12, 1), pos.RULES[1])
+            ow.check(today=e2)
+        finally:
+            ow.capital_free = orig
+        self.assertEqual(ow.read_csv(ow.LEDGER_CSV), [])
+        self.assertEqual([c["status"] for c in ow.read_csv(ow.CALLS_CSV)], ["CAPITAL_CAP"])
 
     def test_not_entry_day_does_nothing(self):
         ow.check(today=datetime.date(2026, 12, 2))

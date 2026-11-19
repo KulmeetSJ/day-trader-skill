@@ -1555,7 +1555,7 @@ def resolve_derivative_contract(symbol, cache_payload=None, as_of_date=None, exc
     }
 
 
-def validate_listed_derivative_contract(symbol, cache_payload=None, exchange=None, expected=None):
+def validate_listed_derivative_contract(symbol, cache_payload=None, exchange=None, expected=None, as_of_date=None):
     """Validate a derivative against an exact exchange-master contract record.
 
     Parsing a symbol or resolving an underlying's lot size is not evidence that
@@ -1564,7 +1564,8 @@ def validate_listed_derivative_contract(symbol, cache_payload=None, exchange=Non
     if not is_derivative_symbol(symbol):
         raise InstrumentMetadataError("%s is not a canonical listed derivative symbol" % symbol)
     if cache_payload is None and os.path.isfile(DEFAULT_CACHE_PATH):
-        cache_payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30)
+        # as_of_date: the trade's own date (e.g. a --now replay), so freshness is judged then, not today
+        cache_payload = load_instrument_cache(DEFAULT_CACHE_PATH, max_age_days=30, as_of_date=as_of_date)
     if not isinstance(cache_payload, dict):
         raise InstrumentMetadataError("authoritative derivative instrument master is unavailable")
     parsed = parse_derivative_symbol(symbol)
