@@ -49,7 +49,7 @@ INSTRUMENTS = os.path.join("trader", "state", "instruments.json")
 HOLDOUT_FROM = "2023-01-01"
 TARGET_R = 2.5          # 2.2R nets ~1.9 after positional charges and fails the hard 2.0 floor
 MAX_STOP_ATR = 3.0
-HOLDS = (10, 20)
+HOLDS = (20, 40, 60)     # up to ~3 months (2026-11-19: multi-day equity calls)
 RANDOM_PER_SIGNAL = 2
 SEED = 7
 
@@ -158,6 +158,11 @@ def simulate(bars, i_entry, entry, stop, target, hold):
     return "time", bars[last]["c"], last
 
 
+def incomplete(outcome, k, i_entry, hold):
+    """A time exit before the full hold means the data ran out (a recent signal): not a result."""
+    return outcome == "time" and k < i_entry + hold - 1
+
+
 def plan_for(bars, i_signal, sig_stop):
     """Entry next open, stop = min-width of (pattern stop, entry - 3 ATR), target 2.2R. None if invalid."""
     import exit as exit_mod
@@ -216,6 +221,8 @@ def _trade_job(s):
     width_atr = (p["entry"] - p["stop"]) / p["atr"] if p["atr"] else None
     for hold in HOLDS:
         oc, px, k = simulate(bars, i + 1, p["entry"], p["stop"], p["target"], hold)
+        if incomplete(oc, k, i + 1, hold):
+            continue
         sz = size_and_charge(s["sym"], bars[i + 1]["date"], p, px, _W["size"], _W["cfg"])
         if sz is None:
             out.append({"kind": "refused", "setup": s["setup"], "hold": hold, "date": s["date"], "sym": s["sym"]})
@@ -238,6 +245,8 @@ def _trade_job(s):
         rp = {"entry": e, "stop": st, "target": tick(e + TARGET_R * (e - st)), "atr": atr}
         for hold in HOLDS:
             oc, px, k = simulate(bars, j + 1, e, st, rp["target"], hold)
+            if incomplete(oc, k, j + 1, hold):
+                continue
             sz = size_and_charge(s["sym"], bars[j + 1]["date"], rp, px, _W["size"], _W["cfg"])
             if sz is None:
                 continue

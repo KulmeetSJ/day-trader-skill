@@ -184,5 +184,38 @@ class TestSimulator(unittest.TestCase):
         self.assertFalse(bs.passes(row))
 
 
+class TestMultiDayFamilies(unittest.TestCase):
+    def test_results_gap(self):
+        base = wiggle(100, 80, 1)
+        bars = mk(base, [1000.0] * 80)
+        prev = bars[-1]["c"]
+        bars.append({"date": "D99999", "o": prev * 1.05, "h": prev * 1.08, "l": prev * 1.045,
+                     "c": prev * 1.075, "v": 4000.0})
+        s = last_signals(bars)
+        self.assertIn("results_gap", s)
+        self.assertAlmostEqual(s["results_gap"]["stop"], round(prev * 1.045, 2), places=2)
+
+    def test_results_gap_needs_volume_and_strong_close(self):
+        base = wiggle(100, 80, 1)
+        prev = mk(base)[-1]["c"]
+        weak = mk(base, [1000.0] * 80) + [{"date": "D99999", "o": prev * 1.05, "h": prev * 1.10,
+                                            "l": prev * 1.045, "c": prev * 1.05, "v": 4000.0}]
+        self.assertNotIn("results_gap", last_signals(weak))          # closed in the bottom of its range
+        quiet = mk(base, [1000.0] * 80) + [{"date": "D99999", "o": prev * 1.05, "h": prev * 1.08,
+                                             "l": prev * 1.045, "c": prev * 1.075, "v": 1500.0}]
+        self.assertNotIn("results_gap", last_signals(quiet))
+
+    def test_pullback_uptrend(self):
+        closes = lin(50, 100, 260) + [99.0, 97.5, 96.0]
+        self.assertIn("pullback_uptrend", last_signals(mk(closes)))
+        down = lin(100, 50, 260) + [49.0, 48.0, 47.0]
+        self.assertNotIn("pullback_uptrend", last_signals(mk(down)))  # not in an uptrend
+
+    def test_incomplete_time_exit_is_dropped(self):
+        self.assertTrue(bs.incomplete("time", 105, 100, 20))
+        self.assertFalse(bs.incomplete("time", 119, 100, 20))
+        self.assertFalse(bs.incomplete("stop", 105, 100, 20))
+
+
 if __name__ == "__main__":
     unittest.main()

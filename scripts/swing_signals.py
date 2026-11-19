@@ -16,6 +16,10 @@ Formations (each docstring below is the exact rule):
   high52_breakout, flat_base, ascending_triangle, cup_handle, double_bottom, vcp, bull_flag_v2
 Relative strength:
   rs_leader
+Multi-day families (2026-11-19, for 20-60 day holds):
+  results_gap      -- gap-up >= 4 % on >= 3x volume closing in the top third (how a results/news
+                      surprise shows up in price; historical results dates aren't available)
+  pullback_uptrend -- RSI(2) < 10 while close > 200-day average and 50-day > 200-day
 Existing scanner daily setups (trader-scanner/scan.py find_setups, closes only):
   breakout_20d, bull_flag, reclaim_ma20, oversold, oversold_bounce
 """
@@ -101,7 +105,27 @@ def prep(bars):
         trs.append(tr)
         prev = A["c"][k]
     A["atr14"] = _sma(trs, 14)
+    A["rsi2"] = _rsi(A["c"], 2)
     return A
+
+
+def _rsi(closes, n):
+    """Wilder RSI(n); None until n changes are known."""
+    out = [None] * len(closes)
+    up = dn = 0.0
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        g, l = max(ch, 0.0), max(-ch, 0.0)
+        if i <= n:
+            up += g / n
+            dn += l / n
+            if i < n:
+                continue
+        else:
+            up = (up * (n - 1) + g) / n
+            dn = (dn * (n - 1) + l) / n
+        out[i] = 100.0 if dn == 0 else 100.0 - 100.0 / (1.0 + up / dn)
+    return out
 
 
 def _swings(A, key, lo, t):
@@ -303,6 +327,32 @@ def bull_flag_v2(A, t):
     return None
 
 
+def results_gap(A, t, gap=0.04, vol_mult=3.0):
+    """Results/news-surprise proxy: day t opens above day t-1's high, closes >= 4 % above day t-1's
+    close and in the top third of its own range, on volume >= 3x the 50 days before.
+    Stop: day t's low (a gap that fills is a failed surprise)."""
+    if t < 51:
+        return None
+    o, h, l, c, pc = A["o"][t], A["h"][t], A["l"][t], A["c"][t], A["c"][t - 1]
+    av = A["avgv50_prior"][t]
+    if not av or A["v"][t] < vol_mult * av or pc <= 0:
+        return None
+    if o <= A["h"][t - 1] or c / pc - 1 < gap or h <= l or (c - l) / (h - l) < 2.0 / 3:
+        return None
+    return {"stop": _r(l), "gap_pct": _r(100 * (c / pc - 1)), "vol_x": _r(A["v"][t] / av)}
+
+
+def pullback_uptrend(A, t):
+    """Short pullback inside an uptrend: RSI(2) < 10 while close > 200-day average and the 50-day
+    average > the 200-day. No pattern stop (the 3 ATR cap applies)."""
+    r, s50, s200 = A["rsi2"][t], A["sma50"][t], A["sma200"][t]
+    if r is None or s50 is None or s200 is None:
+        return None
+    if r < 10 and A["c"][t] > s200 and s50 > s200:
+        return {"stop": None, "rsi2": _r(r)}
+    return None
+
+
 FORMATIONS = (("high52_breakout", high52_breakout), ("flat_base", flat_base),
               ("ascending_triangle", ascending_triangle), ("cup_handle", cup_handle),
               ("double_bottom", double_bottom), ("vcp", vcp), ("bull_flag_v2", bull_flag_v2))
@@ -378,6 +428,10 @@ def signals_at(A, t, rs_pct=None, rs_pct_prev=None):
             r = fn(A, t)
             if r:
                 out.append((name, r))
+    for name, fn in (("results_gap", results_gap), ("pullback_uptrend", pullback_uptrend)):
+        r = fn(A, t)
+        if r:
+            out.append((name, r))
     if rs_leader_state(A, t, rs_pct) and not rs_leader_state(A, t - 1, rs_pct_prev):
         out.append(("rs_leader", {"stop": _r(low10(A, t)), "rs_pct": _r(rs_pct)}))
     import scan
