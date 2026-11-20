@@ -141,6 +141,26 @@ class TestEquityFlow(Base):
         self.assertEqual(inv["pool_free_inr"], 100000.0)
         self.assertEqual(inv["verdict"], "PASS", inv["reasons"])
 
+    def test_capital_cap_reported_not_enforced_while_testing(self):
+        enforce = book_mod.capital.ENFORCE
+        b = book_mod.load(self.bk.path)                                  # Rs 80,000 already open in the pool
+        b["positions"].append({"id": "seed", "kind": "equity", "pool": "trading", "style": "intraday",
+                               "symbol": "OTHER", "qty": 100, "entry": 800.0, "capital_inr": 80000.0,
+                               "status": "OPEN"})
+        book_mod.save(b, self.bk.path)
+        try:
+            book_mod.capital.ENFORCE = True
+            capped = self.bk.preview_equity("trading", "RELIANCE", stop=1320.0, target=1376.0)
+            book_mod.capital.ENFORCE = False
+            free = self.bk.preview_equity("trading", "RELIANCE", stop=1320.0, target=1376.0)
+        finally:
+            book_mod.capital.ENFORCE = enforce
+        self.assertEqual(free["verdict"], "PASS", free["reasons"])
+        self.assertEqual(free["pool_free_inr"], 20000.0)                  # still reported
+        self.assertFalse(free["capital_cap_enforced"])
+        self.assertLessEqual(capped["capital_inr"], 20000.0)              # enforced: inside the free room
+        self.assertGreater(free["qty"], capped["qty"])                    # off: sized as if the pool were empty
+
     def test_trades_per_day_limit(self):
         self.bk.cfg["max_trades_per_day"] = 1
         pv = self.bk.preview_equity("trading", "RELIANCE", stop=1320.0, target=1376.0)

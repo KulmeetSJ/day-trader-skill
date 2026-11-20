@@ -459,7 +459,7 @@ def cmd_scan(a):
         # Room in the INVESTING pool (its own Rs 1,00,000, separate from trading).
         import size as size_mod
         cap = capital.cap_inr(size_mod.load_config(None, market="IN"), "investing")
-        free = capital.room("investing", cap)
+        free = capital.room("investing", cap) if capital.ENFORCE else None   # cap off while testing
         ledger = add_to_ledger(ledger, ideas, capital_free=free)
         write_csv(LEDGER_CSV, LEDGER_FIELDS, ledger)
     prev = [r for r in read_csv(CALLS_CSV) if r.get("scan_date") != scan_date]

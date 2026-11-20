@@ -9,6 +9,7 @@ Python 3.8 compatible without third-party dependencies.
 import datetime
 from decimal import Decimal, InvalidOperation
 import gzip
+import hashlib
 import inspect
 import json
 import logging
@@ -16,6 +17,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -2446,6 +2448,9 @@ def _iter_upstox_date_chunks(start_date, end_date, unit, unit_interval):
     return chunks
 
 
+RATE_LIMIT_BACKOFF_S = 5.0   # parallel batch: wait this long after a 429 before the single retry
+
+
 class UpstoxOptionChain(OptionChain):
     """OptionChain preserving real Upstox provider, live/historical status, and Greeks."""
 
@@ -2629,6 +2634,25 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         self._base_url = str(base_url or UPSTOX_BASE_URL).rstrip("/")
         self._instruments_url_template = str(instruments_url_template or UPSTOX_INSTRUMENTS_CDN_TEMPLATE)
         self._now_fn = now_fn
+        # Speed knobs (opt-in; the watcher sets them, tests and one-off CLIs keep the old behaviour):
+        #   UPSTOX_BATCH_WORKERS  parallel symbol fetches in get_batch_series (default 1 = sequential)
+        #   UPSTOX_HIST_CACHE_DIR same-day disk cache for historical-candle chunks that hold only PAST
+        #                         sessions (they can't change intraday; today's bars always come live
+        #                         from the intraday endpoint, never from this cache).
+        try:
+            self._batch_workers = max(1, min(8, int(env_map.get("UPSTOX_BATCH_WORKERS") or 1)))
+        except (TypeError, ValueError):
+            self._batch_workers = 1
+        self._hist_cache_dir = str(env_map.get("UPSTOX_HIST_CACHE_DIR") or "").strip() or None
+        #   UPSTOX_MAX_RPS        cap on request starts per second for this process, shared by all
+        #                         threads (Upstox's Cloudflare edge answers bursts with 429 / error 1015)
+        try:
+            rps = float(env_map.get("UPSTOX_MAX_RPS") or 0)
+        except (TypeError, ValueError):
+            rps = 0.0
+        self._min_gap = (1.0 / rps) if rps > 0 else 0.0
+        self._rate_lock = threading.Lock()
+        self._next_slot = [0.0]
 
         self._instruments_by_exch = {}
         self._key_by_symbol = {}
@@ -2718,11 +2742,22 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             raise ProviderConnectionError("Upstox server error HTTP %s: %s" % (status_code, combined_msg))
         raise DataError("Upstox API error (%s): %s" % (", ".join(err_codes) or status_code, combined_msg))
 
+    def _throttle(self):
+        if not self._min_gap:
+            return
+        with self._rate_lock:
+            now = time.time()
+            slot = max(now, self._next_slot[0])
+            self._next_slot[0] = slot + self._min_gap
+        if slot > now:
+            time.sleep(slot - now)
+
     def _raw_http_get(self, url, headers=None, method="GET"):
         if str(method).upper() != "GET":
             raise ProviderConfigError(
                 "UpstoxMarketDataProvider is strictly read-only; HTTP %s is forbidden." % method
             )
+        self._throttle()
         hdrs = dict(headers or {})
         if self._http_get_fn is not None:
             resp = self._http_get_fn(url, headers=hdrs, timeout=self._timeout)
@@ -3363,14 +3398,18 @@ class UpstoxMarketDataProvider(MarketDataProvider):
                 path = "/v3/historical-candle/%s/%s/%s/%s/%s" % (
                     encoded_key, unit, unit_iv, c_end.isoformat(), c_start.isoformat()
                 )
-                try:
-                    resp = self._request_json(path)
-                except SymbolNotFoundError:
-                    if include_intraday and c_end >= today_ist:
-                        continue
-                    raise
-                candles = ((resp or {}).get("data") or {}).get("candles") or []
-                for bar in self._parse_upstox_candles(candles, unit):
+                parsed = self._hist_cache_get(path, today_ist)
+                if parsed is None:
+                    try:
+                        resp = self._request_json(path)
+                    except SymbolNotFoundError:
+                        if include_intraday and c_end >= today_ist:
+                            continue
+                        raise
+                    candles = ((resp or {}).get("data") or {}).get("candles") or []
+                    parsed = self._parse_upstox_candles(candles, unit)
+                    self._hist_cache_put(path, today_ist, parsed)
+                for bar in parsed:
                     by_ts[bar["ts"]] = bar
 
             if include_intraday and end_date >= today_ist:
@@ -3538,7 +3577,47 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             is_cas_eligible=is_cas_eligible,
         )
 
+    def _hist_cache_file(self, path, today_ist):
+        if not self._hist_cache_dir:
+            return None
+        h = hashlib.sha256(path.encode("utf-8")).hexdigest()[:32]
+        return os.path.join(self._hist_cache_dir, today_ist.isoformat(), h + ".json")
+
+    def _hist_cache_get(self, path, today_ist):
+        """Parsed bars cached TODAY for this exact historical-candle path, else None."""
+        f = self._hist_cache_file(path, today_ist)
+        if not f or not os.path.exists(f):
+            return None
+        try:
+            with open(f, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if doc.get("path") != path or not isinstance(doc.get("bars"), list):
+                return None
+            return doc["bars"]
+        except Exception:
+            return None
+
+    def _hist_cache_put(self, path, today_ist, bars):
+        """Cache a chunk only if every bar is from a session before today (immutable data)."""
+        f = self._hist_cache_file(path, today_ist)
+        if not f or not bars:
+            return
+        today_s = today_ist.isoformat()
+        if any(str(b.get("date") or "") >= today_s for b in bars):
+            return
+        try:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            tmp = "%s.%d.%d.tmp" % (f, os.getpid(), threading.get_ident())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"path": path, "bars": bars}, fh)
+            os.replace(tmp, f)
+        except Exception:
+            pass
+
     def get_batch_series(self, symbols, range_str="3mo", interval="1d", exchange="NSE", now=None, pause=0.0):
+        if self._batch_workers > 1 and len(symbols or []) > 1:
+            return self._get_batch_series_parallel(symbols, range_str=range_str, interval=interval,
+                                                   exchange=exchange, now=now)
         out = {}
         last_err = None
         is_daily = str(interval or "1d").lower() in ("1d", "d", "daily", "1wk", "1mo")
@@ -3560,6 +3639,56 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             if pause and idx + 1 < len(symbols):
                 time.sleep(pause)
         if not out and symbols and last_err is not None:
+            raise last_err
+        return out
+
+    def _get_batch_series_parallel(self, symbols, range_str="3mo", interval="1d", exchange="NSE", now=None):
+        """Same contract as the sequential loop, fetched by a small thread pool. Instrument keys are
+        resolved first, in this thread, so the shared instrument maps are filled before any worker runs.
+        Auth and rate-limit errors still abort the whole batch (fail closed)."""
+        import concurrent.futures
+        is_daily = str(interval or "1d").lower() in ("1d", "d", "daily", "1wk", "1mo")
+        syms = list(symbols or [])
+        for sym in syms:
+            try:
+                self.resolve_instrument_key(sym, exchange=exchange)
+            except (SymbolNotFoundError, MissingDataError, InvalidSymbolError):
+                pass
+
+        def fetch(sym):
+            if is_daily:
+                return self.get_daily_bars(sym, range_str=range_str, exchange=exchange, now=now)
+            return self.get_intraday_data(sym, interval=interval, range_str=range_str, exchange=exchange, now=now)
+
+        def one(sym):
+            try:
+                return fetch(sym)
+            except RateLimitError:          # one polite retry after a back-off, then give up (fail closed)
+                time.sleep(RATE_LIMIT_BACKOFF_S)
+                return fetch(sym)
+
+        out, last_err, results = {}, None, {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._batch_workers) as ex:
+            futs = dict((ex.submit(one, sym), sym) for sym in syms)
+            for fut in concurrent.futures.as_completed(futs):
+                sym = futs[fut]
+                try:
+                    results[sym] = fut.result()
+                except (AuthenticationConfigError, RateLimitError):
+                    for f in futs:
+                        f.cancel()
+                    raise
+                except (SymbolNotFoundError, MissingDataError) as e:
+                    last_err = e
+        for sym in syms:                       # keep the caller's symbol order
+            pl = results.get(sym)
+            if pl is None:
+                continue
+            canon = symbols_in.normalize_symbol(sym) if "|" not in str(sym) else str(sym)
+            out[canon] = to_scanner_series(pl)
+            if pl.get("fallback_from"):
+                out[canon]["fallback_from"] = pl["fallback_from"]
+        if not out and syms and last_err is not None:
             raise last_err
         return out
 

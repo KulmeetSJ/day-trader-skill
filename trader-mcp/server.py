@@ -27,7 +27,8 @@ STATE = os.path.join(BASE_DIR, "trader", "state")
 INSTRUCTIONS = (
     "Paper trading desk for Indian equities and index options (NSE). You are the trader: research with the "
     "read tools, then trade with preview_* -> place_trade. Two separate pools of Rs 1,00,000: 'trading' "
-    "(intraday, flat by 15:20) and 'investing' (multi-day). Every trade is sized by the budget engine and must "
+    "(intraday, flat by 15:20) and 'investing' (multi-day); during this testing stage the pool cap is reported "
+    "but does not refuse trades (each trade is sized as if its pool were empty). Every trade is sized by the budget engine and must "
     "PASS trader-risk (Rs 2,000 max loss per trade, Rs 5,000 risk at stops per day per pool, 3 entries/day, "
     "net reward:risk >= 2 after charges, long only, no entries after 15:00). You cannot override a BLOCK -- "
     "pick another trade or do nothing. Doing nothing is a valid, often correct, decision. Exits at stop, "

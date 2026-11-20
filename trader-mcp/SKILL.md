@@ -29,7 +29,9 @@ believes in, and writes down why. The deterministic engine still owns every numb
 | `trading` | intraday equity, intraday option buys | Rs 1,00,000 committed at once | stop, target, flat by 15:20 |
 | `investing` | multi-day equity (positional) | its own Rs 1,00,000 | stop, target, 60-session time stop |
 
-The caps come from the config `budget`. Each pool keeps its own order records, so trader-risk's daily
+The caps come from the config `budget`. **While testing (since 2026-11-20) the cap is reported but not
+enforced** (`scripts/capital.py` `ENFORCE = False`): each trade is sized as if its pool were empty, and
+`pool_free_inr` still shows the real free capital. Each pool keeps its own order records, so trader-risk's daily
 loss (Rs 5,000 at the stops of today's entries), trades-per-day (3) and duplicate rules apply per pool.
 The rule-based ledgers (equity_calls, options_watch) keep running beside this book as benchmarks; they
 never share or block its capital.

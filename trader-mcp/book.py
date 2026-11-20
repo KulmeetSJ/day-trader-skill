@@ -37,6 +37,7 @@ for _d in ("trader-alerts", "trader-budget", "trader-risk", "trader-options", "t
 
 import size  # noqa: E402  (trader-budget/size.py)
 import check as risk  # noqa: E402  (trader-risk/check.py)
+import capital  # noqa: E402  (scripts/capital.py: ENFORCE switch for the pool caps)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 BOOK_PATH = os.path.join(BASE_DIR, "trader", "state", "ai_book.json")
@@ -115,6 +116,12 @@ class Book(object):
     def room(self, book, pool):
         return max(0.0, self.cap(pool) - self.committed(book, pool))
 
+    def sizing_room(self, book, pool):
+        """Cash a new trade may use: the pool's free capital, or (capital.ENFORCE off, testing stage)
+        the whole pool cap, so open positions never refuse or shrink a new one. room() still reports
+        the real free capital."""
+        return self.room(book, pool) if capital.ENFORCE else self.cap(pool)
+
     def pool_state(self, book, pool):
         """trader-risk's broker-state view of ONE pool (its own daily loss / trades limits)."""
         return {"orders": [o for o in book["orders"] if o.get("pool") == pool]}
@@ -145,7 +152,7 @@ class Book(object):
                             % (stop, entry, target))
         with _LOCK:
             book = load(self.path)
-            room = self.room(book, pool)
+            room = self.sizing_room(book, pool)
             if room <= 0:
                 raise BookError("CAPITAL_CAP: the %s pool's Rs %.0f is fully committed" % (pool, self.cap(pool)))
             now = self.clock()
@@ -174,7 +181,8 @@ class Book(object):
                    "stop": s["stop"], "target": s["target"], "capital_inr": round(s["qty"] * s["entry"], 2),
                    "max_loss_inr": s.get("net_risk_including_costs"), "net_reward_risk": s.get("net_reward_risk"),
                    "est_charges_inr": (s.get("transaction_costs") or {}).get("total"),
-                   "last_price": price, "data_status": tier, "pool_free_inr": round(room, 2)}
+                   "last_price": price, "data_status": tier, "pool_free_inr": round(self.room(book, pool), 2),
+                   "capital_cap_enforced": bool(capital.ENFORCE)}
             if r["verdict"] == "PASS":
                 pid = "EQ-" + hashlib.sha256(("%s|%s" % (r["fingerprint"], now.isoformat())).encode()).hexdigest()[:10]
                 book["previews"][pid] = dict(out, kind="equity", fingerprint=r["fingerprint"], order=order,
@@ -194,7 +202,7 @@ class Book(object):
         with _LOCK:
             book = load(self.path)
             now = self.clock()
-            room = self.room(book, "trading")
+            room = self.sizing_room(book, "trading")
             for s in sigs:
                 strat = str(s.get("strategy") or "")
                 ps = s.get("position_sizing") or {}
@@ -313,7 +321,7 @@ class Book(object):
         positions = [{"symbol": p["symbol"], "qty": p["qty"]} for p in self.open_positions(book, pool)
                      if p["kind"] == "equity"]
         now_utc = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-        res = risk.check([pv["order"]], self.cfg, portfolio={"cash": self.room(book, pool), "positions": positions},
+        res = risk.check([pv["order"]], self.cfg, portfolio={"cash": self.sizing_room(book, pool), "positions": positions},
                          prices={pv["symbol"]: float(pv["entry"])}, state=self.pool_state(book, pool), now=now_utc,
                          price_times={pv["symbol"]: now_utc}, market="IN", instruments_path=self.instruments_path)
         r0 = res["results"][0]

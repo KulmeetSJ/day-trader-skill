@@ -3,6 +3,7 @@
 
     python3 scripts/daily_start.py start       # start whatever isn't running (no-op on non-trading days)
     python3 scripts/daily_start.py status      # which watchers are running
+    python3 scripts/daily_start.py stop        # stop all of them (SIGTERM, then SIGKILL)
     python3 scripts/daily_start.py install     # launchd agent: run `start` at 09:00 IST Mon-Fri (+ at login)
     python3 scripts/daily_start.py uninstall
 
@@ -55,9 +56,56 @@ def is_trading_day(d):
 
 
 def running(script):
-    out = subprocess.run(["pgrep", "-f", "python[0-9.]* .*%s" % script], stdout=subprocess.PIPE,
-                         universal_newlines=True)
-    return [int(x) for x in out.stdout.split()]
+    """PIDs of the Python processes running `script` (e.g. scripts/ai_trader.py).
+
+    Matched on the full command line by script path, whatever the interpreter is called: Homebrew's
+    python3 shows up as .../Python.app/Contents/MacOS/Python, which a "python[0-9.]*" pattern misses.
+    The `caffeinate -i ...` helper (its command line also names the script) is not the worker: macOS
+    caffeinate runs the command in its own process and keeps a child that only holds the awake lock,
+    so it is skipped. Our own process is skipped too."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], stdout=subprocess.PIPE, universal_newlines=True)
+    pids = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        argv = cmd.split()
+        if pid == os.getpid() or not argv or os.path.basename(argv[0]) == "caffeinate":
+            continue
+        if any(a == script or a.endswith("/" + script) for a in argv[1:3]):
+            pids.append(pid)
+    return pids
+
+
+def stop_pids(pids, wait_s=10.0):
+    """SIGTERM, wait, then SIGKILL anything left. Returns the pids that were still alive at the end."""
+    import signal
+    import time
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + wait_s
+    alive = list(pids)
+    while alive and time.time() < deadline:
+        time.sleep(0.5)
+        alive = [p for p in alive if _alive(p)]
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return [p for p in alive if _alive(p)]
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def cmd_start(a):
@@ -74,6 +122,11 @@ def cmd_start(a):
     py = sys.executable
     for name, args, logname, until in JOBS:
         pids = running(args[0])
+        if len(pids) > 1:                           # duplicates double the API load and the AI runs
+            log("%s has %d copies running (%s); stopping all but the newest"
+                % (name, len(pids), ",".join(map(str, pids))))
+            stop_pids(sorted(pids)[:-1])
+            pids = sorted(pids)[-1:]
         if pids:
             log("%s already running (pid %s)" % (name, ",".join(map(str, pids))))
             continue
@@ -84,6 +137,18 @@ def cmd_start(a):
         p = subprocess.Popen(["caffeinate", "-i", py] + args, cwd=BASE_DIR, stdout=fh, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, start_new_session=True)
         log("started %s (pid %d) -> trader/state/%s" % (name, p.pid, logname))
+    return 0
+
+
+def cmd_stop(a):
+    for name, args, _, _ in JOBS:
+        pids = running(args[0])
+        if not pids:
+            print("%-14s not running" % name)
+            continue
+        left = stop_pids(pids)
+        print("%-14s stopped pid %s%s" % (name, ",".join(map(str, pids)),
+                                         (" (STILL ALIVE: %s)" % left) if left else ""))
     return 0
 
 
@@ -167,10 +232,12 @@ def main(argv=None):
     s = sub.add_parser("start")
     s.add_argument("--force", action="store_true", help="start even on a non-trading day / after the cutoff")
     sub.add_parser("status")
+    sub.add_parser("stop")
     sub.add_parser("install")
     sub.add_parser("uninstall")
     a = ap.parse_args(argv)
-    fn = {"start": cmd_start, "status": cmd_status, "install": cmd_install, "uninstall": cmd_uninstall}.get(a.cmd)
+    fn = {"start": cmd_start, "status": cmd_status, "stop": cmd_stop, "install": cmd_install,
+          "uninstall": cmd_uninstall}.get(a.cmd)
     if fn is None:
         ap.print_help()
         return 2

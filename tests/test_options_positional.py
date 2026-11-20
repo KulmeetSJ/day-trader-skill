@@ -123,15 +123,28 @@ class TestWatchLedger(unittest.TestCase):
         self.assertEqual([c["status"] for c in calls], ["CALL", "OPEN_RISK"])
 
     def test_capital_cap_blocks_spread_that_does_not_fit(self):
-        orig = ow.capital_free
+        orig, enforce = ow.capital_free, ow.capital.ENFORCE
         ow.capital_free = lambda: (1000.0, 100000.0)     # Rs 99,000 already committed elsewhere
+        ow.capital.ENFORCE = True
         try:
             _, e2 = pos.entry_expiry(datetime.date(2026, 12, 1), pos.RULES[1])
             ow.check(today=e2)
         finally:
-            ow.capital_free = orig
+            ow.capital_free, ow.capital.ENFORCE = orig, enforce
         self.assertEqual(ow.read_csv(ow.LEDGER_CSV), [])
         self.assertEqual([c["status"] for c in ow.read_csv(ow.CALLS_CSV)], ["CAPITAL_CAP"])
+
+    def test_capital_cap_off_while_testing_opens_the_spread(self):
+        orig, enforce = ow.capital_free, ow.capital.ENFORCE
+        ow.capital_free = lambda: (1000.0, 100000.0)
+        ow.capital.ENFORCE = False
+        try:
+            _, e2 = pos.entry_expiry(datetime.date(2026, 12, 1), pos.RULES[1])
+            ow.check(today=e2)
+        finally:
+            ow.capital_free, ow.capital.ENFORCE = orig, enforce
+        self.assertEqual(len(ow.read_csv(ow.LEDGER_CSV)), 1)
+        self.assertEqual([c["status"] for c in ow.read_csv(ow.CALLS_CSV)], ["CALL"])
 
     def test_not_entry_day_does_nothing(self):
         ow.check(today=datetime.date(2026, 12, 2))

@@ -73,6 +73,15 @@ DEFAULT_STOP = "swing"
 # other setups in the 37-session backtest -- 2026-11-19 diagnosis -- so it is alerted again.)
 ANALYSIS_ONLY_SETUPS = ""
 DEFAULT_TARGET_R = 2.2
+# Speed (2026-11-20: cycles took ~290s and skipped every other 5m candle). Inherited by every subprocess
+# (scanner, trader-exit, scoreboard, options worker): read-only Upstox GETs a few at a time, and past
+# sessions' candles cached for the day on disk (today's bars always come live). See data_in.py.
+SPEED_ENV = {"UPSTOX_BATCH_WORKERS": "4", "UPSTOX_MAX_RPS": "5",
+             "UPSTOX_HIST_CACHE_DIR": os.path.join(BASE_DIR, "trader", "state", "cache", "upstox_hist")}
+# The background full scoreboard shares the API with the scan, so it gets a smaller request rate.
+FULL_BOARD_ENV = {"UPSTOX_MAX_RPS": "2", "UPSTOX_BATCH_WORKERS": "2"}
+# The full scoreboard (re-prices every rejected setup; a report only) runs in the background this often.
+FULL_BOARD_EVERY_S = 900
 REJECT_FIELDS = ("date", "time", "kind", "direction", "symbol", "setup", "trigger_time", "underlying_price",
                  "entry", "stop", "target", "qty_or_lots", "net_rr", "reasons",
                  "p_target", "p_stop", "p_green", "odds_n", "india_vix", "nifty_chg_pct", "nifty_vs_open_pct")
@@ -196,6 +205,8 @@ class Watcher(object):
         self.capital_cap = capital.cap_inr(self.cfg, "trading")
         self.equity_ledger_path = capital.EQUITY_LEDGER_CSV
         self.options_ledger_path = capital.OPTIONS_LEDGER_CSV
+        self.full_board = None          # background Popen of the full scoreboard
+        self.full_board_at = 0.0
 
     def load_active_calls(self):
         import csv
@@ -494,8 +505,10 @@ class Watcher(object):
             # Size inside the capital still free under the Rs 1,00,000 total cap: the budget engine gets
             # it as cash, so its own buffer / position cap / max order decide the quantity.
             free, used = self.capital_room()
-            room_cash = free if cash is None else min(cash, free)
-            if room_cash <= 0:
+            enforce = capital.ENFORCE
+            size_cash = free if enforce else self.capital_cap      # cap off: size as if the pool were empty
+            room_cash = size_cash if cash is None else min(cash, size_cash)
+            if enforce and room_cash <= 0:
                 self.seen.add(key)
                 self.confirmed_rejected += 1
                 self.reject(dict(base_row, entry=entry, stop=stop, target=target,
@@ -509,7 +522,7 @@ class Watcher(object):
                 self.seen.add(key)
                 self.confirmed_rejected += 1
                 cap_note = (" (sized within Rs %.0f free of the Rs %.0f capital cap)" % (free, self.capital_cap)
-                            if free < self.capital_cap - 1e-6 else "")
+                            if enforce and free < self.capital_cap - 1e-6 else "")
                 self.reject(dict(base_row, entry=entry, stop=stop, target=target,
                                  reasons="BUDGET: " + _last_line(e) + cap_note))
                 continue
@@ -519,7 +532,7 @@ class Watcher(object):
                 self.confirmed_rejected += 1
                 why = ("BUDGET: %s" % s.get("refusal")) if s.get("refusal") else (
                     "BUDGET: qty 0" if not s.get("qty") else "NET_RR: %.2f after charges < %.2f" % (net_rr or 0, self.min_rr))
-                if free < self.capital_cap - 1e-6:
+                if enforce and free < self.capital_cap - 1e-6:
                     why += " (sized within Rs %.0f free of the Rs %.0f capital cap)" % (free, self.capital_cap)
                 self.reject(dict(base_row, entry=entry, stop=stop, target=target, qty_or_lots=s.get("qty"),
                                  net_rr=round(net_rr, 2) if net_rr is not None else "", reasons=why))
@@ -549,6 +562,10 @@ class Watcher(object):
                           ("%.2f" % costs) if costs is not None else "n/a",
                           plan["provider"], plan["data_status"]))
             summary += " | " + probability.odds_text(odds, self.prob_model)
+            need = float(s.get("qty") or 0) * float(entry)
+            if not enforce and need > free + 1e-6:
+                summary += (" | over the Rs %.0f trading cap (Rs %.0f already committed today; cap not enforced "
+                            "while testing)" % (self.capital_cap, used))
             row = {"action": "BUY shares (long equity)", "symbol": sym, "setup": h.get("setup"),
                    "trigger_time": trig.get("close_time"), "trigger_price": trig.get("close"),
                    "alert_delay_min": ("%.1f" % age_now) if age_now is not None else "",
@@ -626,7 +643,7 @@ class Watcher(object):
                 else:
                     blocked = (self.setup_block(_ut.get("setup")) or self.loss_block()) if sig.get("_validated") else None
                 need = sig.get("capital_margin_requirement")
-                if sig.get("_validated") and not blocked:
+                if sig.get("_validated") and not blocked and capital.ENFORCE:
                     free, used = self.capital_room()
                     if need is None:
                         blocked = "CAPITAL_CAP: no capital requirement in the signal; not alerted (fail closed)"
@@ -680,6 +697,7 @@ class Watcher(object):
         except Exception as e:
             self.error("options scan", e)
         took = time.time() - t0
+        self.last_cycle_s = took
         if took > 300 - SETTLE_SECONDS:
             emit("WATCH SLOW: cycle took %.0fs (equities %.0fs, options %.0fs) -- the next 5m candle's "
                  "check is skipped, so alerts run late" % (took, t_eq, took - t_eq))
@@ -688,20 +706,33 @@ class Watcher(object):
         if force or time.time() - self.last_heartbeat >= HEARTBEAT_MINUTES * 60:
             self.last_heartbeat = time.time()
             emit("WATCH alive: %d cycles, %d opportunities, %d confirmed setups refused by budget/net R:R, "
-                 "%d rejected/short calls logged to trader/state/rejected.csv%s"
+                 "%d rejected/short calls logged to trader/state/rejected.csv | last cycle %.0fs%s"
                  % (self.cycles, self.opportunities, self.confirmed_rejected, self.rejected,
+                    getattr(self, "last_cycle_s", 0.0),
                     " | HALTED for the day (daily loss limit)" if self.halted else ""))
 
     def refresh_scoreboard(self):
-        """Rewrite trader/state/scoreboard.txt (scripts/scoreboard.py) in its own process."""
+        """Today's alerted calls -> scoreboard_day.json (the daily-loss stop reads it), blocking but fast
+        (`--calls-only`). The full board with every rejected setup re-priced is a report, so it runs in
+        the background at most every FULL_BOARD_EVERY_S and never delays a cycle."""
+        script = os.path.join(BASE_DIR, "scripts", "scoreboard.py")
         try:
-            out = subprocess.run([sys.executable, os.path.join(BASE_DIR, "scripts", "scoreboard.py")],
+            out = subprocess.run([sys.executable, script, "--calls-only"],
                                  cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  universal_newlines=True, timeout=150)
             if out.returncode != 0:
                 raise RuntimeError(out.stderr or "scoreboard exit %d" % out.returncode)
         except Exception as e:
             self.error("scoreboard", e)
+        try:
+            busy = self.full_board is not None and self.full_board.poll() is None
+            if not busy and time.time() - self.full_board_at >= FULL_BOARD_EVERY_S:
+                self.full_board_at = time.time()
+                env = dict(os.environ, **FULL_BOARD_ENV)
+                self.full_board = subprocess.Popen([sys.executable, script, "--workers", "2"], cwd=BASE_DIR, env=env,
+                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.error("full scoreboard", e)
 
     def next_wake(self, now):
         base = now.replace(second=0, microsecond=0)
@@ -711,11 +742,12 @@ class Watcher(object):
 
     def run(self):
         emit("WATCH start: equities %s (plan: stop %s, target %sR via trader-exit), options %s, "
-             "budget Rs %.0f, min net R:R %.2f, capital cap Rs %.0f total, cutoff %s IST. Paper only; never places orders."
+             "budget Rs %.0f, min net R:R %.2f, capital cap Rs %.0f total (%s), cutoff %s IST. Paper only; never places orders."
              % (("from %s" % (self.args.universe or self.args.watchlist)) if getattr(self.args, "equities", False)
                 else "OFF (intraday equity alerts retired 2026-11-19; --equities to re-enable)", self.args.stop, self.args.target_r,
                 ",".join(self.args.options) or "off", self.args.budget,
-                self.min_rr, self.capital_cap, self.cutoff.strftime("%H:%M")))
+                self.min_rr, self.capital_cap, "enforced" if capital.ENFORCE else "reported, not enforced",
+                self.cutoff.strftime("%H:%M")))
         if self.args.once:
             self.cycle()
             self.heartbeat(force=True)
@@ -733,6 +765,19 @@ class Watcher(object):
             wake = max(self.next_wake(now_ist()),
                        now_ist().replace(hour=FIRST_CHECK.hour, minute=FIRST_CHECK.minute, second=SETTLE_SECONDS, microsecond=0))
             time.sleep(max(1.0, (wake - now_ist()).total_seconds()))
+
+
+def apply_speed_env():
+    """SPEED_ENV for this process and its children (an explicit env var wins); drop old cache days."""
+    for k, v in SPEED_ENV.items():
+        os.environ.setdefault(k, v)
+    root = os.environ.get("UPSTOX_HIST_CACHE_DIR")
+    today = now_ist().date().isoformat()
+    if root and os.path.isdir(root):
+        import shutil
+        for d in os.listdir(root):
+            if d != today and len(d) == 10 and d[4] == "-":
+                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
 
 def build_universe(path):
@@ -807,6 +852,7 @@ def main(argv=None):
                     help="don't scan bearish setups for rejected.csv (they are never alerted either way)")
     ap.add_argument("--options-worker", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
+    apply_speed_env()
     if a.options_worker:
         return options_worker(a.options_worker, a.budget)
     a.options = [s.strip().upper() for s in a.options.split(",") if s.strip()]

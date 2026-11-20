@@ -94,7 +94,11 @@ Mon-Fri and at login; on an NSE trading day (`calendar_in`) it starts whatever i
 `caffeinate -i`, logging to `trader/state/<name>.log`:
 - `market_watch.py --equities` -- intraday watcher (exits at the 15:00 cutoff, so it's started daily);
 - `options_watch.py run`, `equity_calls.py run`, `ai_trader.py run` -- long-running daemons.
-`daily_start.py status` shows what's up. A sleeping Mac misses the open: `sudo pmset repeat wakeorpoweron MTWRF 08:55:00`.
+`daily_start.py status` shows what's up; `daily_start.py stop` stops them. Processes are found by script path
+on the full command line: Homebrew python runs as `.../Python.app/Contents/MacOS/Python` and `caffeinate -i`
+keeps a helper child naming the script, so a `pgrep python...` match hits the helper, not the worker (this
+left duplicate watchers running until 2026-11-20). `start` stops duplicates, keeping the newest.
+A sleeping Mac misses the open: `sudo pmset repeat wakeorpoweron MTWRF 08:55:00`.
 
 **AI trader -- the primary path now** (`trader-mcp/`, `scripts/ai_trader.py`, `.mcp.json` -> `day-trader`).
 The user's goal: an MCP server where the AI, not fixed rules, analyses and decides, triggered automatically.
@@ -109,6 +113,10 @@ The user's goal: an MCP server where the AI, not fixed rules, analyses and decid
   are never placeable. Exits are rules run by `mark()` without the AI: stop (checked before target within a
   bar), target, 15:20 flat-by (intraday), 60-session time stop (positional). The journal pairs every
   rationale with its outcome -- that's how the AI is judged.
+- Capital cap NOT ENFORCED while testing (user, 2026-11-20): `scripts/capital.py` `ENFORCE = False`. Every
+  tool still reports committed capital, but nothing is refused or shrunk for it; trades are sized as if
+  the pool were empty. Per-trade/daily loss, trades/day, net R:R and trader-risk BLOCKs are unchanged.
+  Flip `ENFORCE = True` to restore the caps below.
 - Two SEPARATE pools of Rs 1,00,000 each (config `budget`): `trading` = intraday equity + option buys,
   `investing` = multi-day equity. Each pool keeps its own broker-style order records, so trader-risk's
   daily loss (Rs 5,000 at stops of today's entries), 3 entries/day and duplicate rules apply per pool.
@@ -135,6 +143,13 @@ The user's goal: an MCP server where the AI, not fixed rules, analyses and decid
   spreads (the only backtest variants that passed, on a Black-Scholes-on-VIX MODEL); Rs 6,000/lot spread
   budget (user-approved, spreads only), one open at a time, trading-pool capital cap; ledger
   `options_ledger.csv` tracked at real chain prices.
+- Speed (2026-11-20, cycles were ~290s and skipped every other candle; now ~50s): `market_watch.py` sets
+  `UPSTOX_BATCH_WORKERS=4`, `UPSTOX_MAX_RPS=5` and `UPSTOX_HIST_CACHE_DIR` for itself and its children.
+  `data_in.UpstoxMarketDataProvider` then fetches batches in parallel under a shared request-rate cap
+  (one retry after a 429; Upstox's Cloudflare edge returns error 1015 on bursts) and caches
+  historical-candle chunks that hold only past sessions for the day (today's bars always come live).
+  All opt-in env vars; defaults unchanged. The per-cycle scoreboard is `--calls-only` (daily-loss total,
+  under 1s); the full board re-pricing rejected setups runs in the background every 15 min at 2 req/s.
 - `capital.py`: per-pool committed capital for these ledgers (unreadable row = whole cap, fail closed). The
   AI book does its own accounting and never shares capital with them.
 

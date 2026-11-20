@@ -37,6 +37,13 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 POOLS = ("trading", "investing")
 
+# ENFORCE: refuse a new position that would push a pool over its cap?  OFF since 2026-11-20 (user: "we are
+# in the testing stage; I want to see how many of the bot's trades go right"). While off, every tool still
+# computes and REPORTS committed capital and flags trades that go over the cap, but never refuses one for
+# it; sizing gets the whole pool cap as cash, so each trade is sized as if the pool were empty. Per-trade
+# loss, daily loss, trades/day, net R:R and every trader-risk BLOCK are unaffected. Set True to restore.
+ENFORCE = False
+
 
 def cap_inr(cfg, pool="trading"):
     """A pool's hard cap: the config's budget (same for both pools). Missing/invalid -> ValueError."""

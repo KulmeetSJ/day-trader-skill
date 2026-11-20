@@ -219,7 +219,15 @@ class TestDailyLossStop(unittest.TestCase):
 
 
 class TestCapitalCap(unittest.TestCase):
-    """Rs 1,00,000 is the TOTAL capital at once (config budget), not per trade (user rule 2026-11-19)."""
+    """Rs 1,00,000 is the TOTAL capital at once (config budget), not per trade (user rule 2026-11-19).
+    These run with the cap ENFORCED; it is off while testing (2026-11-20), see TestCapitalCapOff."""
+
+    def setUp(self):
+        self._enforce = mw.capital.ENFORCE
+        mw.capital.ENFORCE = True
+
+    def tearDown(self):
+        mw.capital.ENFORCE = self._enforce
 
     def test_cap_is_config_budget(self):
         self.assertEqual(make_watcher().capital_cap, 100000.0)
@@ -289,6 +297,69 @@ class TestCapitalCap(unittest.TestCase):
         finally:
             w.scan_equities, w.exit_plan, mw.size.size_trade = origs
         self.assertTrue(rows(w.rejected_path)[0]["reasons"].startswith("CAPITAL_CAP:"))
+
+
+class TestCapitalCapOff(unittest.TestCase):
+    """capital.ENFORCE False (testing stage, user 2026-11-20): the cap is reported, never a refusal."""
+
+    def setUp(self):
+        self._enforce = mw.capital.ENFORCE
+        mw.capital.ENFORCE = False
+
+    def tearDown(self):
+        mw.capital.ENFORCE = self._enforce
+
+    def _hit(self):
+        now = mw.now_ist().strftime("%H:%M")
+        return {"symbol": "NEW", "setup": "vwap_reclaim", "side": "buy", "decision_state": "ENTRY CONFIRMED",
+                "actionable": True, "trigger": {"close_time": now, "close": 200.0},
+                "decision": {"entry_reference": 200.0, "stop_loss": 196.0}}
+
+    def test_full_cap_committed_still_sizes_with_the_whole_pool(self):
+        w = make_watcher()
+        w.args.equities = True
+        seed_today_call(w, 1000, 100.0)                 # the whole Rs 1,00,000 is committed
+        seen = {}
+
+        def fake_size(plan, cfg, cash=None, **k):
+            seen["cash"] = cash
+            return {"qty": 0, "refusal": "too small for the test", "net_reward_risk": None}
+        origs = (w.scan_equities, w.exit_plan, mw.size.size_trade, w.portfolio_cash)
+        w.scan_equities = lambda: {"hits": [self._hit()]}
+        w.exit_plan = lambda *a, **k: {"entry": 200.0, "stop": 196.0, "target": 208.8}
+        w.portfolio_cash = lambda: None
+        mw.size.size_trade = fake_size
+        try:
+            w.check_equities()
+        finally:
+            w.scan_equities, w.exit_plan, mw.size.size_trade, w.portfolio_cash = origs
+        self.assertAlmostEqual(seen["cash"], 100000.0)
+        why = rows(w.rejected_path)[0]["reasons"]
+        self.assertFalse(why.startswith("CAPITAL_CAP"), why)
+        self.assertNotIn("capital cap", why)
+
+    def test_option_over_the_cap_is_alerted(self):
+        import json as _json
+        w = make_watcher()
+        seed_today_call(w, 950, 100.0)                  # Rs 95,000 committed; the option needs Rs 12,037
+        w.args.options = ["NIFTY"]
+        w.args.budget = 2000.0
+        sig = {"contract": "NIFTY2026112325250CE", "strategy": "BUY_CE", "direction": "BULLISH",
+               "_validated": True, "underlying_trigger": {"time": "13:35", "setup": "vwap_reclaim"},
+               "current_premium": 160.5, "stop_loss": 143.3, "target_1": 175.9,
+               "capital_margin_requirement": 12037.5, "position_sizing": {"lots": 1, "total_quantity": 75}}
+
+        class R(object):
+            returncode, stderr, stdout = 0, "", _json.dumps([sig])
+        orig, orig_n = mw.subprocess.run, mw.notify
+        mw.subprocess.run = lambda *a, **k: R()
+        mw.notify = lambda *a, **k: None
+        try:
+            w.check_options()
+        finally:
+            mw.subprocess.run, mw.notify = orig, orig_n
+        self.assertEqual([r["kind"] for r in rows(w.csv_path)], ["equity", "options"])
+        self.assertEqual(rows(w.rejected_path), [])
 
 
 class TestAnalysisOnlySetups(unittest.TestCase):

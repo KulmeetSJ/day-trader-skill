@@ -11,6 +11,7 @@ It places nothing and changes nothing except the scoreboard text file it writes.
 
     python3 scripts/scoreboard.py                  # print today's board, write trader/state/scoreboard.txt
     python3 scripts/scoreboard.py --date 2026-11-18
+    python3 scripts/scoreboard.py --calls-only     # just today's calls + scoreboard_day.json (fast)
 """
 
 import argparse
@@ -208,7 +209,7 @@ def score_rejected(r, bars_for, now_slot):
     return ("RIGHT" if mv > 0 else "WRONG"), now_px, None, "direction only %+.2f" % mv
 
 
-def build(date=None, provider=None, totals=None, on_totals=None):
+def build(date=None, provider=None, totals=None, on_totals=None, calls_only=False, workers=1):
     """Return the board text. If `totals` is a dict it is filled with the day's equity-call total
     (see day_totals) for the watcher's daily-loss stop. `on_totals(totals)` is called as soon as the
     alerted calls are scored -- before the slow rejected section -- so the daily-loss total is saved
@@ -220,15 +221,29 @@ def build(date=None, provider=None, totals=None, on_totals=None):
     p = provider or data_in.get_provider()
     cache = {}
 
+    def fetch(sym):
+        try:
+            d = p.get_intraday_data(sym, interval="5m", range_str="1d")
+            return {slot(b["start"]): b for b in (d.get("bars") or [])
+                    if b.get("date") == date and b.get("c") is not None}
+        except Exception:
+            return {}
+
     def bars_for(sym):
         if sym not in cache:
-            try:
-                d = p.get_intraday_data(sym, interval="5m", range_str="1d")
-                cache[sym] = {slot(b["start"]): b for b in (d.get("bars") or [])
-                              if b.get("date") == date and b.get("c") is not None}
-            except Exception:
-                cache[sym] = {}
+            cache[sym] = fetch(sym)
         return cache[sym]
+
+    def prefetch(syms):
+        """Fill the cache for many symbols at once (read-only GETs, a few in parallel)."""
+        todo = sorted(set(x for x in syms if x and x not in cache))
+        if workers <= 1 or len(todo) < 2:
+            return
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for sym, bars in zip(todo, ex.map(fetch, todo)):
+                cache[sym] = bars
+    prefetch([c["symbol"] for c in calls])
     # bars whose 5 minutes have finished, plus the forming one (gives the live price)
     now_slot = slot(today.strftime("%H:%M")) if date == today.strftime("%Y-%m-%d") else 999
     charges = load_charges(date)
@@ -278,6 +293,10 @@ def build(date=None, provider=None, totals=None, on_totals=None):
     lines += odds_check("Alerted calls", odds_seen)
     if not calls:
         lines = lines[:2] + ["No alerted calls yet today."]
+    if calls_only:      # the watcher's per-cycle daily-loss check: skip the slow analysis section
+        return "\n".join(lines)
+    prefetch([underlying_of(r.get("symbol")) if r.get("kind") == "options" else r.get("symbol")
+              for r in load_rejected(date)])
     lines += rejected_section(date, bars_for, now_slot)
     return "\n".join(lines)
 
@@ -360,13 +379,17 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--date", default=None, help="YYYY-MM-DD (default: today IST)")
     ap.add_argument("--no-write", action="store_true")
+    ap.add_argument("--calls-only", action="store_true",
+                    help="score only today's alerted calls and save the day total (fast; for the watcher's "
+                         "daily-loss stop). scoreboard.txt is left alone.")
+    ap.add_argument("--workers", type=int, default=4, help="parallel bar fetches (default 4)")
     a = ap.parse_args(argv)
     os.chdir(BASE_DIR)
     totals = {}
     save = write_day if (a.date is None and not a.no_write) else None
-    text = build(a.date, totals=totals, on_totals=save)
+    text = build(a.date, totals=totals, on_totals=save, calls_only=a.calls_only, workers=max(1, a.workers))
     print(text)
-    if not a.no_write:
+    if not a.no_write and not a.calls_only:
         write(text)
     return 0
 

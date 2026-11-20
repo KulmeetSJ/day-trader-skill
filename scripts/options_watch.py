@@ -214,7 +214,7 @@ def check(preview=False, today=None):
             status, reason = "DUPLICATE", "already in the ledger"
         elif len(open_rows(ledger)) >= MAX_OPEN:
             status, reason = "OPEN_RISK", "one spread already open (one worst case exceeds the Rs 5,000 daily limit)"
-        else:
+        elif capital.ENFORCE:                       # cap reported, not enforced, while testing (capital.py)
             free, cap = capital_free()
             if float(sp["max_loss_inr"]) > free + 1e-6:
                 status, reason = "CAPITAL_CAP", ("needs Rs %.0f (max loss ~ blocked margin) but only Rs %.0f of the "
