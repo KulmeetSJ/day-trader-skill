@@ -38,6 +38,7 @@ for _d in ("trader-alerts", "trader-budget", "trader-options", "config", "script
 
 import positional as pos  # noqa: E402  (trader-options/positional.py)
 import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
+import upstox_speed  # noqa: E402  (per-process Upstox request pacing)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 STATE = os.path.join(BASE_DIR, "trader", "state")
@@ -340,6 +341,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     os.chdir(BASE_DIR)
     if a.cmd == "run":
+        upstox_speed.apply("options_watch")
         return run()
     if a.cmd == "preview":
         return check(preview=True)

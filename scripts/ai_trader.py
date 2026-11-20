@@ -11,8 +11,9 @@ and exits on rules.
 
 `run`, every 2 minutes during the NSE session (and once after the close):
   * marks the book: stop / target / 15:20 flat-by / time stop -- deterministic, no AI;
-  * wakes the AI when there is something NEW: an intraday alert or a fresh batch of refused setups
-    (market_watch), an option spread call (options_watch), a new multi-day scan (equity_calls), or a
+  * wakes the AI when there is something NEW: an intraday alert from market_watch (at once, even inside the
+    run gap; the AI is told to take it unless a concrete reason says no), setups refused just under the net
+    R:R gate (hourly at most, never into runs kept for the reviews ahead), an option spread call (options_watch), a new multi-day scan (equity_calls), or a
     scheduled review (09:35, 11:00, 13:30, and 15:50 for the investing pool);
   * caps AI runs (MAX_RUNS_PER_DAY, MIN_GAP_MIN apart) so a busy tape can't run up the bill.
 
@@ -43,7 +44,12 @@ POLL_SECONDS = 120
 MAX_RUNS_PER_DAY = 16
 MIN_GAP_MIN = 10
 AI_TIMEOUT_S = 900
-REFUSED_BATCH = 25          # wake the AI when this many NEW refused setups have piled up
+# Refused setups (2026-11-20 change): waking on every 25 refusals burned 10 of 16 runs on setups the AI
+# always passed (net R:R 1.2-1.9 after charges) and starved the 15:50 review. Now only NEAR-GATE refusals
+# (long, net R:R >= NEAR_GATE_RR) wake it, at most once per REFUSED_EVERY_MIN, and never into the runs kept
+# for the scheduled reviews still ahead.
+NEAR_GATE_RR = 1.8
+REFUSED_EVERY_MIN = 60
 
 PROMPT = """You are the trader for a PAPER account (Indian markets, NSE). Use only the day-trader MCP tools.
 Why you were woken: {reason}
@@ -51,15 +57,21 @@ Why you were woken: {reason}
 Do this:
 1. portfolio -> see both pools (trading: intraday; investing: multi-day), free capital, risk used today, limits.
 2. market_status. If the market is closed, only review the investing pool / plan for tomorrow; no intraday trades.
-3. get_signals (and get_quote / get_bars / get_news on anything you consider). Rule-based signals are leads;
+3. NEW INTRADAY ALERTS from the market watcher (listed above, if any) are the experiment we are measuring:
+   TAKE each one -- preview_equity_trade in the 'trading' pool with the alert's own stop and target, then
+   place_trade if it PASSes -- unless you find a concrete, checkable reason to skip it (stale data, price
+   already past the target or far past the entry, results/news event today, halted or illiquid). Name that
+   reason. "Too late", "stretched trend" or a gut feel is not a reason to skip an alert. Your own picks
+   beyond the alerts stay selective.
+4. get_signals (and get_quote / get_bars / get_news on anything you consider). Rule-based signals are leads;
    backtests found no fixed rule with a proven edge after charges, so your judgement is the point:
    trend and market context (NIFTY), where the stop really belongs (structure, not a fixed %), whether the
    target is realistic for the time left, liquidity, news/results risk.
-4. For the best idea(s) only: preview_equity_trade (or preview_option_trades for an index view). If PASS and
+5. For the best idea(s) only: preview_equity_trade (or preview_option_trades for an index view). If PASS and
    you still like it, place_trade with a specific rationale. A BLOCK is final -- don't fiddle the stop/target
    just to squeeze past the gate; a stop must sit where the setup is proven wrong.
-5. Doing nothing is often right. Prefer 0-2 high-conviction trades over many marginal ones.
-6. Finish with 3-6 lines: what you did and why, or why you passed.
+6. Apart from the alerts, doing nothing is often right. Prefer 0-2 high-conviction trades over many marginal ones.
+7. Finish with 3-6 lines: what you did and why, or why you passed.
 """
 
 
@@ -80,8 +92,9 @@ def load_seen():
         s = {}
     today = now_ist().strftime("%Y-%m-%d")
     if s.get("date") != today:
-        s = {"date": today, "alerts": 0, "refused": 0, "spread_calls": 0, "scan_date": s.get("scan_date"),
-             "reviews": [], "runs": 0, "last_run": None}
+        s = {"date": today, "alerts": 0, "refused": 0, "refused_at": None, "spread_calls": 0,
+             "scan_date": s.get("scan_date"), "reviews": [], "runs": 0, "last_run": None}
+    s.setdefault("refused_at", None)
     return s
 
 
@@ -108,19 +121,50 @@ def latest_scan_date():
         return max((r.get("scan_date") or "" for r in csv.DictReader(fh)), default=None)
 
 
+def read_rows(name, where):
+    path = os.path.join(STATE, name)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", newline="") as fh:
+        return [r for r in csv.DictReader(fh) if where(r)]
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def reviews_left(seen, now):
+    """Scheduled reviews still ahead today (each keeps one AI run in reserve)."""
+    return sum(1 for t in REVIEWS if t.strftime("%H:%M") not in seen["reviews"] and now.time() < t)
+
+
 def pending_reasons(seen, now):
     """What's new since the AI last looked. Updates `seen` in place."""
     today = now.strftime("%Y-%m-%d")
     reasons = []
-    n = count_rows("opportunities.csv", lambda r: r.get("date") == today)
-    if n > seen["alerts"]:
-        reasons.append("%d new intraday alert(s) from the market watcher" % (n - seen["alerts"]))
-        seen["alerts"] = n
-    n = count_rows("rejected.csv", lambda r: r.get("date") == today and r.get("kind") == "equity")
-    if n - seen["refused"] >= REFUSED_BATCH:
-        reasons.append("%d new confirmed setups the fixed rules refused (your call whether any deserve a "
-                       "different stop/target)" % (n - seen["refused"]))
-        seen["refused"] = n
+    alerts = read_rows("opportunities.csv", lambda r: r.get("date") == today)
+    if len(alerts) > seen["alerts"]:
+        new = alerts[seen["alerts"]:]
+        reasons.append("%d new intraday alert(s) from the market watcher -- take each unless a concrete reason "
+                       "says no: %s" % (len(new), "; ".join(
+                           "%s %s entry %s stop %s target %s" % (r.get("symbol"), r.get("setup"), r.get("entry"),
+                                                                 r.get("stop"), r.get("target")) for r in new)))
+        seen["alerts"] = len(alerts)
+    near = read_rows("rejected.csv", lambda r: r.get("date") == today and r.get("kind") == "equity"
+                     and (_num(r.get("net_rr")) or 0) >= NEAR_GATE_RR)
+    last = seen.get("refused_at")
+    due = last is None or (now - datetime.datetime.fromisoformat(last)).total_seconds() >= REFUSED_EVERY_MIN * 60
+    spare = MAX_RUNS_PER_DAY - seen["runs"] - reviews_left(seen, now) > 0
+    if len(near) > seen["refused"] and due and spare:
+        new = near[seen["refused"]:]
+        reasons.append("%d new setup(s) refused just under the net R:R gate (>= %.1f): %s -- your call whether "
+                       "any deserves a trade with a stop at real structure" % (
+                           len(new), NEAR_GATE_RR, ", ".join(sorted(set(r.get("symbol") or "?" for r in new)))))
+        seen["refused"] = len(near)
+        seen["refused_at"] = now.isoformat()
     n = count_rows("options_calls.csv", lambda r: str(r.get("time", "")).startswith(today) and r.get("status") == "CALL")
     if n > seen["spread_calls"]:
         reasons.append("new option credit-spread call")
@@ -176,6 +220,7 @@ def cmd_run(a):
     bk = book_mod.Book()
     emit("AI TRADER start: paper only; marks every %ds in session; AI runs max %d/day, %d min apart. Ctrl-C to stop."
          % (POLL_SECONDS, MAX_RUNS_PER_DAY, MIN_GAP_MIN))
+    last_deferred = None
     while True:
         now = now_ist()
         if is_trading_day(now.date()) and OPEN <= now.time() <= datetime.time(16, 0):
@@ -185,6 +230,7 @@ def cmd_run(a):
             reasons = pending_reasons(seen, now)
             last = datetime.datetime.fromisoformat(seen["last_run"]) if seen.get("last_run") else None
             gap_ok = last is None or (now - last).total_seconds() >= MIN_GAP_MIN * 60
+            gap_ok = gap_ok or any("intraday alert(s) from the market watcher" in r for r in reasons)  # alerts can't wait
             if reasons and seen["runs"] < MAX_RUNS_PER_DAY and gap_ok:
                 seen["runs"] += 1
                 seen["last_run"] = now.isoformat()
@@ -195,7 +241,8 @@ def cmd_run(a):
                     emit("AI SAYS:\n" + run_ai(why, dry=a.dry_run))
                 except Exception as e:
                     emit("AI ERROR %s" % str(e)[-300:])
-            elif reasons:
+            elif reasons and reasons != last_deferred:
+                last_deferred = reasons
                 emit("AI deferred (%s): %s" % ("daily run cap" if seen["runs"] >= MAX_RUNS_PER_DAY else "too soon",
                                                "; ".join(reasons)))
                 # not saved: the reasons stay pending and wake the AI once the gap/cap allows

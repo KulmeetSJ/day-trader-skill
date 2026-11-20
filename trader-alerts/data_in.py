@@ -2808,6 +2808,10 @@ class UpstoxMarketDataProvider(MarketDataProvider):
 
         headers = self._auth_headers() if auth else {"Accept": "application/json", "User-Agent": DEFAULT_USER_AGENT}
         status_code, body = self._raw_http_get(url, headers=headers, method="GET")
+        if status_code == 429 and self._min_gap > 0:
+            # Paced mode (UPSTOX_MAX_RPS set): one polite retry after a back-off, then fail closed as usual.
+            time.sleep(RATE_LIMIT_BACKOFF_S)
+            status_code, body = self._raw_http_get(url, headers=headers, method="GET")
         if status_code >= 400:
             if isinstance(body, (bytes, bytearray)):
                 body = bytes(body).decode("utf-8", errors="replace")

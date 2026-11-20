@@ -123,6 +123,26 @@ class TestThrottle(unittest.TestCase):
             data_in.RATE_LIMIT_BACKOFF_S = orig
         self.assertEqual(sorted(out), ["INFY", "RELIANCE"])
 
+    def test_paced_single_request_retries_once_after_429(self):
+        calls = {"n": 0}
+        ok = Recorder()
+
+        def flaky(url, headers=None, timeout=15):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 429, json.dumps({"status": "error", "errors": [{"message": "Rate limit"}]})
+            return ok(url, headers, timeout)
+        orig = data_in.RATE_LIMIT_BACKOFF_S
+        data_in.RATE_LIMIT_BACKOFF_S = 0.0
+        try:
+            out = provider(flaky, UPSTOX_MAX_RPS="50").get_historical_data("RELIANCE", range_str="1mo", interval="1d")
+            self.assertTrue(out["bars"])
+            calls["n"] = 0
+            with self.assertRaises(data_in.RateLimitError):          # unpaced: unchanged, fails at once
+                provider(flaky).get_historical_data("RELIANCE", range_str="1mo", interval="1d")
+        finally:
+            data_in.RATE_LIMIT_BACKOFF_S = orig
+
 
 class TestHistCache(unittest.TestCase):
     def setUp(self):

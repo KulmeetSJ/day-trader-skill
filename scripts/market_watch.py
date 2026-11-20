@@ -49,6 +49,7 @@ import size  # noqa: E402  (trader-budget/size.py)
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 import probability  # noqa: E402  (scripts/probability.py: backtest odds for a call)
 import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
+import upstox_speed  # noqa: E402  (scripts/upstox_speed.py: per-process Upstox request pacing)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 SETUPS = "breakout_intraday,vwap_reclaim,ema_alignment,rsi_momentum"
@@ -76,10 +77,8 @@ DEFAULT_TARGET_R = 2.2
 # Speed (2026-11-20: cycles took ~290s and skipped every other 5m candle). Inherited by every subprocess
 # (scanner, trader-exit, scoreboard, options worker): read-only Upstox GETs a few at a time, and past
 # sessions' candles cached for the day on disk (today's bars always come live). See data_in.py.
-SPEED_ENV = {"UPSTOX_BATCH_WORKERS": "4", "UPSTOX_MAX_RPS": "5",
-             "UPSTOX_HIST_CACHE_DIR": os.path.join(BASE_DIR, "trader", "state", "cache", "upstox_hist")}
 # The background full scoreboard shares the API with the scan, so it gets a smaller request rate.
-FULL_BOARD_ENV = {"UPSTOX_MAX_RPS": "2", "UPSTOX_BATCH_WORKERS": "2"}
+FULL_BOARD_ENV = upstox_speed.PROFILES["full_board"]
 # The full scoreboard (re-prices every rejected setup; a report only) runs in the background this often.
 FULL_BOARD_EVERY_S = 900
 REJECT_FIELDS = ("date", "time", "kind", "direction", "symbol", "setup", "trigger_time", "underlying_price",
@@ -768,16 +767,8 @@ class Watcher(object):
 
 
 def apply_speed_env():
-    """SPEED_ENV for this process and its children (an explicit env var wins); drop old cache days."""
-    for k, v in SPEED_ENV.items():
-        os.environ.setdefault(k, v)
-    root = os.environ.get("UPSTOX_HIST_CACHE_DIR")
-    today = now_ist().date().isoformat()
-    if root and os.path.isdir(root):
-        import shutil
-        for d in os.listdir(root):
-            if d != today and len(d) == 10 and d[4] == "-":
-                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    """The watcher's Upstox pacing for this process and its children (an explicit env var wins)."""
+    upstox_speed.apply("market_watch")
 
 
 def build_universe(path):

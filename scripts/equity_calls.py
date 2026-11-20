@@ -43,6 +43,7 @@ for _d in ("trader-alerts", "trader-scanner", "trader-budget", "trader-exit", "t
 
 import swing_signals as sig  # noqa: E402
 import capital  # noqa: E402  (scripts/capital.py: Rs 1,00,000 total-capital hard cap)
+import upstox_speed  # noqa: E402  (per-process Upstox request pacing)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 STATE = os.path.join(BASE_DIR, "trader", "state")
@@ -529,6 +530,8 @@ def main(argv=None):
     r.add_argument("--no-ledger", action="store_true")
     a = ap.parse_args(argv)
     os.chdir(BASE_DIR)
+    if a.cmd in ("run", "scan"):
+        upstox_speed.apply("equity_calls")
     return {"scan": cmd_scan, "track": cmd_track, "show": cmd_show, "run": cmd_run}[a.cmd](a)
 
 

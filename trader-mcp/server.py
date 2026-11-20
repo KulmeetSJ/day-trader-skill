@@ -220,6 +220,8 @@ def _err(mid, code, message):
 
 def main():
     os.chdir(BASE_DIR)
+    import upstox_speed                 # scripts/ is on sys.path via book.py
+    upstox_speed.apply("ai_mcp")       # paced Upstox calls + same-day cache (429s on 2026-11-20)
     for line in sys.stdin:
         line = line.strip()
         if not line:

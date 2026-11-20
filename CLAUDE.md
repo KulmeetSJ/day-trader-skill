@@ -121,8 +121,13 @@ The user's goal: an MCP server where the AI, not fixed rules, analyses and decid
   `investing` = multi-day equity. Each pool keeps its own broker-style order records, so trader-risk's
   daily loss (Rs 5,000 at stops of today's entries), 3 entries/day and duplicate rules apply per pool.
 - `scripts/ai_trader.py run`: marks the book every 2 min in session and runs `claude -p` (only the
-  `mcp__day-trader` tools allowed) on new intraday alerts, every 25 newly refused setups, a new spread
-  call, a new multi-day scan, and reviews at 09:35/11:00/13:30/15:50; max 16 AI runs/day, 10 min apart.
+  `mcp__day-trader` tools allowed) on new intraday alerts (at once, even inside the 10-min gap), setups
+  refused just under the gate (net R:R >= 1.8; hourly at most, never into runs kept for the reviews still
+  ahead), a new spread call, a new multi-day scan, and reviews at 09:35/11:00/13:30/15:50; max 16 runs/day.
+  Since 2026-11-20 (user: "see how many of the bot's trades go right") the prompt tells the AI to TAKE every
+  watcher alert that passes trader-risk unless it names a concrete, checkable reason to skip; on that day
+  it passed on all 3 alerts ("too late") that closed +Rs 2,271, and the old every-25-refusals trigger spent
+  10 of 16 runs and starved the 15:50 review.
   `trigger --reason "..."` is the hook for any external API/webhook; `show` prints the account.
 - The AI can't override a BLOCK, change a limit, short, sell naked options, or move a stop after entry.
   Going live would need the user's explicit decision AND a broker with an order API (Upstox is read-only).
@@ -148,7 +153,9 @@ The user's goal: an MCP server where the AI, not fixed rules, analyses and decid
   `data_in.UpstoxMarketDataProvider` then fetches batches in parallel under a shared request-rate cap
   (one retry after a 429; Upstox's Cloudflare edge returns error 1015 on bursts) and caches
   historical-candle chunks that hold only past sessions for the day (today's bars always come live).
-  All opt-in env vars; defaults unchanged. The per-cycle scoreboard is `--calls-only` (daily-loss total,
+  All opt-in env vars; defaults unchanged. `scripts/upstox_speed.py` holds each process's share (watcher 5
+  req/s, AI's MCP server 3, equity_calls 3, background board 2, options_watch 2); with a cap set, a single
+  request also gets one retry after a 429 (the AI hit 429s at 15:48 on 2026-11-20 without it). The per-cycle scoreboard is `--calls-only` (daily-loss total,
   under 1s); the full board re-pricing rejected setups runs in the background every 15 min at 2 req/s.
 - `capital.py`: per-pool committed capital for these ledgers (unreadable row = whole cap, fail closed). The
   AI book does its own accounting and never shares capital with them.
